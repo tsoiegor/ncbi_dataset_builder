@@ -1,0 +1,323 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import tempfile
+from pathlib import Path
+from typing import Any
+
+import polars as pl
+
+from .execution import SlurmOptions
+from .metadata import sanitize_legacy_metadata
+from .models import ResourceSpec
+from .processing.base import load_processor
+from .workflow import BuilderConfig, DatasetBuilder
+
+
+def _write_csv(frame: pl.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".part", dir=path.parent
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        frame.write_csv(temporary)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _value(raw: str) -> Any:
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+
+
+def _condition(specification: str) -> pl.Expr:
+    match = re.fullmatch(r"\s*([^<>=!~]+?)\s*(==|!=|>=|<=|>|<|~)\s*(.*?)\s*", specification)
+    if not match:
+        raise ValueError(f"Invalid filter {specification!r}; use COLUMN==VALUE or COLUMN~substring")
+    column, operator, raw = match.groups()
+    value = _value(raw)
+    expression = pl.col(column)
+    if operator == "==":
+        return expression == value
+    if operator == "!=":
+        return expression != value
+    if operator == ">=":
+        return expression >= value
+    if operator == "<=":
+        return expression <= value
+    if operator == ">":
+        return expression > value
+    if operator == "<":
+        return expression < value
+    return expression.cast(pl.String).str.contains(str(value), literal=True)
+
+
+def _builder(arguments: argparse.Namespace) -> DatasetBuilder:
+    return DatasetBuilder(
+        BuilderConfig(
+            workspace=arguments.workspace,
+            email=arguments.email,
+            ncbi_api_key=arguments.api_key,
+            max_workers=arguments.max_workers,
+            total_threads=arguments.total_threads,
+        )
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="ncbi-dataset")
+    parser.add_argument("--workspace", type=Path, default=Path("workspace"))
+    parser.add_argument("--email", default=os.environ.get("NCBI_EMAIL"))
+    parser.add_argument("--api-key", default=os.environ.get("NCBI_API_KEY"))
+    parser.add_argument("--max-workers", type=int, default=1)
+    parser.add_argument("--total-threads", type=int)
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    fetch = commands.add_parser("fetch-runs", help="Fetch complete SRA RunInfo for an Entrez query")
+    fetch.add_argument("query")
+    fetch.add_argument("--output", type=Path)
+    fetch.add_argument("--refresh", action="store_true")
+
+    geo = commands.add_parser("resolve-geo", help="Resolve GSE/GSM accessions to SRA RunInfo")
+    geo.add_argument("accessions", nargs="+")
+    geo.add_argument("--output", type=Path, required=True)
+
+    filtering = commands.add_parser("filter", help="Apply repeatable safe filters to RunInfo CSV")
+    filtering.add_argument("--catalog", type=Path, required=True)
+    filtering.add_argument("--where", action="append", default=[], required=True)
+    filtering.add_argument("--output", type=Path, required=True)
+
+    enrich = commands.add_parser(
+        "enrich-metadata", help="Fetch structured SRA and BioSample XML metadata"
+    )
+    enrich.add_argument("--catalog", type=Path, required=True)
+    enrich.add_argument("--output", type=Path, required=True)
+    enrich.add_argument("--include-raw-trees", action="store_true")
+
+    metadata = commands.add_parser(
+        "fetch-metadata",
+        help="Fetch complete structured metadata for SRA accessions",
+    )
+    metadata.add_argument("accessions", nargs="+")
+    metadata.add_argument("--output", type=Path, required=True)
+    metadata.add_argument("--include-raw-trees", action="store_true")
+
+    for metadata_command in (enrich, metadata):
+        metadata_command.add_argument(
+            "--description-profile",
+            choices=("training", "full"),
+            default="training",
+            help="Per-sample JSON profile; complete metadata.json is retained separately",
+        )
+        metadata_command.add_argument(
+            "--legacy-descriptions",
+            type=Path,
+            help="Directory of old flat sampleDescriptions JSON whose values must be preserved",
+        )
+
+    sanitize = commands.add_parser(
+        "sanitize-legacy-metadata",
+        help="Remove leaked presentation HTML and decode entities in old JSON snapshots",
+    )
+    sanitize.add_argument("paths", nargs="+", type=Path)
+
+    plan = commands.add_parser("plan", help="Create a deterministic processing plan")
+    plan.add_argument("--catalog", type=Path, required=True)
+    plan.add_argument(
+        "--group-by",
+        choices=("run", "experiment", "sra_sample", "biosample"),
+        default="experiment",
+    )
+    plan.add_argument("--threads", type=int, default=4)
+    plan.add_argument("--memory-gb", type=int, default=16)
+    plan.add_argument("--time-limit", default="24:00:00")
+    plan.add_argument("--max-batch-gb", type=float)
+    plan.add_argument("--max-batch-units", type=int)
+    plan.add_argument("--output", type=Path, required=True)
+
+    build = commands.add_parser("build", help="Execute a plan on the current machine")
+    build.add_argument("--plan", type=Path, required=True)
+    build.add_argument("--processor", required=True)
+    build.add_argument("--retry-failed", action="store_true")
+    build.add_argument("--batch-id", type=int, action="append")
+
+    submit = commands.add_parser("submit-slurm", help="Generate or submit an sbatch job array")
+    submit.add_argument("--plan", type=Path, required=True)
+    submit.add_argument("--processor", required=True)
+    submit.add_argument("--script", type=Path)
+    submit.add_argument("--partition")
+    submit.add_argument("--account")
+    submit.add_argument("--qos")
+    submit.add_argument("--max-parallel", type=int)
+    submit.add_argument("--dry-run", action="store_true")
+    submit.add_argument("--retry-failed", action="store_true")
+    submit.add_argument("--batch-id", type=int, action="append")
+
+    status = commands.add_parser("status", help="Summarize durable task state")
+    status.add_argument("--plan", type=Path, required=True)
+    status.add_argument("--batch-id", type=int, action="append")
+
+    preflight = commands.add_parser("preflight", help="Check external executables and versions")
+    preflight.add_argument("--processor")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    arguments = parser.parse_args(argv)
+    try:
+        legacy_descriptions = None
+        legacy_path = getattr(arguments, "legacy_descriptions", None)
+        if legacy_path is not None:
+            if not legacy_path.is_dir():
+                raise ValueError(f"Legacy description directory does not exist: {legacy_path}")
+            legacy_descriptions = {
+                path.stem: json.loads(path.read_text(encoding="utf-8"))
+                for path in legacy_path.glob("*.json")
+            }
+        builder = _builder(arguments)
+        if arguments.command == "fetch-runs":
+            catalog = builder.fetch_runs(arguments.query, refresh=arguments.refresh)
+            output = arguments.output or arguments.workspace / "latest-runinfo.csv"
+            _write_csv(catalog.frame, output)
+            print(
+                json.dumps(
+                    {
+                        "rows": catalog.frame.height,
+                        "output": str(output),
+                        "audit": catalog.audit,
+                    }
+                )
+            )
+        elif arguments.command == "resolve-geo":
+            catalog = builder.fetch_geo_runs(arguments.accessions)
+            _write_csv(catalog.frame, arguments.output)
+            print(json.dumps({"rows": catalog.frame.height, "output": str(arguments.output)}))
+        elif arguments.command == "filter":
+            catalog = builder.load_runs(arguments.catalog)
+            for condition in arguments.where:
+                catalog = catalog.filter(_condition(condition), description=condition)
+            _write_csv(catalog.frame, arguments.output)
+            print(
+                json.dumps(
+                    {
+                        "rows": catalog.frame.height,
+                        "output": str(arguments.output),
+                        "audit": catalog.audit,
+                    }
+                )
+            )
+        elif arguments.command == "enrich-metadata":
+            bundle = builder.enrich_metadata(
+                builder.load_runs(arguments.catalog),
+                destination=arguments.output,
+                include_raw=arguments.include_raw_trees,
+                description_profile=arguments.description_profile,
+                legacy_descriptions=legacy_descriptions,
+            )
+            print(json.dumps({key: len(value) for key, value in bundle.to_dict().items()}))
+        elif arguments.command == "fetch-metadata":
+            bundle = builder.fetch_metadata(
+                arguments.accessions,
+                destination=arguments.output,
+                include_raw=arguments.include_raw_trees,
+                description_profile=arguments.description_profile,
+                legacy_descriptions=legacy_descriptions,
+            )
+            print(json.dumps({key: len(value) for key, value in bundle.to_dict().items()}))
+        elif arguments.command == "sanitize-legacy-metadata":
+            changed = sanitize_legacy_metadata(arguments.paths)
+            print(json.dumps({"changed": len(changed)}))
+        elif arguments.command == "plan":
+            resources = ResourceSpec(arguments.threads, arguments.memory_gb, arguments.time_limit)
+            plan = builder.plan(
+                builder.load_runs(arguments.catalog),
+                group_by=arguments.group_by,
+                resources=resources,
+                max_batch_bytes=int(arguments.max_batch_gb * 1_000_000_000)
+                if arguments.max_batch_gb
+                else None,
+                max_batch_units=arguments.max_batch_units,
+            )
+            builder.save_plan(plan, arguments.output)
+            print(
+                json.dumps(
+                    {
+                        "plan_id": plan.plan_id,
+                        "tasks": len(plan.tasks),
+                        "output": str(arguments.output),
+                    }
+                )
+            )
+        elif arguments.command == "build":
+            report = builder.build(
+                builder.load_plan(arguments.plan),
+                arguments.processor,
+                retry_failed=arguments.retry_failed,
+                batch_ids=set(arguments.batch_id) if arguments.batch_id else None,
+            )
+            print(
+                json.dumps(
+                    {
+                        "succeeded": report.succeeded,
+                        "failed": report.failed,
+                        "skipped": report.skipped,
+                    }
+                )
+            )
+            return 1 if report.failed else 0
+        elif arguments.command == "submit-slurm":
+            plan = builder.load_plan(arguments.plan)
+            resources = plan.tasks[0].resources if plan.tasks else ResourceSpec()
+            script, job_id = builder.submit_slurm(
+                plan,
+                processor_reference=arguments.processor,
+                options=SlurmOptions(
+                    resources=resources,
+                    max_parallel=arguments.max_parallel,
+                    partition=arguments.partition,
+                    account=arguments.account,
+                    qos=arguments.qos,
+                ),
+                plan_path=arguments.plan,
+                script_path=arguments.script,
+                submit=not arguments.dry_run,
+                retry_failed=arguments.retry_failed,
+                batch_ids=set(arguments.batch_id) if arguments.batch_id else None,
+            )
+            print(json.dumps({"script": str(script), "job_id": job_id}))
+        elif arguments.command == "status":
+            print(
+                json.dumps(
+                    builder.status(
+                        builder.load_plan(arguments.plan),
+                        batch_ids=set(arguments.batch_id) if arguments.batch_id else None,
+                    ),
+                    indent=2,
+                )
+            )
+        elif arguments.command == "preflight":
+            versions = {
+                "sra": builder.fastq_provider.preflight(),
+                "genomes": builder.genomes.preflight(),
+            }
+            if arguments.processor:
+                processor = load_processor(arguments.processor)
+                if hasattr(processor, "preflight"):
+                    versions["processor"] = processor.preflight()
+            print(json.dumps(versions, indent=2))
+        return 0
+    except (ValueError, OSError, RuntimeError) as exc:
+        parser.exit(2, f"error: {exc}\n")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
