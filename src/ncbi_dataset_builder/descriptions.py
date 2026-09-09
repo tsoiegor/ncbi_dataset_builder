@@ -258,6 +258,45 @@ def _experiment_description(experiment, study, submission, policy):
     return row
 
 
+def training_fields_by_experiment(
+    bundle: MetadataBundle,
+    *,
+    policy: DescriptionPolicy | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Return compact library and study fields keyed by Experiment accession.
+
+    Args:
+        bundle: Normalized SRA metadata and package relationships.
+        policy: Optional attribute-selection and renaming policy.
+
+    Raises:
+        ValueError: If repeated package relationships describe one Experiment
+            inconsistently.
+    """
+
+    policy = policy or DescriptionPolicy()
+    indexes = {
+        name: {row["accession"]: row for row in getattr(bundle, name)}
+        for name in ("experiments", "studies", "submissions")
+    }
+    descriptions: dict[str, dict[str, Any]] = {}
+    for relation in bundle.packages:
+        accession = relation.get("experiment_accession")
+        if not accession:
+            continue
+        row = _experiment_description(
+            indexes["experiments"].get(accession, {}),
+            indexes["studies"].get(relation.get("study_accession"), {}),
+            indexes["submissions"].get(relation.get("submission_accession"), {}),
+            policy,
+        )
+        previous = descriptions.get(accession)
+        if previous is not None and previous != row:
+            raise ValueError(f"Conflicting compact metadata for Experiment {accession}")
+        descriptions[accession] = row
+    return descriptions
+
+
 def training_descriptions(
     bundle: MetadataBundle,
     *,

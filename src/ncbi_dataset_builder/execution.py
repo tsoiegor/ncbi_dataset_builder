@@ -8,7 +8,7 @@ from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Generic, TypeVar
+from typing import Generic, Literal, TypeVar
 
 from .commands import CommandRunner
 from .models import ResourceSpec
@@ -106,7 +106,7 @@ class LocalExecutor(Generic[T, R]):
 
 @dataclass(frozen=True)
 class SlurmOptions:
-    """Configure one Slurm allocation or legacy array submission.
+    """Configure single-node or quota-aware distributed Slurm execution.
 
     Args:
         resources: CPU, memory, and time requested per task.
@@ -114,6 +114,13 @@ class SlurmOptions:
         partition: Optional Slurm partition name.
         account: Optional allocation account.
         qos: Optional quality-of-service name.
+        mode: ``single_node`` or quota-aware ``distributed`` execution.
+        total_cpu_quota: Maximum CPUs used across coordinator and worker jobs.
+        max_running_jobs: Maximum running coordinator and worker jobs.
+        coordinator_cpus: CPUs reserved for the distributed coordinator.
+        coordinator_memory_gb: Memory reserved for the coordinator in GB.
+        coordinator_time_limit: Slurm wall time for the complete coordinator.
+        cpus_per_node: Optional CPU capacity used to reject impossible requests.
     """
 
     resources: ResourceSpec = field(default_factory=ResourceSpec)
@@ -121,19 +128,77 @@ class SlurmOptions:
     partition: str | None = None
     account: str | None = None
     qos: str | None = None
+    mode: Literal["single_node", "distributed"] = "single_node"
+    total_cpu_quota: int | None = None
+    max_running_jobs: int | None = None
+    coordinator_cpus: int = 1
+    coordinator_memory_gb: int = 4
+    coordinator_time_limit: str = "7-00:00:00"
+    cpus_per_node: int | None = None
 
     def __post_init__(self) -> None:
         """Validate positive concurrency and shell-safe scheduler identifiers."""
 
         if self.max_parallel is not None and self.max_parallel < 1:
             raise ValueError("max_parallel must be positive")
-        for name, value in (
-            ("partition", self.partition),
-            ("account", self.account),
-            ("qos", self.qos),
+        if self.mode not in {"single_node", "distributed"}:
+            raise ValueError(f"Unknown Slurm mode: {self.mode!r}")
+        if self.coordinator_cpus < 1 or self.coordinator_memory_gb < 1:
+            raise ValueError("Coordinator CPU and memory must be positive")
+        if self.cpus_per_node is not None and self.cpus_per_node < 1:
+            raise ValueError("cpus_per_node must be positive")
+        if (
+            self.cpus_per_node is not None
+            and self.coordinator_cpus > self.cpus_per_node
         ):
+            raise ValueError(
+                f"Coordinator request exceeds cpus_per_node={self.cpus_per_node}"
+            )
+        if not re.fullmatch(r"[0-9:-]+", self.coordinator_time_limit):
+            raise ValueError(
+                f"Unsafe or invalid coordinator time: {self.coordinator_time_limit!r}"
+            )
+        if self.partition is not None:
+            partitions = self.partition.split(",")
+            if not partitions or any(
+                not re.fullmatch(r"[A-Za-z0-9_.-]+", value) for value in partitions
+            ):
+                raise ValueError(f"Unsafe or invalid Slurm partition: {self.partition!r}")
+        for name, value in (("account", self.account), ("qos", self.qos)):
             if value is not None and not re.fullmatch(r"[A-Za-z0-9_.-]+", value):
                 raise ValueError(f"Unsafe or invalid Slurm {name}: {value!r}")
+        if self.mode == "distributed":
+            if self.total_cpu_quota is None or self.total_cpu_quota < 2:
+                raise ValueError("Distributed Slurm mode requires total_cpu_quota >= 2")
+            if self.max_running_jobs is None or self.max_running_jobs < 2:
+                raise ValueError("Distributed Slurm mode requires max_running_jobs >= 2")
+            if self.coordinator_cpus >= self.total_cpu_quota:
+                raise ValueError("Coordinator CPUs must be below total_cpu_quota")
+
+    def worker_parallelism(self, threads_per_unit: int) -> int:
+        """Return worker slots allowed for *threads_per_unit* by all configured quotas."""
+
+        if threads_per_unit < 1:
+            raise ValueError("threads_per_unit must be positive")
+        if self.cpus_per_node is not None and threads_per_unit > self.cpus_per_node:
+            raise ValueError(
+                f"A {threads_per_unit}-CPU unit exceeds cpus_per_node={self.cpus_per_node}"
+            )
+        if self.mode != "distributed":
+            return self.max_parallel or 1
+        assert self.total_cpu_quota is not None
+        assert self.max_running_jobs is not None
+        by_cpu = (self.total_cpu_quota - self.coordinator_cpus) // threads_per_unit
+        by_jobs = self.max_running_jobs - 1
+        workers = min(by_cpu, by_jobs)
+        if self.max_parallel is not None:
+            workers = min(workers, self.max_parallel)
+        if workers < 1:
+            raise ValueError(
+                f"CPU quota cannot satisfy one {threads_per_unit}-CPU worker after reserving "
+                f"{self.coordinator_cpus} coordinator CPUs"
+            )
+        return workers
 
 
 class SlurmExecutor:
@@ -164,6 +229,9 @@ class SlurmExecutor:
         options: SlurmOptions,
         retry_failed: bool = False,
         task_indices: list[int] | None = None,
+        cleanup: str = "after_success",
+        keep_failed_inputs: bool = True,
+        fsync_logs: bool = True,
     ) -> Path:
         """Write a Slurm array script for selected tasks in a saved plan.
 
@@ -172,6 +240,8 @@ class SlurmExecutor:
         logs and state, *email* configures NCBI access, *output_path* receives the
         script, and *options* supplies scheduler settings. *retry_failed* enables
         failed-task retries; *task_indices* optionally submits a subset.
+        *cleanup*, *keep_failed_inputs*, and *fsync_logs* configure worker cleanup
+        and logging behavior.
         """
 
         if task_count < 1:
@@ -191,8 +261,9 @@ class SlurmExecutor:
             f"#SBATCH --cpus-per-task={resources.threads}",
             f"#SBATCH --mem={resources.memory_gb}G",
             f"#SBATCH --time={resources.time_limit}",
-            f"#SBATCH --output={shlex.quote(str(logs / '%A_%a.out'))}",
-            f"#SBATCH --error={shlex.quote(str(logs / '%A_%a.err'))}",
+            f"#SBATCH --output={shlex.quote(str(logs / '%A.batch.log'))}",
+            f"#SBATCH --error={shlex.quote(str(logs / '%A.batch.log'))}",
+            "#SBATCH --open-mode=append",
         ]
         for flag, value in (
             ("partition", options.partition),
@@ -218,6 +289,11 @@ class SlurmExecutor:
             command.extend(("--email", email))
         if retry_failed:
             command.append("--retry-failed")
+        command.extend(("--cleanup", cleanup))
+        if not keep_failed_inputs:
+            command.append("--discard-failed-inputs")
+        if not fsync_logs:
+            command.append("--no-fsync-logs")
         rendered = " ".join(
             item if item == "${SLURM_ARRAY_TASK_ID}" else shlex.quote(item) for item in command
         )
@@ -232,6 +308,111 @@ class SlurmExecutor:
         )
         atomic_write_text(output_path, "\n".join(lines))
         self.progress.message(f"Slurm script created: {output_path}")
+        return output_path
+
+    def create_dispatcher_script(
+        self,
+        *,
+        plan_path: Path,
+        processor_reference: str,
+        workspace: Path,
+        email: str | None,
+        output_path: Path,
+        options: SlurmOptions,
+        prefetch_batches: int,
+        max_staged_gb: float | None,
+        minimum_free_gb: float,
+        cleanup: str,
+        keep_failed_inputs: bool,
+        fsync_logs: bool,
+        retry_failed: bool = False,
+        batch_ids: set[int] | None = None,
+    ) -> Path:
+        """Write a quota-aware dispatcher for *plan_path* and *processor_reference*.
+
+        *workspace*, *email*, and *output_path* configure execution paths;
+        *options* supplies Slurm limits; *prefetch_batches*, *max_staged_gb*,
+        *minimum_free_gb*, *cleanup*, *keep_failed_inputs*, and *fsync_logs*
+        configure storage and logs. *retry_failed* and *batch_ids* select work.
+        """
+
+        if options.mode != "distributed":
+            raise ValueError("Dispatcher scripts require distributed Slurm mode")
+        logs = workspace / "logs" / "slurm"
+        lines = [
+            "#!/usr/bin/env bash",
+            "#SBATCH --job-name=ncbi-dispatch",
+            f"#SBATCH --cpus-per-task={options.coordinator_cpus}",
+            f"#SBATCH --mem={options.coordinator_memory_gb}G",
+            f"#SBATCH --time={options.coordinator_time_limit}",
+            f"#SBATCH --output={shlex.quote(str(logs / '%j.coordinator.log'))}",
+            f"#SBATCH --error={shlex.quote(str(logs / '%j.coordinator.log'))}",
+            "#SBATCH --open-mode=append",
+        ]
+        for flag, value in (
+            ("partition", options.partition),
+            ("account", options.account),
+            ("qos", options.qos),
+        ):
+            if value:
+                lines.append(f"#SBATCH --{flag}={value}")
+        command = [
+            self.python_executable,
+            "-m",
+            "ncbi_dataset_builder.slurm_dispatcher",
+            "--plan",
+            str(plan_path.resolve()),
+            "--processor",
+            processor_reference,
+            "--workspace",
+            str(workspace.resolve()),
+            "--total-cpu-quota",
+            str(options.total_cpu_quota),
+            "--max-running-jobs",
+            str(options.max_running_jobs),
+            "--coordinator-cpus",
+            str(options.coordinator_cpus),
+            "--prefetch-batches",
+            str(prefetch_batches),
+            "--minimum-free-gb",
+            str(minimum_free_gb),
+            "--cleanup",
+            cleanup,
+        ]
+        if options.max_parallel is not None:
+            command.extend(("--max-parallel", str(options.max_parallel)))
+        if options.cpus_per_node is not None:
+            command.extend(("--cpus-per-node", str(options.cpus_per_node)))
+        if max_staged_gb is not None:
+            command.extend(("--max-staged-gb", str(max_staged_gb)))
+        if options.partition:
+            command.extend(("--partition", options.partition))
+        if options.account:
+            command.extend(("--account", options.account))
+        if options.qos:
+            command.extend(("--qos", options.qos))
+        if email:
+            command.extend(("--email", email))
+        if retry_failed:
+            command.append("--retry-failed")
+        if not keep_failed_inputs:
+            command.append("--discard-failed-inputs")
+        if not fsync_logs:
+            command.append("--no-fsync-logs")
+        for batch_id in sorted(batch_ids or ()):
+            command.extend(("--batch-id", str(batch_id)))
+        rendered = " ".join(shlex.quote(item) for item in command)
+        lines.extend(
+            (
+                "",
+                "set -euo pipefail",
+                f"mkdir -p {shlex.quote(str(logs))}",
+                rendered,
+                "",
+            )
+        )
+        atomic_write_text(output_path, "\n".join(lines))
+        self.progress.message(f"Slurm dispatcher script created: {output_path}")
         return output_path
 
     @staticmethod

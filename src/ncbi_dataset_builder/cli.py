@@ -185,6 +185,15 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--account")
     submit.add_argument("--qos")
     submit.add_argument("--max-parallel", type=int)
+    submit.add_argument(
+        "--slurm-mode", choices=("single_node", "distributed"), default="single_node"
+    )
+    submit.add_argument("--total-cpu-quota", type=int)
+    submit.add_argument("--max-running-jobs", type=int)
+    submit.add_argument("--coordinator-cpus", type=int, default=1)
+    submit.add_argument("--coordinator-memory-gb", type=int, default=4)
+    submit.add_argument("--coordinator-time-limit", default="7-00:00:00")
+    submit.add_argument("--cpus-per-node", type=int)
     submit.add_argument("--dry-run", action="store_true")
     submit.add_argument("--retry-failed", action="store_true")
     submit.add_argument("--batch-id", type=int, action="append")
@@ -202,6 +211,14 @@ def build_parser() -> argparse.ArgumentParser:
     status = commands.add_parser("status", help="Summarize durable task state")
     status.add_argument("--plan", type=Path, required=True)
     status.add_argument("--batch-id", type=int, action="append")
+
+    publish = commands.add_parser(
+        "publish", help="Publish completed experiment outputs as a compact dataset"
+    )
+    publish.add_argument("--plan", type=Path, required=True)
+    publish.add_argument("--destination", type=Path)
+    publish.add_argument("--mode", choices=("auto", "hardlink", "copy"), default="auto")
+    publish.add_argument("--overwrite", action="store_true")
 
     preflight = commands.add_parser("preflight", help="Check external executables and versions")
     preflight.add_argument("--processor")
@@ -335,6 +352,13 @@ def main(argv: list[str] | None = None) -> int:
                     partition=arguments.partition,
                     account=arguments.account,
                     qos=arguments.qos,
+                    mode=arguments.slurm_mode,
+                    total_cpu_quota=arguments.total_cpu_quota,
+                    max_running_jobs=arguments.max_running_jobs,
+                    coordinator_cpus=arguments.coordinator_cpus,
+                    coordinator_memory_gb=arguments.coordinator_memory_gb,
+                    coordinator_time_limit=arguments.coordinator_time_limit,
+                    cpus_per_node=arguments.cpus_per_node,
                 ),
                 plan_path=arguments.plan,
                 script_path=arguments.script,
@@ -359,6 +383,23 @@ def main(argv: list[str] | None = None) -> int:
                         batch_ids=set(arguments.batch_id) if arguments.batch_id else None,
                     ),
                     indent=2,
+                )
+            )
+        elif arguments.command == "publish":
+            result = builder.publish_dataset(
+                builder.load_plan(arguments.plan),
+                destination=arguments.destination,
+                mode=arguments.mode,
+                overwrite=arguments.overwrite,
+            )
+            print(
+                json.dumps(
+                    {
+                        "destination": str(result.destination),
+                        "manifest": str(result.manifest),
+                        "experiments": result.experiments,
+                        "genomes": result.genomes,
+                    }
                 )
             )
         elif arguments.command == "preflight":

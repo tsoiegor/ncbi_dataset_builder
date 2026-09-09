@@ -4,6 +4,7 @@ import gzip
 import json
 import logging
 import os
+import shutil
 import threading
 import zipfile
 from collections.abc import Iterable
@@ -439,10 +440,17 @@ class GenomeManager:
         *scientific_name* overrides the assembly report's species label when supplied.
         """
 
-        target_dir = self.root / str(taxid) / candidate.accession
-        target_dir.mkdir(parents=True, exist_ok=True)
-        archive = target_dir / f"{candidate.accession}.zip"
-        fasta = target_dir / f"{candidate.accession}.fna.gz"
+        self.root.mkdir(parents=True, exist_ok=True)
+        download_dir = self.root / ".downloads" / candidate.accession
+        download_dir.mkdir(parents=True, exist_ok=True)
+        archive = download_dir / f"{candidate.accession}.zip"
+        fasta = self.root / f"{candidate.accession}.fasta.gz"
+        if existing_nonempty(fasta):
+            try:
+                self._validate_downloaded_fasta(fasta)
+            except DownloadError:
+                self.progress.message(f"Discard invalid cached genome FASTA: {fasta}")
+                fasta.unlink(missing_ok=True)
         if not existing_nonempty(fasta):
             if not zipfile.is_zipfile(archive):
                 self.progress.message(f"Download genome archive {candidate.accession}")
@@ -500,8 +508,14 @@ class GenomeManager:
                         output.write(chunk)
                         progress.update(bytes_to_gb(len(chunk)))
                 os.replace(partial_fasta, fasta)
-        if not existing_nonempty(fasta):
-            raise DownloadError(f"Genome FASTA is missing after extraction: {fasta}")
+        self._validate_downloaded_fasta(fasta)
+        if download_dir.is_dir():
+            shutil.rmtree(download_dir)
+            downloads_root = download_dir.parent
+            try:
+                downloads_root.rmdir()
+            except OSError:
+                pass
         self.progress.message(f"Checksum genome FASTA {fasta}")
         return GenomeRef(
             taxid=taxid,
@@ -514,6 +528,22 @@ class GenomeManager:
             refseq_category=candidate.refseq_category,
             selection_rationale=self.policy.rationale(candidate),
         )
+
+    @staticmethod
+    def _validate_downloaded_fasta(fasta: Path) -> None:
+        """Fully validate gzip-compressed downloaded FASTA *fasta*."""
+
+        if not existing_nonempty(fasta):
+            raise DownloadError(f"Genome FASTA is missing after extraction: {fasta}")
+        try:
+            with gzip.open(fasta, "rb") as handle:
+                first = handle.readline()
+                if not first.startswith(b">"):
+                    raise DownloadError(f"Genome FASTA has no header: {fasta}")
+                while handle.read(8 * 1024 * 1024):
+                    pass
+        except (OSError, EOFError) as exc:
+            raise DownloadError(f"Genome FASTA failed gzip validation: {fasta}") from exc
 
     def register_custom(
         self,

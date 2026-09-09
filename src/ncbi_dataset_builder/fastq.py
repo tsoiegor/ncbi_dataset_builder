@@ -5,6 +5,7 @@ import hashlib
 import os
 import random
 import re
+import shutil
 import time
 import urllib.error
 import urllib.parse
@@ -239,7 +240,7 @@ class SraToolkitProvider:
         raise DownloadError(f"Command failed after retries: {list(command)!r}") from last_error
 
     def _download_run(self, accession: str, sra_root: Path) -> Path:
-        """Prefetch and validate SRA *accession* below shared *sra_root*."""
+        """Prefetch and validate SRA *accession* below unit-local *sra_root*."""
 
         run_dir = sra_root / accession
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -306,16 +307,57 @@ class SraToolkitProvider:
         path.unlink()
         return target
 
+    @staticmethod
+    def _validate_gzip(path: Path) -> None:
+        """Read compressed FASTQ *path* fully and raise when its gzip stream is invalid."""
+
+        try:
+            with gzip.open(path, "rb") as handle:
+                while handle.read(8 * 1024 * 1024):
+                    pass
+        except (OSError, EOFError) as exc:
+            raise DownloadError(f"Compressed FASTQ failed gzip validation: {path}") from exc
+
+    def _cached_run_fastq(self, accession: str, root: Path) -> dict[str, Path] | None:
+        """Return validated per-run FASTQ for *accession* below unit *root*, when cached."""
+
+        run_fastq = root / ".runs" / accession
+        complete = run_fastq / "run.complete.json"
+        if not complete.is_file():
+            return None
+        known = {
+            "read1": run_fastq / f"{accession}_1.fastq.gz",
+            "read2": run_fastq / f"{accession}_2.fastq.gz",
+            "single": run_fastq / f"{accession}.fastq.gz",
+        }
+        present = {key: path for key, path in known.items() if existing_nonempty(path)}
+        if not present or ("read1" in present) != ("read2" in present):
+            return None
+        try:
+            record = read_json(complete)
+            expected = record.get("checksums", {})
+            for path in present.values():
+                if expected.get(path.name) != sha256_file(path, progress=self.progress):
+                    return None
+                self._validate_gzip(path)
+        except (OSError, ValueError):
+            return None
+        return present
+
     def _materialize_run(
         self, accession: str, sra_file: Path, root: Path, threads: int
     ) -> dict[str, Path]:
         """Convert *sra_file* for *accession* into validated FASTQ files.
 
-        *root* stores shared run files and temporary data; *threads* controls
+        *root* stores unit-local run files and temporary data; *threads* controls
         ``fasterq-dump`` and compression concurrency.
         """
 
-        run_fastq = root / "runs" / accession
+        cached = self._cached_run_fastq(accession, root)
+        if cached is not None:
+            self.progress.message(f"FASTQ conversion cache hit: {accession}")
+            return cached
+        run_fastq = root / ".runs" / accession
         run_fastq.mkdir(parents=True, exist_ok=True)
         complete = run_fastq / "run.complete.json"
         known = {
@@ -323,15 +365,10 @@ class SraToolkitProvider:
             "read2": run_fastq / f"{accession}_2.fastq.gz",
             "single": run_fastq / f"{accession}.fastq.gz",
         }
-        if complete.is_file():
-            present = {key: path for key, path in known.items() if existing_nonempty(path)}
-            if present and ("read1" in present) == ("read2" in present):
-                self.progress.message(f"FASTQ conversion cache hit: {accession}")
-                return present
         for path in (*known.values(), *(run_fastq.glob("*.fastq"))):
             path.unlink(missing_ok=True)
         complete.unlink(missing_ok=True)
-        temporary = root / "tmp" / accession
+        temporary = root / ".tmp" / accession
         temporary.mkdir(parents=True, exist_ok=True)
         self._retry_command(
             [
@@ -353,13 +390,24 @@ class SraToolkitProvider:
             raise DownloadError(f"Run {accession} has only one mate after fasterq-dump")
         if not present:
             raise DownloadError(f"fasterq-dump produced no FASTQ for {accession}")
+        checksums: dict[str, str] = {}
+        for path in present.values():
+            self._validate_gzip(path)
+            checksums[path.name] = sha256_file(path, progress=self.progress)
         atomic_write_json(
             complete,
             {
                 "accession": accession,
                 "files": {key: str(path) for key, path in present.items()},
+                "checksums": checksums,
             },
         )
+        raw_root = root / ".raw" / accession
+        if raw_root.is_dir():
+            shutil.rmtree(raw_root)
+            self.progress.message(f"Removed validated SRA archive for {accession}")
+        if temporary.is_dir():
+            shutil.rmtree(temporary)
         return present
 
     def _merge_gzip_members(self, paths: Iterable[Path], destination: Path) -> Path | None:
@@ -373,6 +421,14 @@ class SraToolkitProvider:
         self.progress.message(f"Merge {len(inputs):,} gzip members into {destination.name}")
         partial = destination.with_name(destination.name + ".part")
         destination.parent.mkdir(parents=True, exist_ok=True)
+        partial.unlink(missing_ok=True)
+        if len(inputs) == 1:
+            try:
+                os.link(inputs[0], partial)
+                os.replace(partial, destination)
+                return destination
+            except OSError:
+                partial.unlink(missing_ok=True)
         with (
             partial.open("wb") as output,
             self.progress.task(
@@ -401,27 +457,42 @@ class SraToolkitProvider:
         """Return safe ID, unit root, and manifest for *unit* at *destination*."""
 
         safe_id = sanitize_identifier(unit.unit_id)
-        fingerprint = hashlib.sha256("\n".join(unit.run_accessions).encode()).hexdigest()[:16]
-        unit_root = destination / safe_id / fingerprint
+        unit_root = destination / safe_id
         manifest = unit_root / "fastq.manifest.json"
         return safe_id, unit_root, manifest
 
     def _cleanup_roots(
         self, unit: ProcessingUnit, destination: Path, unit_root: Path
     ) -> tuple[Path, ...]:
-        """Return roots owned by *unit* below *destination*, including *unit_root*."""
+        """Return the one unit-owned *unit_root* eligible below *destination*."""
 
-        shared = destination / "_runs"
-        roots = [unit_root]
-        for accession in unit.run_accessions:
-            roots.extend(
-                (
-                    shared / "sra" / accession,
-                    shared / "runs" / accession,
-                    shared / "tmp" / accession,
-                )
-            )
-        return tuple(roots)
+        del unit, destination
+        return (unit_root,)
+
+    @staticmethod
+    def _remove_transient_unit_files(unit_root: Path) -> None:
+        """Remove raw and per-run conversion artifacts below *unit_root*."""
+
+        for transient in (unit_root / ".raw", unit_root / ".tmp", unit_root / ".runs"):
+            if transient.is_dir():
+                shutil.rmtree(transient)
+        for fastq in unit_root.glob("*.fastq"):
+            fastq.unlink(missing_ok=True)
+
+    def _unit_cache(self, unit: ProcessingUnit, manifest: Path) -> FastqSet | None:
+        """Return *unit* FASTQ from *manifest* only when its run list still matches."""
+
+        cached = _from_manifest(manifest, progress=self.progress)
+        if cached is not None and cached.run_accessions == unit.run_accessions:
+            self._remove_transient_unit_files(manifest.parent)
+            return cached
+        stale_outputs = list(manifest.parent.glob("*.fastq.gz"))
+        if cached is not None or manifest.exists() or stale_outputs:
+            manifest.unlink(missing_ok=True)
+            for path in stale_outputs:
+                path.unlink(missing_ok=True)
+            self.progress.message(f"Invalidate changed FASTQ unit cache: {unit.unit_id}")
+        return None
 
     def stage(self, unit: ProcessingUnit, destination: Path, *, threads: int) -> StagedFastq:
         """Prefetch raw SRA for *unit* below *destination* using *threads*."""
@@ -429,7 +500,7 @@ class SraToolkitProvider:
         del threads
         safe_id, unit_root, manifest = self._unit_locations(unit, destination)
         del safe_id
-        cached = _from_manifest(manifest, progress=self.progress)
+        cached = self._unit_cache(unit, manifest)
         if cached is not None:
             self.progress.message(f"FASTQ unit cache hit: {unit.unit_id}")
             roots = self._cleanup_roots(unit, destination, unit_root)
@@ -444,16 +515,19 @@ class SraToolkitProvider:
         unit_root.mkdir(parents=True, exist_ok=True)
         self.runner.require("prefetch", "vdb-validate", "fasterq-dump")
         sra_files: dict[str, str] = {}
-        shared_runs = destination / "_runs"
         for accession in self.progress.track(
             unit.run_accessions, f"Stage raw SRA for {unit.unit_id}", unit="runs"
         ):
             with exclusive_file_lock(
-                shared_runs / f".{accession}.lock",
+                unit_root / f".{accession}.lock",
                 timeout_seconds=7 * 24 * 60 * 60,
                 stale_after_seconds=7 * 24 * 60 * 60,
             ):
-                sra_files[accession] = str(self._download_run(accession, shared_runs / "sra"))
+                if self._cached_run_fastq(accession, unit_root) is not None:
+                    continue
+                sra_files[accession] = str(
+                    self._download_run(accession, unit_root / ".raw")
+                )
         roots = self._cleanup_roots(unit, destination, unit_root)
         return StagedFastq(
             unit_id=unit.unit_id,
@@ -484,7 +558,7 @@ class SraToolkitProvider:
             timeout_seconds=7 * 24 * 60 * 60,
             stale_after_seconds=7 * 24 * 60 * 60,
         ):
-            cached = _from_manifest(manifest, progress=self.progress)
+            cached = self._unit_cache(unit, manifest)
             if cached is not None:
                 self.progress.message(f"FASTQ unit cache hit after lock: {unit.unit_id}")
                 return cached
@@ -517,26 +591,31 @@ class SraToolkitProvider:
 
         self.runner.require("prefetch", "vdb-validate", "fasterq-dump")
         by_run: dict[str, dict[str, Path]] = {}
-        shared_runs = destination / "_runs"
         for accession in self.progress.track(
             unit.run_accessions,
             f"Materialize FASTQ for {unit.unit_id}",
             unit="runs",
         ):
             with exclusive_file_lock(
-                shared_runs / f".{accession}.lock",
+                unit_root / f".{accession}.lock",
                 timeout_seconds=7 * 24 * 60 * 60,
                 stale_after_seconds=7 * 24 * 60 * 60,
             ):
+                cached_run = self._cached_run_fastq(accession, unit_root)
                 staged_path = staged.metadata.get("sra_files", {}).get(accession)
+                if cached_run is not None:
+                    by_run[accession] = cached_run
+                    continue
                 sra_file = (
                     Path(staged_path)
                     if staged_path and existing_nonempty(Path(staged_path))
-                    else self._download_run(accession, shared_runs / "sra")
+                    else self._download_run(accession, unit_root / ".raw")
                 )
-                by_run[accession] = self._materialize_run(accession, sra_file, shared_runs, threads)
+                by_run[accession] = self._materialize_run(
+                    accession, sra_file, unit_root, threads
+                )
 
-        merged = unit_root / "merged"
+        merged = unit_root
         read1 = self._merge_gzip_members(
             (by_run[run]["read1"] for run in unit.run_accessions if "read1" in by_run[run]),
             merged / f"{safe_id}_1.fastq.gz",
@@ -570,14 +649,12 @@ class SraToolkitProvider:
             output_dir=destination.parent / "results" / safe_id,
             checksums={str(path): sha256_file(path, progress=self.progress) for path in files},
             metadata={
-                "per_run": {
-                    run: {key: str(path) for key, path in value.items()}
-                    for run, value in by_run.items()
-                }
+                "per_run_layout": {run: sorted(value) for run, value in by_run.items()}
             },
         )
         result.validate()
         atomic_write_json(manifest, result.to_dict())
+        self._remove_transient_unit_files(unit_root)
         return result
 
 

@@ -4,6 +4,7 @@ import argparse
 import os
 from pathlib import Path
 
+from .pipeline import PipelinePolicy
 from .workflow import BuilderConfig, DatasetBuilder
 
 
@@ -19,13 +20,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--workspace", type=Path, required=True)
     parser.add_argument("--email", default=os.environ.get("NCBI_EMAIL"))
     parser.add_argument("--retry-failed", action="store_true")
+    parser.add_argument("--cleanup", choices=("after_success", "never"), default="after_success")
+    parser.add_argument("--discard-failed-inputs", action="store_true")
+    parser.add_argument("--no-fsync-logs", action="store_true")
     arguments = parser.parse_args(argv)
+    policy = PipelinePolicy(
+        cleanup=arguments.cleanup,
+        keep_failed_inputs=not arguments.discard_failed_inputs,
+        fsync_logs=not arguments.no_fsync_logs,
+    )
     builder = DatasetBuilder(
         BuilderConfig(
             workspace=arguments.workspace,
             email=arguments.email,
             ncbi_api_key=os.environ.get("NCBI_API_KEY"),
             max_workers=1,
+            pipeline_policy=policy,
             progress_bars=False,
         )
     )

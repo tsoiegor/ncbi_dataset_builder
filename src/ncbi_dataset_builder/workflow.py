@@ -49,6 +49,7 @@ from .pipeline import (
 )
 from .processing.base import Processor, load_processor
 from .progress import ProgressReporter
+from .publishing import DatasetExport, DatasetPublisher, PublishMode
 from .state import TaskStateStore
 from .unit_logging import install_unit_logging, unit_log
 from .util import (
@@ -928,6 +929,167 @@ class DatasetBuilder:
         )
         return _PreparedBatch(entries, manifest)
 
+    def prefetch_batch(
+        self,
+        plan: DatasetPlan,
+        batch_id: int,
+        *,
+        retry_failed: bool = False,
+        policy: PipelinePolicy | None = None,
+        occupied_size_gb: float = 0.0,
+    ) -> BatchManifest:
+        """Stage *batch_id* from *plan* for distributed workers.
+
+        *retry_failed* includes previously failed tasks, *policy* controls storage
+        and logging, and *occupied_size_gb* accounts for a currently running batch.
+        This method does not claim task state; Slurm workers claim their own units.
+        """
+
+        active_policy = policy or self.config.pipeline_policy
+        tasks = [task for task in plan.tasks if task.batch_id == batch_id]
+        if not tasks:
+            raise ValueError(f"Plan {plan.plan_id} has no batch {batch_id}")
+        eligible: list[DatasetTask] = []
+        statuses: dict[str, str] = {}
+        for task in tasks:
+            state = self.state.get(f"{plan.plan_id}__{task.task_id}")
+            status = (state or {}).get("status", "pending")
+            statuses[task.task_id] = status
+            if status == "succeeded" or status == "failed" and not retry_failed:
+                continue
+            eligible.append(task)
+        estimated = sum(task.unit.total_size_gb for task in eligible)
+        self._validate_staging_capacity(
+            estimated_size_gb=estimated,
+            occupied_size_gb=occupied_size_gb,
+            policy=active_policy,
+        )
+        manifest = BatchManifest(
+            plan_id=plan.plan_id,
+            batch_id=batch_id,
+            status="staging",
+            unit_ids=tuple(task.task_id for task in tasks),
+            estimated_size_gb=estimated,
+            task_statuses=statuses,
+            log_paths={task.task_id: str(self._unit_log_path(plan.plan_id, task)) for task in tasks},
+        )
+        self.batch_state.save(manifest)
+        cleanup_roots: dict[str, list[str]] = {}
+        staging_failed = False
+        for task in eligible:
+            log_path = self._unit_log_path(plan.plan_id, task)
+            try:
+                with (
+                    unit_log(
+                        log_path,
+                        phase="distributed-prefetch",
+                        unit_id=task.task_id,
+                        fsync=active_policy.fsync_logs,
+                    ),
+                    self.progress.minimum_level(logging.WARNING),
+                ):
+                    if task.unit.taxid is None:
+                        raise ValueError(f"Task {task.task_id} has no species taxid")
+                    self.genomes.resolve(
+                        taxid=task.unit.taxid,
+                        scientific_name=task.unit.scientific_name,
+                        pin=task.genome_pin,
+                    )
+                    staged = self._stage_fastq(task)
+                    cleanup_roots[task.task_id] = [str(path) for path in staged.cleanup_roots]
+                    statuses[task.task_id] = "ready"
+            except Exception:  # noqa: BLE001 - worker receives a later independent retry
+                staging_failed = True
+                statuses[task.task_id] = "staging_failed"
+                error = traceback.format_exc()
+                with unit_log(
+                    log_path,
+                    phase="distributed-prefetch-error",
+                    unit_id=task.task_id,
+                    fsync=active_policy.fsync_logs,
+                ):
+                    LOGGER.error("Distributed prefetch failed; worker will retry:\n%s", error)
+                self.progress.message(
+                    f"Prefetch failed for {task.task_id}; its worker will retry",
+                    level=logging.WARNING,
+                )
+        roots = tuple(Path(path) for values in cleanup_roots.values() for path in values)
+        staged_size = paths_size_gb(list(roots))
+        available = free_space_gb(self.config.workspace)
+        storage_error: str | None = None
+        if (
+            active_policy.max_staged_gb is not None
+            and occupied_size_gb + staged_size > active_policy.max_staged_gb
+        ):
+            storage_error = (
+                "Measured distributed staging exceeds max_staged_gb: "
+                f"{occupied_size_gb:.3f} GB present + {staged_size:.3f} GB staged > "
+                f"{active_policy.max_staged_gb:.3f} GB"
+            )
+        elif available < active_policy.minimum_free_gb:
+            storage_error = (
+                "Measured free storage is below minimum_free_gb after distributed staging: "
+                f"{available:.3f} GB < {active_policy.minimum_free_gb:.3f} GB"
+            )
+        manifest = replace(
+            manifest,
+            status="partially_failed" if staging_failed or storage_error else "ready",
+            staged_size_gb=staged_size,
+            retained_size_gb=staged_size,
+            free_space_gb=available,
+            task_statuses=statuses,
+            cleanup_roots=cleanup_roots,
+            updated_at=utc_timestamp(),
+        )
+        self.batch_state.save(manifest)
+        if storage_error is not None:
+            self.progress.message(storage_error, level=logging.ERROR)
+            raise RuntimeError(storage_error)
+        self.progress.message(
+            f"Batch {batch_id} prefetched: {len(eligible):,} eligible units; "
+            f"{staged_size:.3f} GB staged",
+            level=logging.WARNING if staging_failed else logging.INFO,
+        )
+        return manifest
+
+    def finalize_distributed_batch(self, plan: DatasetPlan, batch_id: int) -> BatchManifest:
+        """Finalize distributed *batch_id* state for *plan* after its Slurm array exits."""
+
+        tasks = [task for task in plan.tasks if task.batch_id == batch_id]
+        if not tasks:
+            raise ValueError(f"Plan {plan.plan_id} has no batch {batch_id}")
+        prior = self.batch_state.get(plan.plan_id, batch_id)
+        if prior is None:
+            raise ValueError(f"Batch {batch_id} has no staging manifest")
+        statuses = {
+            task.task_id: (
+                self.state.get(f"{plan.plan_id}__{task.task_id}") or {"status": "pending"}
+            ).get("status", "pending")
+            for task in tasks
+        }
+        roots = tuple(Path(path) for values in prior.cleanup_roots.values() for path in values)
+        retained = paths_size_gb(list(roots))
+        terminal = all(status in {"succeeded", "failed"} for status in statuses.values())
+        all_succeeded = all(status == "succeeded" for status in statuses.values())
+        status = (
+            "cleaned"
+            if all_succeeded and retained == 0
+            else "completed"
+            if all_succeeded
+            else "partially_failed"
+        )
+        manifest = replace(
+            prior,
+            status=status,
+            retained_size_gb=retained,
+            free_space_gb=free_space_gb(self.config.workspace),
+            task_statuses=statuses,
+            updated_at=utc_timestamp(),
+            completed_at=utc_timestamp() if terminal else None,
+        )
+        self.batch_state.save(manifest)
+        return manifest
+
     def _process_prepared_task(
         self,
         prepared: _PreparedTask,
@@ -1338,11 +1500,45 @@ class DatasetBuilder:
             ),
         )
         active_policy = policy or self.config.pipeline_policy
+        if options.mode == "distributed":
+            resource_specs = {task.resources for task in selected_tasks}
+            if len(resource_specs) != 1:
+                raise ValueError(
+                    "Distributed Slurm execution requires one ResourceSpec across selected tasks"
+                )
+            per_unit_threads = max(task.resources.threads for task in selected_tasks)
+            workers = options.worker_parallelism(per_unit_threads)
+            self.progress.message(
+                f"Distributed Slurm quota permits {workers:,} concurrent units at "
+                f"{per_unit_threads:,} CPUs each"
+            )
+            script = executor.create_dispatcher_script(
+                plan_path=saved_plan,
+                processor_reference=processor_reference,
+                workspace=self.config.workspace,
+                email=self.config.email,
+                output_path=target_script,
+                options=options,
+                prefetch_batches=active_policy.prefetch_batches,
+                max_staged_gb=active_policy.max_staged_gb,
+                minimum_free_gb=active_policy.minimum_free_gb,
+                cleanup=active_policy.cleanup,
+                keep_failed_inputs=active_policy.keep_failed_inputs,
+                fsync_logs=active_policy.fsync_logs,
+                retry_failed=retry_failed,
+                batch_ids=batch_ids,
+            )
+            return script, executor.submit(script) if submit else None
         workers = options.max_parallel or self.config.max_workers
         per_unit_threads = max(task.resources.threads for task in selected_tasks)
         per_unit_memory_gb = max(task.resources.memory_gb for task in selected_tasks)
         total_threads = self.config.total_threads or per_unit_threads * workers
         total_memory_gb = self.config.total_memory_gb or per_unit_memory_gb * workers
+        if options.cpus_per_node is not None and total_threads > options.cpus_per_node:
+            raise ValueError(
+                f"Single-node Slurm request needs {total_threads} CPUs but "
+                f"cpus_per_node={options.cpus_per_node}"
+            )
         workers = min(workers, max(1, total_threads // per_unit_threads))
         workers = min(workers, max(1, int(total_memory_gb // per_unit_memory_gb)))
         script = executor.create_coordinator_script(
@@ -1390,3 +1586,23 @@ class DatasetBuilder:
             if (saved := self.batch_state.get(plan.plan_id, batch_id)) is not None
         ]
         return summary
+
+    def publish_dataset(
+        self,
+        plan: DatasetPlan,
+        destination: Path | None = None,
+        *,
+        mode: PublishMode = "auto",
+        overwrite: bool = False,
+    ) -> DatasetExport:
+        """Publish completed *plan* into compact *destination* using *mode*.
+
+        *overwrite* permits atomic replacement of an existing published dataset.
+        """
+
+        return DatasetPublisher(self.config.workspace, progress=self.progress).publish(
+            plan,
+            destination,
+            mode=mode,
+            overwrite=overwrite,
+        )

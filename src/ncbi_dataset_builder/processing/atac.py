@@ -179,7 +179,11 @@ class AtacSeqProcessor:
     def _ensure_index(self, genome: GenomeRef, threads: int) -> Path:
         """Return a complete Bowtie2 index for *genome*, building with *threads*."""
 
-        index_dir = genome.fasta.parent / "bowtie2"
+        legacy_prefix = genome.fasta.parent / "bowtie2" / genome.accession
+        if self._index_complete(legacy_prefix):
+            self.progress.message(f"Bowtie2 index cache hit: {genome.accession}")
+            return legacy_prefix
+        index_dir = genome.fasta.parent / "indexes" / sanitize_identifier(genome.accession)
         prefix = index_dir / genome.accession
         if self._index_complete(prefix):
             self.progress.message(f"Bowtie2 index cache hit: {genome.accession}")

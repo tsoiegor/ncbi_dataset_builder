@@ -1,7 +1,7 @@
 """Public API for building reproducible datasets from NCBI resources."""
 
 from .catalog import RunCatalog, validate_polars_runtime
-from .descriptions import DescriptionPolicy
+from .descriptions import DescriptionPolicy, training_fields_by_experiment
 from .execution import LocalExecutor, SlurmExecutor, SlurmOptions
 from .fastq import AtomicDownloader, GeoFastqProvider, SraToolkitProvider, StagedFastqProvider
 from .genomes import GenomeManager, GenomeSelectionPolicy
@@ -28,6 +28,7 @@ from .models import (
 from .pipeline import BatchManifest, BatchStateStore, PipelinePolicy
 from .processing import AtacSeqConfig, AtacSeqProcessor, Processor, process_atac
 from .progress import ProgressReporter, ProgressTask
+from .publishing import DatasetExport, DatasetPublisher, PublishMode
 from .unit_logging import current_unit_log_handle, current_unit_log_path
 from .workflow import BuilderConfig, DatasetBuilder
 
@@ -40,7 +41,9 @@ __all__ = [
     "BioSampleClient",
     "BuilderConfig",
     "DatasetBuilder",
+    "DatasetExport",
     "DatasetPlan",
+    "DatasetPublisher",
     "DatasetTask",
     "DescriptionPolicy",
     "EntrezClient",
@@ -60,6 +63,7 @@ __all__ = [
     "Processor",
     "ProgressReporter",
     "ProgressTask",
+    "PublishMode",
     "ResourceSpec",
     "RunCatalog",
     "SlurmExecutor",
@@ -73,7 +77,8 @@ __all__ = [
     "process_atac",
     "sanitize_legacy_metadata",
     "sanitize_presentation_markup",
+    "training_fields_by_experiment",
     "validate_polars_runtime",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
