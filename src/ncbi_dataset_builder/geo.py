@@ -14,21 +14,35 @@ from .metadata import EntrezClient, SraClient, _tag, _text
 
 @dataclass(frozen=True)
 class GeoSupplementaryFile:
+    """Describe one GEO supplementary file.
+
+    Args:
+        geo_accession: Parent GSE or GSM accession.
+        url: Download URL declared by GEO.
+        filename: File name derived from the URL.
+    """
+
     geo_accession: str
     url: str
     filename: str
 
 
 class GeoClient:
-    """Resolve GEO records through NCBI links and discover supplementary files."""
+    """Use configured Entrez and SRA clients to resolve GEO sequencing data."""
 
     def __init__(self, entrez: EntrezClient, sra: SraClient) -> None:
+        """Store *entrez* for GEO links and *sra* for linked RunInfo retrieval."""
+
         self.entrez = entrez
         self.sra = sra
 
     def resolve_to_sra(self, accessions: list[str]) -> RunCatalog:
+        """Resolve GSE or GSM *accessions* to a deduplicated SRA run catalog."""
+
         sra_ids: list[str] = []
-        for accession in accessions:
+        for accession in self.entrez.progress.track(
+            accessions, "Resolve GEO accessions", unit="accessions"
+        ):
             gds_ids = self.entrez.search_ids("gds", f"{accession}[ACCN]", limit=100)
             if not gds_ids:
                 raise MetadataError(f"GEO accession was not found: {accession}")
@@ -52,6 +66,8 @@ class GeoClient:
 
     @staticmethod
     def _series_stem(accession: str) -> str:
+        """Return the GEO FTP bucket stem for GSE *accession*."""
+
         match = re.fullmatch(r"GSE(\d+)", accession.upper())
         if not match:
             raise ValueError("GEO MINiML discovery requires a GSE accession")
@@ -59,6 +75,8 @@ class GeoClient:
         return f"GSE{digits[:-3]}nnn" if len(digits) > 3 else "GSEnnn"
 
     def discover_supplementary(self, series_accession: str) -> list[GeoSupplementaryFile]:
+        """Return files declared in the MINiML archive for *series_accession*."""
+
         accession = series_accession.upper()
         stem = self._series_stem(accession)
         url = (
@@ -66,6 +84,7 @@ class GeoClient:
             f"miniml/{accession}_family.xml.tgz"
         )
         payload = self.entrez.http.request(url).body
+        self.entrez.progress.message(f"Downloaded GEO MINiML archive for {accession}")
         try:
             with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
                 xml_members = [

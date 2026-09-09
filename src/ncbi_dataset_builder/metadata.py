@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import re
+import threading
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -19,18 +20,36 @@ from .catalog import RunCatalog
 from .descriptions import DescriptionPolicy, training_descriptions
 from .errors import MetadataError
 from .http import HttpClient
-from .util import atomic_write_json, atomic_write_text
+from .progress import ProgressReporter, get_progress
+from .util import atomic_write_bytes, atomic_write_json, atomic_write_text, read_json
 
 EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 _SAFE_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]*\Z")
 _HTML_TAG = re.compile(r"</?[A-Za-z][^>]*>")
 
 
+def _client_progress(client: Any) -> ProgressReporter:
+    """Return the configured reporter for *client* or a disabled fallback."""
+
+    return get_progress(getattr(client, "progress", None))
+
+
+def _response_cached(client: Any, endpoint: str, params: Mapping[str, Any]) -> bool:
+    """Return whether *client* reports cached *endpoint* and *params*."""
+
+    checker = getattr(client, "is_cached", None)
+    return bool(checker and checker(endpoint, params))
+
+
 def _tag(element: ET.Element) -> str:
+    """Return local tag name for possibly namespaced XML *element*."""
+
     return element.tag.rsplit("}", 1)[-1]
 
 
 def _text(element: ET.Element | None) -> str | None:
+    """Return whitespace-normalized descendant text from *element*."""
+
     if element is None:
         return None
     value = " ".join("".join(element.itertext()).split())
@@ -38,22 +57,30 @@ def _text(element: ET.Element | None) -> str | None:
 
 
 def _child(element: ET.Element | None, tag: str) -> ET.Element | None:
+    """Return the first direct child of *element* with local *tag*."""
+
     if element is None:
         return None
     return next((node for node in element if _tag(node) == tag), None)
 
 
 def _descendant(element: ET.Element | None, tag: str) -> ET.Element | None:
+    """Return the first descendant of *element* with local *tag*."""
+
     if element is None:
         return None
     return next((node for node in element.iter() if _tag(node) == tag), None)
 
 
 def _descendant_text(element: ET.Element | None, tag: str) -> str | None:
+    """Return normalized text from *element*'s first descendant named *tag*."""
+
     return _text(_descendant(element, tag))
 
 
 def _integer(value: str | None) -> int | None:
+    """Convert string *value* to an integer, returning ``None`` when invalid."""
+
     if value in (None, ""):
         return None
     try:
@@ -62,8 +89,15 @@ def _integer(value: str | None) -> int | None:
         return None
 
 
+def _gigabytes(value: str | None) -> float | None:
+    """Convert an optional byte-count *value* from XML to decimal GB."""
+
+    parsed = _integer(value)
+    return parsed / 1_000_000_000 if parsed is not None else None
+
+
 def xml_to_dict(element: ET.Element) -> dict[str, Any]:
-    """Represent XML while retaining attributes, direct text, and repeated nodes."""
+    """Convert XML *element* to a dictionary without losing repeats or attributes."""
 
     value: dict[str, Any] = {}
     if element.attrib:
@@ -85,6 +119,8 @@ def xml_to_dict(element: ET.Element) -> dict[str, Any]:
 
 
 def _append_mapping_value(result: dict[str, str | list[str]], name: str, value: str) -> None:
+    """Append *value* under *name* in *result*, promoting repeats to a list."""
+
     previous = result.get(name)
     if previous is None:
         result[name] = value
@@ -95,6 +131,8 @@ def _append_mapping_value(result: dict[str, str | list[str]], name: str, value: 
 
 
 def _attribute_records(parent: ET.Element | None) -> list[dict[str, Any]]:
+    """Extract named values, units, and properties below attribute *parent*."""
+
     records: list[dict[str, Any]] = []
     if parent is None:
         return records
@@ -126,6 +164,8 @@ def _attribute_records(parent: ET.Element | None) -> list[dict[str, Any]]:
 
 
 def _attributes(parent: ET.Element | None) -> dict[str, str | list[str]]:
+    """Flatten attribute records below *parent* while preserving repeated names."""
+
     result: dict[str, str | list[str]] = {}
     for record in _attribute_records(parent):
         value = record["value"]
@@ -136,6 +176,8 @@ def _attributes(parent: ET.Element | None) -> dict[str, str | list[str]]:
 
 
 def _identifier_records(parent: ET.Element | None) -> list[dict[str, Any]]:
+    """Extract typed and namespaced identifier records from XML *parent*."""
+
     container = _child(parent, "IDENTIFIERS")
     if container is None:
         container = _child(parent, "Ids")
@@ -171,6 +213,8 @@ def _identifier_records(parent: ET.Element | None) -> list[dict[str, Any]]:
 
 
 def _identifier_value(records: list[dict[str, Any]], namespace: str) -> str | None:
+    """Return the first identifier in *records* matching *namespace*."""
+
     expected = namespace.casefold()
     return next(
         (
@@ -183,6 +227,8 @@ def _identifier_value(records: list[dict[str, Any]], namespace: str) -> str | No
 
 
 def _links(parent: ET.Element | None) -> list[dict[str, Any]]:
+    """Normalize cross-reference, URL, and Entrez links below *parent*."""
+
     if parent is None:
         return []
     records: list[dict[str, Any]] = []
@@ -221,6 +267,8 @@ def _links(parent: ET.Element | None) -> list[dict[str, Any]]:
 
 
 def _library(experiment: ET.Element) -> dict[str, Any]:
+    """Extract library strategy, source, layout, and protocol from *experiment*."""
+
     descriptor = _descendant(experiment, "LIBRARY_DESCRIPTOR")
     if descriptor is None:
         return {}
@@ -238,6 +286,8 @@ def _library(experiment: ET.Element) -> dict[str, Any]:
 
 
 def _platform(experiment: ET.Element) -> dict[str, Any]:
+    """Extract sequencing platform and instrument model from *experiment*."""
+
     platform = _child(experiment, "PLATFORM")
     implementation = next(iter(platform), None) if platform is not None else None
     if implementation is None:
@@ -249,6 +299,8 @@ def _platform(experiment: ET.Element) -> dict[str, Any]:
 
 
 def _organization(element: ET.Element | None) -> dict[str, Any] | None:
+    """Extract submitting organization and contacts from XML *element*."""
+
     if element is None:
         return None
     name = _child(element, "Name")
@@ -271,6 +323,8 @@ def _organization(element: ET.Element | None) -> dict[str, Any] | None:
 
 
 def _members(parent: ET.Element | None) -> list[dict[str, Any]]:
+    """Extract pooled member identifiers and BioSample/GEO links from *parent*."""
+
     if parent is None:
         return []
     records: list[dict[str, Any]] = []
@@ -285,6 +339,8 @@ def _members(parent: ET.Element | None) -> list[dict[str, Any]]:
 
 
 def _run_files(run: ET.Element) -> list[dict[str, Any]]:
+    """Extract SRA file locations and alternatives from *run*."""
+
     records: list[dict[str, Any]] = []
     for element in (node for node in run.iter() if _tag(node) == "SRAFile"):
         record: dict[str, Any] = dict(element.attrib)
@@ -298,6 +354,8 @@ def _run_files(run: ET.Element) -> list[dict[str, Any]]:
 
 
 def _study_record(study: ET.Element, *, include_raw: bool) -> dict[str, Any]:
+    """Normalize SRA *study* XML; *include_raw* retains its complete tree."""
+
     identifiers = _identifier_records(study)
     study_type = _descendant(study, "STUDY_TYPE")
     links = _links(_child(study, "STUDY_LINKS"))
@@ -327,6 +385,8 @@ def _study_record(study: ET.Element, *, include_raw: bool) -> dict[str, Any]:
 
 
 def _experiment_record(experiment: ET.Element, *, include_raw: bool) -> dict[str, Any]:
+    """Normalize SRA *experiment* XML; *include_raw* retains its complete tree."""
+
     identifiers = _identifier_records(experiment)
     study_ref = _descendant(experiment, "STUDY_REF")
     sample_ref = _descendant(experiment, "SAMPLE_DESCRIPTOR")
@@ -350,6 +410,8 @@ def _experiment_record(experiment: ET.Element, *, include_raw: bool) -> dict[str
 
 
 def _sample_record(sample: ET.Element, *, include_raw: bool) -> dict[str, Any]:
+    """Normalize SRA *sample* XML; *include_raw* retains its complete tree."""
+
     identifiers = _identifier_records(sample)
     record: dict[str, Any] = {
         "accession": sample.attrib.get("accession") or sample.attrib.get("alias"),
@@ -372,6 +434,8 @@ def _sample_record(sample: ET.Element, *, include_raw: bool) -> dict[str, Any]:
 def _submission_record(
     submission: ET.Element, organization: ET.Element | None, *, include_raw: bool
 ) -> dict[str, Any]:
+    """Normalize SRA *submission* and *organization*; *include_raw* retains XML."""
+
     record: dict[str, Any] = {
         "accession": submission.attrib.get("accession") or submission.attrib.get("alias"),
         "alias": submission.attrib.get("alias"),
@@ -388,6 +452,8 @@ def _submission_record(
 
 
 def _run_record(run: ET.Element, *, include_raw: bool) -> dict[str, Any]:
+    """Normalize SRA *run* XML; *include_raw* retains its complete tree."""
+
     experiment_ref = _child(run, "EXPERIMENT_REF")
     statistics = _child(run, "Statistics")
     title_node = _child(run, "TITLE")
@@ -404,7 +470,7 @@ def _run_record(run: ET.Element, *, include_raw: bool) -> dict[str, Any]:
         else None,
         "spots": _integer(run.attrib.get("total_spots")),
         "bases": _integer(run.attrib.get("total_bases")),
-        "size_bytes": _integer(run.attrib.get("size")),
+        "size_gb": _gigabytes(run.attrib.get("size")),
         "published_at": run.attrib.get("published"),
         "loaded": run.attrib.get("load_done"),
         "is_public": run.attrib.get("is_public"),
@@ -425,6 +491,19 @@ def _run_record(run: ET.Element, *, include_raw: bool) -> dict[str, Any]:
 
 @dataclass
 class MetadataBundle:
+    """Hold normalized metadata collections and their relations.
+
+    Args:
+        packages: Links among experiments, samples, studies, submissions, and runs.
+        runs: Normalized SRA run records.
+        experiments: Normalized experiment and library records.
+        sra_samples: Normalized SRA Sample records.
+        studies: Normalized SRA Study records.
+        submissions: Normalized submission records.
+        biosamples: Linked NCBI BioSample records.
+        raw_sra_packages: Optional complete Experiment Package trees.
+    """
+
     packages: list[dict[str, Any]] = field(default_factory=list)
     runs: list[dict[str, Any]] = field(default_factory=list)
     experiments: list[dict[str, Any]] = field(default_factory=list)
@@ -435,6 +514,8 @@ class MetadataBundle:
     raw_sra_packages: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
+        """Return all bundle collections as one JSON-compatible mapping."""
+
         return {
             "packages": self.packages,
             "runs": self.runs,
@@ -446,15 +527,53 @@ class MetadataBundle:
             "raw_sra_packages": self.raw_sra_packages,
         }
 
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> MetadataBundle:
+        """Restore a metadata bundle from serialized mapping *value*."""
+
+        if not isinstance(value, Mapping):
+            raise TypeError("Metadata bundle must be a mapping")
+        collections: dict[str, list[dict[str, Any]]] = {}
+        for name in (
+            "packages",
+            "runs",
+            "experiments",
+            "sra_samples",
+            "studies",
+            "submissions",
+            "biosamples",
+            "raw_sra_packages",
+        ):
+            records = value.get(name, [])
+            if not isinstance(records, list) or any(not isinstance(row, dict) for row in records):
+                raise TypeError(f"Metadata collection {name!r} must be a list of mappings")
+            collections[name] = records
+        return cls(**collections)
+
+    @classmethod
+    def load(cls, path: str | Path, *, progress: ProgressReporter | None = None) -> MetadataBundle:
+        """Load a bundle from JSON file or directory *path* with *progress*."""
+
+        source = Path(path)
+        if source.is_dir():
+            source = source / "metadata.json"
+        reporter = get_progress(progress)
+        with reporter.task("Load normalized metadata", total=1, unit="bundle") as task:
+            bundle = cls.from_dict(read_json(source))
+            task.update()
+        return bundle
+
     @staticmethod
     def _selected(
         records: list[dict[str, Any]], accessions: Iterable[str | None]
     ) -> list[dict[str, Any]]:
+        """Select *records* whose accession appears in *accessions*."""
+
         wanted = {accession for accession in accessions if accession}
         return [record for record in records if record.get("accession") in wanted]
 
     def subset_experiments(self, accessions: Iterable[str]) -> MetadataBundle:
-        """Restrict a bundle to catalog experiments, preserving linked sample context."""
+        """Keep experiment *accessions* and every entity linked to them."""
         wanted = set(accessions)
         packages = [row for row in self.packages if row.get("experiment_accession") in wanted]
         samples = self._selected(
@@ -485,17 +604,28 @@ class MetadataBundle:
         profile: str = "training",
         policy: DescriptionPolicy | None = None,
         legacy_descriptions: Mapping[str, dict[str, Any]] | None = None,
+        progress: ProgressReporter | None = None,
     ) -> dict[str, dict[str, Any]]:
-        """Return compact training descriptions, or complete records with profile='full'."""
+        """Build per-sample descriptions using *profile*, *policy*, and *progress*.
+
+        ``training`` returns compact records; ``full`` returns nested provenance.
+        *legacy_descriptions* optionally preserves fields from old final outputs.
+        """
         if profile == "training":
             return training_descriptions(
-                self, policy=policy, legacy_descriptions=legacy_descriptions
+                self,
+                policy=policy,
+                legacy_descriptions=legacy_descriptions,
+                progress=progress,
             )
         if profile != "full":
             raise ValueError("description profile must be 'training' or 'full'")
 
         descriptions: dict[str, dict[str, Any]] = {}
-        for sample in self.sra_samples:
+        reporter = get_progress(progress)
+        for sample in reporter.track(
+            self.sra_samples, "Build full sample descriptions", unit="samples"
+        ):
             accession = sample.get("accession")
             if not accession:
                 continue
@@ -558,12 +688,31 @@ class MetadataBundle:
         profile: str = "training",
         policy: DescriptionPolicy | None = None,
         legacy_descriptions: Mapping[str, dict[str, Any]] | None = None,
+        progress: ProgressReporter | None = None,
     ) -> None:
+        """Write descriptions below *directory* using *profile*, *policy*, and *progress*.
+
+        *legacy_descriptions* supplies optional compatibility records keyed by sample ID.
+        """
+
         directory.mkdir(parents=True, exist_ok=True)
-        for accession, description in self.descriptions_by_sample(
-            profile=profile, policy=policy, legacy_descriptions=legacy_descriptions
-        ).items():
-            atomic_write_json(directory / f"{accession}.json", description)
+        reporter = get_progress(progress)
+        descriptions = self.descriptions_by_sample(
+            profile=profile,
+            policy=policy,
+            legacy_descriptions=legacy_descriptions,
+            progress=reporter,
+        )
+        written = 0
+        unchanged = 0
+        for accession, description in reporter.track(
+            descriptions.items(), "Save sample descriptions", unit="samples"
+        ):
+            if atomic_write_json(directory / f"{accession}.json", description):
+                written += 1
+            else:
+                unchanged += 1
+        reporter.message(f"Sample description files: {unchanged:,} unchanged; {written:,} written")
 
     def save(
         self,
@@ -572,10 +721,22 @@ class MetadataBundle:
         description_profile: str = "training",
         policy: DescriptionPolicy | None = None,
         legacy_descriptions: Mapping[str, dict[str, Any]] | None = None,
+        progress: ProgressReporter | None = None,
     ) -> None:
+        """Persist complete metadata and selected per-sample descriptions.
+
+        *directory* receives normalized JSON/NDJSON. *description_profile* and
+        *policy* control compact files; *legacy_descriptions* preserves old
+        values; and *progress* reports generation and writes.
+        """
+
+        reporter = get_progress(progress)
         directory.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(directory / "metadata.json", self.to_dict())
-        for name in (
+        reporter.message(f"Save complete normalized metadata to {directory}")
+        with reporter.task("Save complete metadata JSON", total=1, unit="file") as task:
+            atomic_write_json(directory / "metadata.json", self.to_dict())
+            task.update()
+        collections = (
             "packages",
             "runs",
             "experiments",
@@ -583,7 +744,8 @@ class MetadataBundle:
             "studies",
             "submissions",
             "biosamples",
-        ):
+        )
+        for name in reporter.track(collections, "Save normalized tables", unit="tables"):
             rows = getattr(self, name)
             if rows:
                 text = "\n".join(
@@ -595,9 +757,12 @@ class MetadataBundle:
             profile=description_profile,
             policy=policy,
             legacy_descriptions=legacy_descriptions,
+            progress=reporter,
         )
 
     def attach_to_runs(self, catalog: RunCatalog) -> RunCatalog:
+        """Join normalized metadata columns onto *catalog* by entity accession."""
+
         frame = catalog.frame
         if self.runs:
             run_fields = [
@@ -606,7 +771,7 @@ class MetadataBundle:
                     "sra_run_title": row.get("title"),
                     "sra_run_spots": row.get("spots"),
                     "sra_run_bases": row.get("bases"),
-                    "sra_run_size_bytes": row.get("size_bytes"),
+                    "sra_run_size_gb": row.get("size_gb"),
                     "sra_run_published_at": row.get("published_at"),
                 }
                 for row in self.runs
@@ -674,7 +839,7 @@ class MetadataBundle:
 
 
 class EntrezClient:
-    """Official E-utilities client with API-key-aware rate limiting."""
+    """Call NCBI E-utilities with identity, rate limiting, and optional raw caching."""
 
     def __init__(
         self,
@@ -684,36 +849,103 @@ class EntrezClient:
         tool: str = "ncbi_dataset_builder",
         cache_dir: Path | None = None,
         http: HttpClient | None = None,
+        progress: ProgressReporter | None = None,
     ) -> None:
+        """Configure NCBI identity, credentials, cache, and HTTP transport.
+
+        *email* is the required contact, *api_key* enables the higher NCBI rate,
+        *tool* names this client, *cache_dir* stores raw responses, *http* can
+        inject a custom transport, and *progress* reports cache/network work.
+        """
+
         if not email:
             raise ValueError("NCBI requires a contact email")
         self.email = email
         self.api_key = api_key
         self.tool = tool
         self.cache_dir = cache_dir
+        self.progress = get_progress(progress)
+        self._statistics_lock = threading.Lock()
+        self._cache_hits = 0
+        self._network_requests = 0
         self.http = http or HttpClient(
             user_agent=f"{tool}/0.1 ({email})",
             requests_per_second=10.0 if api_key else 3.0,
         )
 
     def _params(self, values: dict[str, Any]) -> dict[str, Any]:
+        """Add configured NCBI identity fields to request parameter *values*."""
+
         result = {**values, "email": self.email, "tool": self.tool}
         if self.api_key:
             result["api_key"] = self.api_key
         return result
 
-    def get(self, endpoint: str, params: dict[str, Any]) -> bytes:
+    def _cache_path(self, endpoint: str, params: Mapping[str, Any]) -> Path | None:
+        """Return the raw-cache path for *endpoint* and *params*, when configured."""
+
+        if self.cache_dir is None:
+            return None
+        digest = hashlib.sha256(
+            (endpoint + json.dumps(params, sort_keys=True)).encode()
+        ).hexdigest()[:20]
+        return self.cache_dir / "raw" / f"{endpoint}.{digest}.raw"
+
+    def is_cached(self, endpoint: str, params: Mapping[str, Any]) -> bool:
+        """Return whether *endpoint* and *params* have a non-empty raw response."""
+
+        path = self._cache_path(endpoint, params)
+        try:
+            return path is not None and path.is_file() and path.stat().st_size > 0
+        except FileNotFoundError:
+            return False
+
+    def statistics(self) -> dict[str, int]:
+        """Return thread-safe cumulative raw cache and network request counts."""
+
+        with self._statistics_lock:
+            return {
+                "raw_cache_hits": self._cache_hits,
+                "network_requests": self._network_requests,
+            }
+
+    def get(
+        self,
+        endpoint: str,
+        params: dict[str, Any],
+        *,
+        refresh: bool = False,
+        read_cache: bool = True,
+    ) -> bytes:
+        """Return E-utilities *endpoint* bytes for *params*.
+
+        A non-empty raw response is reused when *read_cache* is true. *refresh*
+        bypasses and replaces it with a new successful HTTP response.
+        """
+
+        cache = self._cache_path(endpoint, params)
+        if cache is not None and read_cache and not refresh:
+            try:
+                if cache.is_file() and cache.stat().st_size > 0:
+                    with self._statistics_lock:
+                        self._cache_hits += 1
+                    return cache.read_bytes()
+            except FileNotFoundError:
+                pass
         response = self.http.request(f"{EUTILS}/{endpoint}", params=self._params(params))
-        if self.cache_dir is not None:
-            digest = hashlib.sha256(
-                (endpoint + json.dumps(params, sort_keys=True)).encode()
-            ).hexdigest()[:20]
-            path = self.cache_dir / "raw" / f"{endpoint}.{digest}.raw"
-            if not path.exists():
-                atomic_write_text(path, response.text)
+        with self._statistics_lock:
+            self._network_requests += 1
+        if cache is not None:
+            atomic_write_bytes(cache, response.body)
         return response.body
 
-    def search_history(self, database: str, query: str) -> dict[str, Any]:
+    def search_history(self, database: str, query: str, *, refresh: bool = False) -> dict[str, Any]:
+        """Create Entrez history for *query* in *database*.
+
+        *refresh* bypasses cached HTTP data. History responses are never read
+        from cache because their WebEnv tokens expire.
+        """
+
         payload = json.loads(
             self.get(
                 "esearch.fcgi",
@@ -724,6 +956,8 @@ class EntrezClient:
                     "retmax": 0,
                     "usehistory": "y",
                 },
+                refresh=refresh,
+                read_cache=False,
             )
         )["esearchresult"]
         return {
@@ -732,11 +966,24 @@ class EntrezClient:
             "webenv": payload["webenv"],
         }
 
-    def search_ids(self, database: str, query: str, *, limit: int = 100_000) -> list[str]:
+    def search_ids(
+        self,
+        database: str,
+        query: str,
+        *,
+        limit: int = 100_000,
+        refresh: bool = False,
+    ) -> list[str]:
+        """Return at most *limit* Entrez IDs for *query* in *database*.
+
+        *refresh* bypasses a cached ESearch response.
+        """
+
         payload = json.loads(
             self.get(
                 "esearch.fcgi",
                 {"db": database, "term": query, "retmode": "json", "retmax": limit},
+                refresh=refresh,
             )
         )["esearchresult"]
         count = int(payload.get("count", 0))
@@ -754,8 +1001,13 @@ class EntrezClient:
         *,
         field: str = "Accession",
         batch_size: int = 50,
+        refresh: bool = False,
     ) -> list[str]:
-        """Resolve public accessions to numeric Entrez UIDs before EFetch."""
+        """Resolve *identifiers* from *field* to UIDs in *database*.
+
+        Requests contain at most *batch_size* accessions, and *refresh* bypasses
+        cached ESearch responses.
+        """
 
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
@@ -769,29 +1021,71 @@ class EntrezClient:
         for accession in accessions:
             if not _SAFE_IDENTIFIER.fullmatch(accession):
                 raise ValueError(f"Unsafe database identifier: {accession!r}")
-        for start in range(0, len(accessions), batch_size):
-            batch = accessions[start : start + batch_size]
-            query = " OR ".join(f'"{accession}"[{field}]' for accession in batch)
-            resolved.extend(self.search_ids(database, query))
+        queries = [
+            " OR ".join(
+                f'"{accession}"[{field}]' for accession in accessions[start : start + batch_size]
+            )
+            for start in range(0, len(accessions), batch_size)
+        ]
+        reporter = _client_progress(self)
+        cached = (
+            sum(
+                _response_cached(
+                    self,
+                    "esearch.fcgi",
+                    {"db": database, "term": query, "retmode": "json", "retmax": 100_000},
+                )
+                for query in queries
+            )
+            if not refresh
+            else 0
+        )
+        reporter.network_summary(
+            f"Resolve {database} accessions",
+            cached=cached,
+            to_fetch=len(queries) - cached,
+            unit="request batches",
+        )
+        for query in reporter.track(queries, f"Resolve {database} accessions", unit="batches"):
+            resolved.extend(self.search_ids(database, query, refresh=refresh))
         return list(dict.fromkeys(resolved))
 
 
 class SraClient:
+    """Fetch and normalize SRA RunInfo and Experiment Package records."""
+
     def __init__(self, entrez: EntrezClient) -> None:
+        """Use configured *entrez* for all SRA requests."""
+
         self.entrez = entrez
 
     @staticmethod
     def _parse_runinfo(payload: bytes) -> list[dict[str, Any]]:
+        """Parse RunInfo CSV *payload* into row dictionaries."""
+
         text = payload.decode("utf-8-sig", errors="replace")
         reader = csv.DictReader(io.StringIO(text))
         if not reader.fieldnames or "Run" not in reader.fieldnames:
             raise MetadataError(f"Unexpected SRA RunInfo response header: {reader.fieldnames!r}")
         return [dict(row) for row in reader if row.get("Run")]
 
-    def fetch_runinfo(self, query: str, *, page_size: int = 5000) -> RunCatalog:
-        history = self.entrez.search_history("sra", query)
+    def fetch_runinfo(
+        self, query: str, *, page_size: int = 5000, refresh: bool = False
+    ) -> RunCatalog:
+        """Fetch complete RunInfo for Entrez *query* in pages of *page_size*.
+
+        *refresh* bypasses cached Entrez responses.
+        """
+
+        history = self.entrez.search_history("sra", query, refresh=refresh)
         records: list[dict[str, Any]] = []
-        for start in range(0, history["count"], page_size):
+        starts = range(0, history["count"], page_size)
+        for start in _client_progress(self.entrez).track(
+            starts,
+            "Fetch SRA RunInfo",
+            total=(history["count"] + page_size - 1) // page_size,
+            unit="pages",
+        ):
             payload = self.entrez.get(
                 "efetch.fcgi",
                 {
@@ -803,18 +1097,32 @@ class SraClient:
                     "retstart": start,
                     "retmax": page_size,
                 },
+                refresh=refresh,
             )
             records.extend(self._parse_runinfo(payload))
         if not records:
             raise MetadataError(f"SRA query returned no runs: {query!r}")
         return RunCatalog.from_records(records).deduplicate_runs()
 
-    def fetch_runinfo_ids(self, ids: list[str], *, batch_size: int = 200) -> RunCatalog:
+    def fetch_runinfo_ids(
+        self, ids: list[str], *, batch_size: int = 200, refresh: bool = False
+    ) -> RunCatalog:
+        """Fetch RunInfo for SRA *ids* in batches of *batch_size*.
+
+        *refresh* bypasses cached Entrez responses.
+        """
+
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
-        uids = self.entrez.resolve_uids("sra", ids, batch_size=min(batch_size, 50))
+        uids = self.entrez.resolve_uids("sra", ids, batch_size=min(batch_size, 50), refresh=refresh)
         records: list[dict[str, Any]] = []
-        for start in range(0, len(uids), batch_size):
+        starts = range(0, len(uids), batch_size)
+        for start in _client_progress(self.entrez).track(
+            starts,
+            "Fetch SRA RunInfo by IDs",
+            total=(len(uids) + batch_size - 1) // batch_size,
+            unit="batches",
+        ):
             payload = self.entrez.get(
                 "efetch.fcgi",
                 {
@@ -823,6 +1131,7 @@ class SraClient:
                     "rettype": "runinfo",
                     "retmode": "text",
                 },
+                refresh=refresh,
             )
             records.extend(self._parse_runinfo(payload))
         if not records:
@@ -830,7 +1139,17 @@ class SraClient:
         return RunCatalog.from_records(records).deduplicate_runs()
 
     @staticmethod
-    def parse_packages(payload: bytes, *, include_raw: bool = False) -> MetadataBundle:
+    def parse_packages(
+        payload: bytes,
+        *,
+        include_raw: bool = False,
+        progress: ProgressReporter | None = None,
+    ) -> MetadataBundle:
+        """Parse package XML *payload* with optional *progress*.
+
+        *include_raw* retains complete trees.
+        """
+
         try:
             root = ET.fromstring(payload)
         except ET.ParseError as exc:
@@ -846,6 +1165,8 @@ class SraClient:
         }
 
         def append_unique(collection: str, record: dict[str, Any]) -> None:
+            """Append accession-unique *record* to named bundle *collection*."""
+
             accession = record.get("accession")
             if not accession or accession in seen[collection]:
                 return
@@ -853,7 +1174,8 @@ class SraClient:
             getattr(bundle, collection).append(record)
 
         packages = [node for node in root.iter() if _tag(node) == "EXPERIMENT_PACKAGE"]
-        for package in packages:
+        reporter = get_progress(progress)
+        for package in reporter.track(packages, "Parse SRA packages", unit="packages"):
             if include_raw:
                 bundle.raw_sra_packages.append(xml_to_dict(package))
             study = _child(package, "STUDY")
@@ -924,7 +1246,7 @@ class SraClient:
                         "bases": _integer(run_set.attrib.get("bases"))
                         if run_set is not None
                         else None,
-                        "bytes": _integer(run_set.attrib.get("bytes"))
+                        "size_gb": _gigabytes(run_set.attrib.get("bytes"))
                         if run_set is not None
                         else None,
                     },
@@ -934,6 +1256,8 @@ class SraClient:
 
     @staticmethod
     def _merge(target: MetadataBundle, source: MetadataBundle) -> None:
+        """Merge accession-unique entity records from *source* into *target*."""
+
         for name in (
             "packages",
             "runs",
@@ -955,25 +1279,54 @@ class SraClient:
         *,
         batch_size: int = 100,
         include_raw: bool = False,
+        refresh: bool = False,
     ) -> MetadataBundle:
+        """Fetch package XML for SRA *accessions* by *batch_size*.
+
+        *include_raw* retains complete XML trees alongside normalized records,
+        and *refresh* bypasses cached Entrez responses.
+        """
+
         if not accessions:
             return MetadataBundle()
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
-        uids = self.entrez.resolve_uids("sra", accessions, batch_size=min(batch_size, 50))
+        uids = self.entrez.resolve_uids(
+            "sra", accessions, batch_size=min(batch_size, 50), refresh=refresh
+        )
         if not uids:
             raise MetadataError("The supplied SRA accessions resolved to no Entrez records")
         bundle = MetadataBundle()
-        for start in range(0, len(uids), batch_size):
+        parameters = [
+            {
+                "db": "sra",
+                "id": ",".join(uids[start : start + batch_size]),
+                "retmode": "xml",
+            }
+            for start in range(0, len(uids), batch_size)
+        ]
+        reporter = _client_progress(self.entrez)
+        cached = (
+            sum(_response_cached(self.entrez, "efetch.fcgi", params) for params in parameters)
+            if not refresh
+            else 0
+        )
+        reporter.network_summary(
+            "SRA package XML",
+            cached=cached,
+            to_fetch=len(parameters) - cached,
+            unit="request batches",
+        )
+        for params in reporter.track(parameters, "Fetch and parse SRA package XML", unit="batches"):
             payload = self.entrez.get(
                 "efetch.fcgi",
-                {
-                    "db": "sra",
-                    "id": ",".join(uids[start : start + batch_size]),
-                    "retmode": "xml",
-                },
+                params,
+                refresh=refresh,
             )
-            self._merge(bundle, self.parse_packages(payload, include_raw=include_raw))
+            self._merge(
+                bundle,
+                self.parse_packages(payload, include_raw=include_raw),
+            )
         requested = {accession for accession in accessions if not accession.isdigit()}
         known = {
             str(value)
@@ -1001,18 +1354,34 @@ class SraClient:
 
 
 class BioSampleClient:
+    """Fetch and normalize BioSample XML records through Entrez."""
+
     def __init__(self, entrez: EntrezClient) -> None:
+        """Use configured *entrez* for all BioSample requests."""
+
         self.entrez = entrez
 
     @staticmethod
-    def parse(payload: bytes, *, include_raw: bool = False) -> list[dict[str, Any]]:
+    def parse(
+        payload: bytes,
+        *,
+        include_raw: bool = False,
+        progress: ProgressReporter | None = None,
+    ) -> list[dict[str, Any]]:
+        """Parse BioSample XML *payload* with optional *progress*.
+
+        *include_raw* retains complete trees.
+        """
+
         try:
             root = ET.fromstring(payload)
         except ET.ParseError as exc:
             raise MetadataError("NCBI returned malformed BioSample XML") from exc
         records: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for sample in (node for node in root.iter() if _tag(node) == "BioSample"):
+        samples = [node for node in root.iter() if _tag(node) == "BioSample"]
+        reporter = get_progress(progress)
+        for sample in reporter.track(samples, "Parse BioSamples", unit="samples"):
             accession = sample.attrib.get("accession")
             if not accession or accession in seen:
                 continue
@@ -1079,24 +1448,50 @@ class BioSampleClient:
         *,
         batch_size: int = 100,
         include_raw: bool = False,
+        refresh: bool = False,
     ) -> list[dict[str, Any]]:
+        """Fetch BioSample *accessions* in batches of *batch_size*.
+
+        *include_raw* retains XML trees, and *refresh* bypasses cached Entrez
+        responses.
+        """
+
         if not accessions:
             return []
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
-        uids = self.entrez.resolve_uids("biosample", accessions, batch_size=min(batch_size, 50))
+        uids = self.entrez.resolve_uids(
+            "biosample", accessions, batch_size=min(batch_size, 50), refresh=refresh
+        )
         if not uids:
             raise MetadataError("The supplied BioSample accessions resolved to no Entrez records")
         records: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for start in range(0, len(uids), batch_size):
+        parameters = [
+            {
+                "db": "biosample",
+                "id": ",".join(uids[start : start + batch_size]),
+                "retmode": "xml",
+            }
+            for start in range(0, len(uids), batch_size)
+        ]
+        reporter = _client_progress(self.entrez)
+        cached = (
+            sum(_response_cached(self.entrez, "efetch.fcgi", params) for params in parameters)
+            if not refresh
+            else 0
+        )
+        reporter.network_summary(
+            "BioSample XML",
+            cached=cached,
+            to_fetch=len(parameters) - cached,
+            unit="request batches",
+        )
+        for params in reporter.track(parameters, "Fetch and parse BioSample XML", unit="batches"):
             payload = self.entrez.get(
                 "efetch.fcgi",
-                {
-                    "db": "biosample",
-                    "id": ",".join(uids[start : start + batch_size]),
-                    "retmode": "xml",
-                },
+                params,
+                refresh=refresh,
             )
             for record in self.parse(payload, include_raw=include_raw):
                 if record["accession"] not in seen:
@@ -1127,14 +1522,23 @@ def fetch_metadata_for_accessions(
     sra: SraClient,
     biosample: BioSampleClient,
     include_raw: bool = False,
+    refresh: bool = False,
 ) -> MetadataBundle:
-    bundle = sra.fetch_packages(accessions, include_raw=include_raw)
+    """Fetch SRA *accessions* with *sra* and linked samples with *biosample*.
+
+    *include_raw* retains complete XML trees in the resulting bundle, and
+    *refresh* bypasses cached Entrez responses.
+    """
+
+    bundle = sra.fetch_packages(accessions, include_raw=include_raw, refresh=refresh)
     biosample_accessions = list(
         dict.fromkeys(
             str(record["biosample"]) for record in bundle.sra_samples if record.get("biosample")
         )
     )
-    bundle.biosamples = biosample.fetch(biosample_accessions, include_raw=include_raw)
+    bundle.biosamples = biosample.fetch(
+        biosample_accessions, include_raw=include_raw, refresh=refresh
+    )
     return bundle
 
 
@@ -1144,9 +1548,16 @@ def fetch_metadata_for_catalog(
     sra: SraClient,
     biosample: BioSampleClient,
     include_raw: bool = False,
+    refresh: bool = False,
 ) -> MetadataBundle:
+    """Enrich run *catalog* using *sra* and *biosample* clients.
+
+    *include_raw* retains complete XML trees in the scoped result, and *refresh*
+    bypasses cached Entrez responses.
+    """
+
     runs = [str(value) for value in catalog.frame.get_column("Run").drop_nulls().unique().to_list()]
-    bundle = sra.fetch_packages(runs, include_raw=include_raw)
+    bundle = sra.fetch_packages(runs, include_raw=include_raw, refresh=refresh)
     # Entrez returns whole experiments; keep only those containing requested runs.
     wanted_runs = set(runs)
     selected_experiments = {
@@ -1163,21 +1574,29 @@ def fetch_metadata_for_catalog(
             str(value)
             for value in catalog.frame.get_column("BioSample").drop_nulls().unique().to_list()
         )
-    bundle.biosamples = biosample.fetch(list(dict.fromkeys(accessions)), include_raw=include_raw)
+    bundle.biosamples = biosample.fetch(
+        list(dict.fromkeys(accessions)), include_raw=include_raw, refresh=refresh
+    )
     return bundle
 
 
 class _MarkupTextExtractor(HTMLParser):
+    """Collect visible text while discarding HTML presentation tags."""
+
     def __init__(self) -> None:
+        """Initialize an empty text-part buffer with entity conversion enabled."""
+
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
 
     def handle_data(self, data: str) -> None:
+        """Append visible text fragment *data* encountered by the parser."""
+
         self.parts.append(data)
 
 
 def sanitize_presentation_markup(value: Any) -> Any:
-    """Recursively remove leaked HTML tags and decode HTML character references."""
+    """Recursively remove HTML presentation markup from JSON-like *value*."""
 
     if isinstance(value, dict):
         return {key: sanitize_presentation_markup(item) for key, item in value.items()}
@@ -1203,7 +1622,7 @@ def sanitize_presentation_markup(value: Any) -> Any:
 
 
 def sanitize_legacy_metadata(paths: Iterable[Path]) -> list[Path]:
-    """Clean JSON snapshots produced by the retired presentation-HTML scraper."""
+    """Clean legacy JSON files or directories in *paths* and return changed files."""
 
     files: list[Path] = []
     for path in paths:

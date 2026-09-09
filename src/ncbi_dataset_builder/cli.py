@@ -13,11 +13,14 @@ import polars as pl
 from .execution import SlurmOptions
 from .metadata import sanitize_legacy_metadata
 from .models import ResourceSpec
+from .pipeline import PipelinePolicy
 from .processing.base import load_processor
 from .workflow import BuilderConfig, DatasetBuilder
 
 
 def _write_csv(frame: pl.DataFrame, path: Path) -> None:
+    """Atomically write Polars *frame* as CSV to *path*."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".part", dir=path.parent
@@ -32,6 +35,8 @@ def _write_csv(frame: pl.DataFrame, path: Path) -> None:
 
 
 def _value(raw: str) -> Any:
+    """Decode JSON scalar *raw*, falling back to the original string."""
+
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
@@ -39,6 +44,8 @@ def _value(raw: str) -> Any:
 
 
 def _condition(specification: str) -> pl.Expr:
+    """Parse a CLI filter *specification* into a safe Polars expression."""
+
     match = re.fullmatch(r"\s*([^<>=!~]+?)\s*(==|!=|>=|<=|>|<|~)\s*(.*?)\s*", specification)
     if not match:
         raise ValueError(f"Invalid filter {specification!r}; use COLUMN==VALUE or COLUMN~substring")
@@ -61,6 +68,8 @@ def _condition(specification: str) -> pl.Expr:
 
 
 def _builder(arguments: argparse.Namespace) -> DatasetBuilder:
+    """Create a dataset builder from parsed CLI *arguments*."""
+
     return DatasetBuilder(
         BuilderConfig(
             workspace=arguments.workspace,
@@ -68,17 +77,29 @@ def _builder(arguments: argparse.Namespace) -> DatasetBuilder:
             ncbi_api_key=arguments.api_key,
             max_workers=arguments.max_workers,
             total_threads=arguments.total_threads,
+            total_memory_gb=arguments.total_memory_gb,
+            show_progress=not arguments.no_progress,
+            progress_bars=not arguments.no_progress_bars,
         )
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build and return the complete ``ncbi-dataset`` argument parser."""
+
     parser = argparse.ArgumentParser(prog="ncbi-dataset")
     parser.add_argument("--workspace", type=Path, default=Path("workspace"))
     parser.add_argument("--email", default=os.environ.get("NCBI_EMAIL"))
     parser.add_argument("--api-key", default=os.environ.get("NCBI_API_KEY"))
     parser.add_argument("--max-workers", type=int, default=1)
     parser.add_argument("--total-threads", type=int)
+    parser.add_argument("--total-memory-gb", type=float)
+    parser.add_argument("--no-progress", action="store_true")
+    parser.add_argument(
+        "--no-progress-bars",
+        action="store_true",
+        help="Use periodic text progress instead of optional tqdm bars",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
 
     fetch = commands.add_parser("fetch-runs", help="Fetch complete SRA RunInfo for an Entrez query")
@@ -111,6 +132,11 @@ def build_parser() -> argparse.ArgumentParser:
     metadata.add_argument("--include-raw-trees", action="store_true")
 
     for metadata_command in (enrich, metadata):
+        metadata_command.add_argument(
+            "--refresh",
+            action="store_true",
+            help="Bypass normalized metadata and raw Entrez response caches",
+        )
         metadata_command.add_argument(
             "--description-profile",
             choices=("training", "full"),
@@ -149,7 +175,9 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--retry-failed", action="store_true")
     build.add_argument("--batch-id", type=int, action="append")
 
-    submit = commands.add_parser("submit-slurm", help="Generate or submit an sbatch job array")
+    submit = commands.add_parser(
+        "submit-slurm", help="Generate or submit one bounded-pipeline coordinator job"
+    )
     submit.add_argument("--plan", type=Path, required=True)
     submit.add_argument("--processor", required=True)
     submit.add_argument("--script", type=Path)
@@ -161,6 +189,16 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--retry-failed", action="store_true")
     submit.add_argument("--batch-id", type=int, action="append")
 
+    for pipeline_command in (build, submit):
+        pipeline_command.add_argument("--prefetch-batches", type=int, choices=(0, 1), default=1)
+        pipeline_command.add_argument("--max-staged-gb", type=float)
+        pipeline_command.add_argument("--minimum-free-gb", type=float, default=0.0)
+        pipeline_command.add_argument(
+            "--cleanup", choices=("after_success", "never"), default="after_success"
+        )
+        pipeline_command.add_argument("--discard-failed-inputs", action="store_true")
+        pipeline_command.add_argument("--no-fsync-logs", action="store_true")
+
     status = commands.add_parser("status", help="Summarize durable task state")
     status.add_argument("--plan", type=Path, required=True)
     status.add_argument("--batch-id", type=int, action="append")
@@ -171,6 +209,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the CLI with optional *argv* and return its process exit code."""
+
     parser = build_parser()
     arguments = parser.parse_args(argv)
     try:
@@ -220,6 +260,7 @@ def main(argv: list[str] | None = None) -> int:
                 builder.load_runs(arguments.catalog),
                 destination=arguments.output,
                 include_raw=arguments.include_raw_trees,
+                refresh=arguments.refresh,
                 description_profile=arguments.description_profile,
                 legacy_descriptions=legacy_descriptions,
             )
@@ -229,6 +270,7 @@ def main(argv: list[str] | None = None) -> int:
                 arguments.accessions,
                 destination=arguments.output,
                 include_raw=arguments.include_raw_trees,
+                refresh=arguments.refresh,
                 description_profile=arguments.description_profile,
                 legacy_descriptions=legacy_descriptions,
             )
@@ -242,9 +284,7 @@ def main(argv: list[str] | None = None) -> int:
                 builder.load_runs(arguments.catalog),
                 group_by=arguments.group_by,
                 resources=resources,
-                max_batch_bytes=int(arguments.max_batch_gb * 1_000_000_000)
-                if arguments.max_batch_gb
-                else None,
+                max_batch_gb=arguments.max_batch_gb,
                 max_batch_units=arguments.max_batch_units,
             )
             builder.save_plan(plan, arguments.output)
@@ -258,11 +298,20 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
         elif arguments.command == "build":
+            policy = PipelinePolicy(
+                prefetch_batches=arguments.prefetch_batches,
+                max_staged_gb=arguments.max_staged_gb,
+                minimum_free_gb=arguments.minimum_free_gb,
+                cleanup=arguments.cleanup,
+                keep_failed_inputs=not arguments.discard_failed_inputs,
+                fsync_logs=not arguments.no_fsync_logs,
+            )
             report = builder.build(
                 builder.load_plan(arguments.plan),
                 arguments.processor,
                 retry_failed=arguments.retry_failed,
                 batch_ids=set(arguments.batch_id) if arguments.batch_id else None,
+                policy=policy,
             )
             print(
                 json.dumps(
@@ -292,6 +341,14 @@ def main(argv: list[str] | None = None) -> int:
                 submit=not arguments.dry_run,
                 retry_failed=arguments.retry_failed,
                 batch_ids=set(arguments.batch_id) if arguments.batch_id else None,
+                policy=PipelinePolicy(
+                    prefetch_batches=arguments.prefetch_batches,
+                    max_staged_gb=arguments.max_staged_gb,
+                    minimum_free_gb=arguments.minimum_free_gb,
+                    cleanup=arguments.cleanup,
+                    keep_failed_inputs=not arguments.discard_failed_inputs,
+                    fsync_logs=not arguments.no_fsync_logs,
+                ),
             )
             print(json.dumps({"script": str(script), "job_id": job_id}))
         elif arguments.command == "status":

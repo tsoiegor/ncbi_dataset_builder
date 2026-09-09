@@ -5,6 +5,10 @@ class DatasetBuilderError(RuntimeError):
     """Base class for expected dataset construction errors."""
 
 
+class DependencyError(DatasetBuilderError):
+    """A required Python or external dependency is inconsistent or unusable."""
+
+
 class CatalogConflictError(DatasetBuilderError):
     """The same accession has contradictory catalog records."""
 

@@ -1,14 +1,18 @@
 Metadata-Version: 2.4
 Name: ncbi-dataset-builder
-Version: 0.1.2
+Version: 0.1.7
 Summary: Reproducible, resumable dataset construction from NCBI SRA, GEO, and Genome data
 Requires-Python: >=3.10
 Description-Content-Type: text/markdown
+License-File: LICENSE
 Requires-Dist: polars>=1.0
+Provides-Extra: progress
+Requires-Dist: tqdm>=4.66; extra == "progress"
 Provides-Extra: dev
 Requires-Dist: pytest>=8; extra == "dev"
 Requires-Dist: pytest-cov>=5; extra == "dev"
 Requires-Dist: ruff>=0.8; extra == "dev"
+Dynamic: license-file
 
 # NCBI Dataset Builder
 

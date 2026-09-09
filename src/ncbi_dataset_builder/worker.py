@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 from pathlib import Path
 
@@ -9,6 +8,8 @@ from .workflow import BuilderConfig, DatasetBuilder
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Execute one plan task from optional CLI *argv* and return an exit code."""
+
     parser = argparse.ArgumentParser(
         description="Execute one durable dataset task (normally from Slurm)"
     )
@@ -25,6 +26,7 @@ def main(argv: list[str] | None = None) -> int:
             email=arguments.email,
             ncbi_api_key=os.environ.get("NCBI_API_KEY"),
             max_workers=1,
+            progress_bars=False,
         )
     )
     plan = builder.load_plan(arguments.plan)
@@ -33,15 +35,6 @@ def main(argv: list[str] | None = None) -> int:
         arguments.task_index,
         arguments.processor,
         retry_failed=arguments.retry_failed,
-    )
-    print(
-        json.dumps(
-            {
-                "task_id": outcome.task_id,
-                "status": outcome.status,
-                "error": outcome.error,
-            }
-        )
     )
     return 1 if outcome.status == "failed" else 0
 

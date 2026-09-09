@@ -13,9 +13,12 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .metadata import MetadataBundle
+    from .progress import ProgressReporter
 
 
 def normalized_name(name: str) -> str:
+    """Normalize attribute *name* for case-insensitive alias matching."""
+
     return " ".join(re.sub(r"[_/\-]+", " ", name).casefold().split())
 
 
@@ -127,17 +130,20 @@ LEGACY_KEY_ALIASES = {
 
 @dataclass(frozen=True)
 class DescriptionPolicy:
-    """Task-specific additions are exact attribute aliases, not keyword guesses.
+    """Select compact description fields with optional exact custom aliases.
 
     All experiment attributes remain protected because the original parser kept
     that section. Historical fields supplied via legacy_descriptions are also
     protected, even if administrative. Null/placeholder filtering only applies
-    to newly selected sample attributes.
+    to newly selected sample attributes. *extra_attributes* maps normalized
+    source attribute names to desired output names.
     """
 
     extra_attributes: Mapping[str, str] = field(default_factory=dict)
 
     def select_attribute(self, name: str, source: str) -> tuple[str | None, str]:
+        """Return the output name and rationale for attribute *name* from *source*."""
+
         if source == "experiment":
             output = name.removeprefix("Experimental Factor: ").strip()
             if output in {"ID", "Experiments"}:
@@ -154,10 +160,14 @@ class DescriptionPolicy:
 
 
 def _comparison(value: Any) -> str:
+    """Convert *value* to whitespace-normalized text for comparisons."""
+
     return " ".join(str(value).split())
 
 
 def _add(target: dict[str, Any], key: str, value: Any, *, keep_missing: bool = False) -> None:
+    """Add unique *value* under *key* in *target*; *keep_missing* keeps placeholders."""
+
     from .metadata import sanitize_presentation_markup
 
     if value is None:
@@ -176,6 +186,8 @@ def _add(target: dict[str, Any], key: str, value: Any, *, keep_missing: bool = F
     if key == "Tissue":
         # Preserve the old [tissue]/[cell_Type] value without repeating its label.
         def tissue_text(item):
+            """Remove a legacy bracketed tissue label from *item* for comparison."""
+
             return re.sub(r"^\[[^]]+\]\s*", "", _comparison(item)).casefold()
 
         if any(tissue_text(item) == tissue_text(value) for item in previous):
@@ -187,6 +199,8 @@ def _add(target: dict[str, Any], key: str, value: Any, *, keep_missing: bool = F
 def _sample_attributes(
     record: dict[str, Any], target: dict[str, Any], policy: DescriptionPolicy
 ) -> None:
+    """Add policy-selected attributes from sample *record* to *target*."""
+
     records = record.get("attribute_records") or [
         {"name": key, "value": value} for key, value in record.get("attributes", {}).items()
     ]
@@ -205,6 +219,8 @@ def _sample_attributes(
 
 
 def _experiment_description(experiment, study, submission, policy):
+    """Combine *experiment*, *study*, and *submission* fields selected by *policy*."""
+
     row: dict[str, Any] = {}
     _add(row, "Design", experiment.get("design_description"))
     library = experiment.get("library", {})
@@ -247,15 +263,20 @@ def training_descriptions(
     *,
     policy: DescriptionPolicy | None = None,
     legacy_descriptions: Mapping[str, dict[str, Any]] | None = None,
+    progress: ProgressReporter | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Produce flat legacy-style records; preserve differing experiments together.
+    """Build compact descriptions from *bundle* using *policy* and *progress*.
 
     Repeated experiments with identical retained descriptions collapse. Shared
     fields appear once at sample level; varying fields stay in Experiments so
-    strategy, library protocol and study relationships cannot be mixed.
+    strategy, library protocol and study relationships cannot be mixed. Values
+    in optional *legacy_descriptions* are retained as a compatibility baseline.
     """
 
+    from .progress import get_progress
+
     policy = policy or DescriptionPolicy()
+    reporter = get_progress(progress)
     legacy_descriptions = legacy_descriptions or {}
     indexes = {
         name: {row["accession"]: row for row in getattr(bundle, name)}
@@ -265,7 +286,7 @@ def training_descriptions(
     for package in bundle.packages:
         relations.setdefault(package.get("sra_sample_accession"), []).append(package)
     descriptions = {}
-    for sample in bundle.sra_samples:
+    for sample in reporter.track(bundle.sra_samples, "Build training descriptions", unit="samples"):
         accession = sample["accession"]
         legacy = legacy_descriptions.get(accession, {})
         if legacy.get("ID", accession) != accession:
@@ -328,10 +349,12 @@ def training_descriptions(
 
 
 def missing_legacy_values(legacy: dict[str, Any], compact: dict[str, Any]) -> list[str]:
-    """Check stored values after HTML decoding and whitespace normalization."""
+    """Return *legacy* keys whose values are absent from *compact*."""
     from .metadata import sanitize_presentation_markup
 
     def leaves(value):
+        """Flatten nested *value* to normalized scalar strings."""
+
         if isinstance(value, dict):
             return [leaf for child in value.values() for leaf in leaves(child)]
         if isinstance(value, list):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -11,11 +12,33 @@ from pathlib import Path
 from ..commands import CommandRunner
 from ..errors import ExternalToolError, ProcessingError
 from ..models import FastqSet, GenomeRef, ProcessingResult
-from ..util import exclusive_file_lock, existing_nonempty, sanitize_identifier
+from ..progress import ProgressReporter
+from ..unit_logging import current_unit_log_handle
+from ..util import bytes_to_gb, exclusive_file_lock, existing_nonempty, sanitize_identifier
+
+LOGGER = logging.getLogger("ncbi_dataset_builder.processing.atac")
 
 
 @dataclass(frozen=True)
 class AtacSeqConfig:
+    """Configure the built-in ATAC-seq processor.
+
+    Args:
+        bowtie2: Bowtie2 executable name or path.
+        bowtie2_build: Bowtie2 index-builder executable.
+        samtools: Samtools executable.
+        fastp: Fastp executable.
+        bam_coverage: deepTools ``bamCoverage`` executable.
+        maximum_insert_size: Maximum paired-end alignment insert size.
+        bin_size: BigWig coverage bin size.
+        normalize_using: Optional ``bamCoverage`` normalization method.
+        coverage_strands: Optional forward/reverse RNA-strand filters.
+        fastp_deduplicate: Enable fastp duplicate removal.
+        fastp_max_threads: Maximum threads passed to fastp.
+        coverage_ignore_duplicates: Ignore duplicate reads in coverage output.
+        keep_intermediates: Retain intermediate BAM files after success.
+    """
+
     bowtie2: str = "bowtie2"
     bowtie2_build: str = "bowtie2-build"
     samtools: str = "samtools"
@@ -31,6 +54,8 @@ class AtacSeqConfig:
     keep_intermediates: bool = True
 
     def __post_init__(self) -> None:
+        """Validate positive numeric settings and supported strand labels."""
+
         if self.maximum_insert_size < 1 or self.bin_size < 1 or self.fastp_max_threads < 1:
             raise ValueError(
                 "maximum_insert_size, bin_size, and fastp_max_threads must be positive"
@@ -41,18 +66,24 @@ class AtacSeqConfig:
 
 
 class AtacSeqProcessor:
-    """A fail-fast replacement for the repository's original shell-heavy ATAC path."""
+    """Build checked BAM and BigWig outputs from ATAC-seq FASTQ inputs."""
 
     def __init__(
         self,
         config: AtacSeqConfig | None = None,
         *,
         runner: CommandRunner | None = None,
+        progress: ProgressReporter | None = None,
     ) -> None:
+        """Initialize with optional *config*, command *runner*, and *progress*."""
+
         self.config = config or AtacSeqConfig()
         self.runner = runner or CommandRunner()
+        self.progress = progress or ProgressReporter()
 
     def preflight(self) -> dict[str, str]:
+        """Require all configured tools and return their reported versions."""
+
         tools = (
             self.config.fastp,
             self.config.bowtie2,
@@ -68,8 +99,9 @@ class AtacSeqProcessor:
             self.config.bam_coverage: self.runner.version(self.config.bam_coverage, "--version"),
         }
 
-    @staticmethod
-    def _merge_inputs(paths: tuple[Path, ...], destination: Path) -> Path | None:
+    def _merge_inputs(self, paths: tuple[Path, ...], destination: Path) -> Path | None:
+        """Merge ordered FASTQ *paths* into *destination*, preserving gzip members."""
+
         if not paths:
             return None
         if len(paths) == 1:
@@ -83,30 +115,51 @@ class AtacSeqProcessor:
         destination.parent.mkdir(parents=True, exist_ok=True)
         partial = destination.with_name(destination.name + ".part")
         if all_compressed or none_compressed:
-            with partial.open("wb") as output:
+            with (
+                partial.open("wb") as output,
+                self.progress.task(
+                    f"Stage {destination.name}",
+                    total=sum(bytes_to_gb(path.stat().st_size) for path in paths),
+                    unit="GB",
+                ) as progress,
+            ):
                 for path in paths:
                     with path.open("rb") as source:
-                        shutil.copyfileobj(source, output, length=8 * 1024 * 1024)
+                        while chunk := source.read(8 * 1024 * 1024):
+                            output.write(chunk)
+                            progress.update(bytes_to_gb(len(chunk)))
                 output.flush()
                 os.fsync(output.fileno())
         else:
-            with gzip.open(partial, "wb", compresslevel=6) as output:
+            with (
+                gzip.open(partial, "wb", compresslevel=6) as output,
+                self.progress.task(f"Stage {destination.name}", unit="GB") as progress,
+            ):
                 for path in paths:
                     opener = gzip.open if path.suffix == ".gz" else open
                     with opener(path, "rb") as source:
-                        shutil.copyfileobj(source, output, length=8 * 1024 * 1024)
+                        while chunk := source.read(8 * 1024 * 1024):
+                            output.write(chunk)
+                            progress.update(bytes_to_gb(len(chunk)))
         os.replace(partial, destination)
         return destination
 
-    @staticmethod
-    def _uncompressed_fasta(source: Path, destination: Path) -> Path:
+    def _uncompressed_fasta(self, source: Path, destination: Path) -> Path:
+        """Materialize possibly gzipped FASTA *source* at *destination*."""
+
         if existing_nonempty(destination):
             return destination
         destination.parent.mkdir(parents=True, exist_ok=True)
         partial = destination.with_name(destination.name + ".part")
         opener = gzip.open if source.suffix == ".gz" else open
-        with opener(source, "rb") as input_handle, partial.open("wb") as output_handle:
-            shutil.copyfileobj(input_handle, output_handle, length=8 * 1024 * 1024)
+        with (
+            opener(source, "rb") as input_handle,
+            partial.open("wb") as output_handle,
+            self.progress.task(f"Prepare {destination.name}", unit="GB") as progress,
+        ):
+            while chunk := input_handle.read(8 * 1024 * 1024):
+                output_handle.write(chunk)
+                progress.update(bytes_to_gb(len(chunk)))
             output_handle.flush()
             os.fsync(output_handle.fileno())
         os.replace(partial, destination)
@@ -114,6 +167,8 @@ class AtacSeqProcessor:
 
     @staticmethod
     def _index_complete(prefix: Path) -> bool:
+        """Return whether all six Bowtie2 index files exist for *prefix*."""
+
         suffixes = (".1", ".2", ".3", ".4", ".rev.1", ".rev.2")
         standard = [Path(str(prefix) + suffix + ".bt2") for suffix in suffixes]
         large = [Path(str(prefix) + suffix + ".bt2l") for suffix in suffixes]
@@ -122,14 +177,19 @@ class AtacSeqProcessor:
         )
 
     def _ensure_index(self, genome: GenomeRef, threads: int) -> Path:
+        """Return a complete Bowtie2 index for *genome*, building with *threads*."""
+
         index_dir = genome.fasta.parent / "bowtie2"
         prefix = index_dir / genome.accession
         if self._index_complete(prefix):
+            self.progress.message(f"Bowtie2 index cache hit: {genome.accession}")
             return prefix
         index_dir.mkdir(parents=True, exist_ok=True)
         with exclusive_file_lock(index_dir / ".build.lock", timeout_seconds=12 * 60 * 60):
             if self._index_complete(prefix):
+                self.progress.message(f"Bowtie2 index cache hit after lock: {genome.accession}")
                 return prefix
+            self.progress.message(f"Build Bowtie2 index: {genome.accession}")
             fasta = self._uncompressed_fasta(genome.fasta, index_dir / f"{genome.accession}.fna")
             self.runner.run(
                 [
@@ -154,6 +214,12 @@ class AtacSeqProcessor:
         root: Path,
         threads: int,
     ) -> tuple[Path | None, Path | None, Path | None, list[Path]]:
+        """Clean paired and/or single reads with fastp and return reads plus reports.
+
+        *read1* and *read2* are paired mates, *single* contains unpaired reads,
+        *root* stores outputs, and *threads* controls fastp concurrency.
+        """
+
         fastp_threads = min(max(1, threads), self.config.fastp_max_threads)
         outputs: list[Path] = []
         clean1: Path | None = None
@@ -167,6 +233,7 @@ class AtacSeqProcessor:
             if not all(
                 existing_nonempty(path) for path in (clean1, clean2, report_json, report_html)
             ):
+                self.progress.message("Run fastp for paired-end reads")
                 command = [
                     self.config.fastp,
                     "--in1",
@@ -188,6 +255,8 @@ class AtacSeqProcessor:
                 if self.config.fastp_deduplicate:
                     command.extend(("--dedup", "--dup_calc_accuracy", "5"))
                 self.runner.run(command, timeout=24 * 60 * 60)
+            else:
+                self.progress.message("fastp paired-end cache hit")
             outputs.extend((report_json, report_html))
         if single:
             clean_single = root / "single.clean.fastq.gz"
@@ -196,6 +265,7 @@ class AtacSeqProcessor:
             if not all(
                 existing_nonempty(path) for path in (clean_single, report_json, report_html)
             ):
+                self.progress.message("Run fastp for single-end reads")
                 command = [
                     self.config.fastp,
                     "--in1",
@@ -213,6 +283,8 @@ class AtacSeqProcessor:
                 if self.config.fastp_deduplicate:
                     command.extend(("--dedup", "--dup_calc_accuracy", "5"))
                 self.runner.run(command, timeout=24 * 60 * 60)
+            else:
+                self.progress.message("fastp single-end cache hit")
             outputs.extend((report_json, report_html))
         for path in (clean1, clean2, clean_single):
             if path is not None and not existing_nonempty(path):
@@ -224,14 +296,22 @@ class AtacSeqProcessor:
         *,
         prefix: Path,
         output: Path,
-        log: Path,
         threads: int,
         read1: Path | None = None,
         read2: Path | None = None,
         single: Path | None = None,
     ) -> Path:
+        """Align one paired or single input and write a sorted BAM.
+
+        *prefix* is the Bowtie2 index, *output* is the BAM, and *threads*
+        controls alignment. Supply either paired
+        *read1*/*read2* or one *single* FASTQ.
+        """
+
         if existing_nonempty(output):
+            self.progress.message(f"Alignment cache hit: {output}")
             return output
+        self.progress.message(f"Align reads and sort BAM: {output.name}")
         bowtie = [
             self.config.bowtie2,
             "--very-sensitive",
@@ -260,61 +340,71 @@ class AtacSeqProcessor:
         partial = output.with_name(output.name + ".part")
         environment = os.environ.copy()
         environment.update(self.runner.base_env)
-        with log.open("ab") as log_handle:
-            processes: list[subprocess.Popen] = []
-            try:
-                aligner = subprocess.Popen(
-                    bowtie, stdout=subprocess.PIPE, stderr=log_handle, env=environment
-                )
-                processes.append(aligner)
-                viewer = subprocess.Popen(
-                    [self.config.samtools, "view", "-b", "-"],
-                    stdin=aligner.stdout,
-                    stdout=subprocess.PIPE,
-                    stderr=log_handle,
-                    env=environment,
-                )
-                processes.append(viewer)
-                if aligner.stdout:
-                    aligner.stdout.close()
-                sorter = subprocess.Popen(
-                    [
-                        self.config.samtools,
-                        "sort",
-                        "-@",
-                        str(max(1, threads)),
-                        "-o",
-                        str(partial),
-                        "-",
-                    ],
-                    stdin=viewer.stdout,
-                    stderr=log_handle,
-                    env=environment,
-                )
-                processes.append(sorter)
-                if viewer.stdout:
-                    viewer.stdout.close()
-                codes = [sorter.wait(), viewer.wait(), aligner.wait()]
-            except FileNotFoundError as exc:
-                for process in processes:
-                    process.kill()
-                raise ExternalToolError(f"Alignment executable not found: {exc.filename}") from exc
+        log_handle = current_unit_log_handle()
+        LOGGER.info(
+            "Run alignment pipeline: %s | %s | %s",
+            bowtie,
+            [self.config.samtools, "view", "-b", "-"],
+            [self.config.samtools, "sort", "-@", str(max(1, threads)), "-o", str(partial), "-"],
+        )
+        processes: list[subprocess.Popen] = []
+        try:
+            aligner = subprocess.Popen(
+                bowtie, stdout=subprocess.PIPE, stderr=log_handle, env=environment
+            )
+            processes.append(aligner)
+            viewer = subprocess.Popen(
+                [self.config.samtools, "view", "-b", "-"],
+                stdin=aligner.stdout,
+                stdout=subprocess.PIPE,
+                stderr=log_handle,
+                env=environment,
+            )
+            processes.append(viewer)
+            if aligner.stdout:
+                aligner.stdout.close()
+            sorter = subprocess.Popen(
+                [
+                    self.config.samtools,
+                    "sort",
+                    "-@",
+                    str(max(1, threads)),
+                    "-o",
+                    str(partial),
+                    "-",
+                ],
+                stdin=viewer.stdout,
+                stderr=log_handle,
+                env=environment,
+            )
+            processes.append(sorter)
+            if viewer.stdout:
+                viewer.stdout.close()
+            codes = [sorter.wait(), viewer.wait(), aligner.wait()]
+        except FileNotFoundError as exc:
+            for process in processes:
+                process.kill()
+            raise ExternalToolError(f"Alignment executable not found: {exc.filename}") from exc
         if any(code != 0 for code in codes):
-            raise ProcessingError(f"Alignment pipeline failed with codes {codes}; see {log}")
+            raise ProcessingError(f"Alignment pipeline failed with codes {codes}")
         if not existing_nonempty(partial):
             raise ProcessingError(f"Alignment produced no BAM: {partial}")
         os.replace(partial, output)
         return output
 
     def __call__(self, fastq: FastqSet, genome: GenomeRef, threads: int) -> ProcessingResult:
+        """Process *fastq* against *genome* with *threads* and return validated outputs."""
+
         fastq.validate()
         genome.validate()
+        self.progress.message(f"ATAC processing started: {fastq.unit_id}")
         versions = self.preflight()
         output_dir = fastq.output_dir
         work = fastq.work_dir / "processing" / "atac"
         output_dir.mkdir(parents=True, exist_ok=True)
         work.mkdir(parents=True, exist_ok=True)
         safe_id = sanitize_identifier(fastq.unit_id)
+        self.progress.message("Stage FASTQ inputs")
         staged1 = self._merge_inputs(fastq.read1, work / "input.R1.fastq.gz")
         staged2 = self._merge_inputs(fastq.read2, work / "input.R2.fastq.gz")
         staged_single = self._merge_inputs(fastq.single, work / "input.single.fastq.gz")
@@ -332,7 +422,6 @@ class AtacSeqProcessor:
                 self._align(
                     prefix=prefix,
                     output=work / "paired.sorted.bam",
-                    log=work / "paired.alignment.log",
                     threads=threads,
                     read1=clean1,
                     read2=clean2,
@@ -343,13 +432,13 @@ class AtacSeqProcessor:
                 self._align(
                     prefix=prefix,
                     output=work / "single.sorted.bam",
-                    log=work / "single.alignment.log",
                     threads=threads,
                     single=clean_single,
                 )
             )
         final_bam = output_dir / f"{safe_id}.bam"
         if not existing_nonempty(final_bam):
+            self.progress.message(f"Create final BAM: {final_bam.name}")
             if len(bams) == 1:
                 shutil.copyfile(bams[0], final_bam.with_name(final_bam.name + ".part"))
                 os.replace(final_bam.with_name(final_bam.name + ".part"), final_bam)
@@ -367,6 +456,7 @@ class AtacSeqProcessor:
                     ]
                 )
                 os.replace(partial, final_bam)
+        self.progress.message(f"Index final BAM: {final_bam.name}")
         self.runner.run(
             [
                 self.config.samtools,
@@ -383,6 +473,7 @@ class AtacSeqProcessor:
             label = strand or "coverage"
             bigwig = output_dir / f"{safe_id}.{label}.bw"
             if not existing_nonempty(bigwig):
+                self.progress.message(f"Create BigWig coverage: {bigwig.name}")
                 command = [
                     self.config.bam_coverage,
                     "--bam",
@@ -404,6 +495,8 @@ class AtacSeqProcessor:
                 if self.config.normalize_using:
                     command.extend(("--normalizeUsing", self.config.normalize_using))
                 self.runner.run(command, timeout=24 * 60 * 60)
+            else:
+                self.progress.message(f"BigWig cache hit: {bigwig.name}")
             coverage_outputs.append(bigwig)
         outputs = (
             final_bam,
@@ -430,6 +523,7 @@ class AtacSeqProcessor:
             for path in bams:
                 if path != final_bam:
                     path.unlink(missing_ok=True)
+        self.progress.message(f"ATAC processing complete: {fastq.unit_id}")
         return result
 
 
@@ -437,6 +531,6 @@ default_atac_processor = AtacSeqProcessor()
 
 
 def process_atac(fastq: FastqSet, genome: GenomeRef, threads: int) -> ProcessingResult:
-    """Importable default processor for local and Slurm execution."""
+    """Run the default ATAC processor on *fastq* and *genome* with *threads*."""
 
     return default_atac_processor(fastq, genome, threads)

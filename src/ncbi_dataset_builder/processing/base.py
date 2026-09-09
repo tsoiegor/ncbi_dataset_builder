@@ -7,11 +7,16 @@ from ..models import FastqSet, GenomeRef, ProcessingResult
 
 
 class Processor(Protocol):
-    def __call__(self, fastq: FastqSet, genome: GenomeRef, threads: int) -> ProcessingResult: ...
+    """Protocol for assay processors that consume FASTQ, genome, and thread count."""
+
+    def __call__(self, fastq: FastqSet, genome: GenomeRef, threads: int) -> ProcessingResult:
+        """Process *fastq* against *genome* using at most *threads* threads."""
+
+        ...
 
 
 def load_processor(reference: str) -> Processor:
-    """Load ``package.module:callable`` while preserving the three-argument contract."""
+    """Load processor *reference* in ``package.module:callable`` form."""
 
     if ":" not in reference:
         raise ValueError("Processor reference must have the form 'package.module:callable'")

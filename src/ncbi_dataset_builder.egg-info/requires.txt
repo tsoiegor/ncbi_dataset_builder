@@ -4,3 +4,6 @@ polars>=1.0
 pytest>=8
 pytest-cov>=5
 ruff>=0.8
+
+[progress]
+tqdm>=4.66

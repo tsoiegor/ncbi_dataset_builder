@@ -1,3 +1,4 @@
+LICENSE
 README.md
 pyproject.toml
 src/ncbi_dataset_builder/__init__.py
@@ -14,6 +15,7 @@ src/ncbi_dataset_builder/geo.py
 src/ncbi_dataset_builder/http.py
 src/ncbi_dataset_builder/metadata.py
 src/ncbi_dataset_builder/models.py
+src/ncbi_dataset_builder/progress.py
 src/ncbi_dataset_builder/state.py
 src/ncbi_dataset_builder/util.py
 src/ncbi_dataset_builder/worker.py
