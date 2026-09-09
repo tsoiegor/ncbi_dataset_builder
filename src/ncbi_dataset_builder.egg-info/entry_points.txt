@@ -1,2 +1,0 @@
-[console_scripts]
-ncbi-dataset = ncbi_dataset_builder.cli:main
