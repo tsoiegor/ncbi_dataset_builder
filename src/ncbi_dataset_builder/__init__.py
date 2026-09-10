@@ -15,7 +15,6 @@ from .metadata import (
     sanitize_presentation_markup,
 )
 from .models import (
-    DatasetPlan,
     DatasetTask,
     FastqLayout,
     FastqSet,
@@ -24,6 +23,7 @@ from .models import (
     ProcessingUnit,
     ResourceSpec,
     StagedFastq,
+    WorkspaceJob,
 )
 from .pipeline import BatchManifest, BatchStateStore, PipelinePolicy
 from .processing import AtacSeqConfig, AtacSeqProcessor, Processor, process_atac
@@ -31,6 +31,7 @@ from .progress import ProgressReporter, ProgressTask
 from .publishing import DatasetExport, DatasetPublisher, PublishMode
 from .unit_logging import current_unit_log_handle, current_unit_log_path
 from .workflow import BuilderConfig, DatasetBuilder
+from .workspace import WorkspaceConfig, WorkspaceStore
 
 __all__ = [
     "AtacSeqConfig",
@@ -42,7 +43,6 @@ __all__ = [
     "BuilderConfig",
     "DatasetBuilder",
     "DatasetExport",
-    "DatasetPlan",
     "DatasetPublisher",
     "DatasetTask",
     "DescriptionPolicy",
@@ -72,6 +72,9 @@ __all__ = [
     "SraToolkitProvider",
     "StagedFastq",
     "StagedFastqProvider",
+    "WorkspaceConfig",
+    "WorkspaceJob",
+    "WorkspaceStore",
     "current_unit_log_handle",
     "current_unit_log_path",
     "process_atac",
@@ -81,4 +84,4 @@ __all__ = [
     "validate_polars_runtime",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

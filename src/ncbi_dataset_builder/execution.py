@@ -220,7 +220,7 @@ class SlurmExecutor:
     def create_script(
         self,
         *,
-        plan_path: Path,
+        job_path: Path,
         task_count: int,
         processor_reference: str,
         workspace: Path,
@@ -232,24 +232,25 @@ class SlurmExecutor:
         cleanup: str = "after_success",
         keep_failed_inputs: bool = True,
         fsync_logs: bool = True,
+        prefetch_max_size: str = "u",
     ) -> Path:
-        """Write a Slurm array script for selected tasks in a saved plan.
+        """Write a Slurm array script for selected tasks in a saved job.
 
-        *plan_path* identifies the saved plan, *task_count* bounds valid indices,
+        *job_path* identifies the saved job, *task_count* bounds valid indices,
         *processor_reference* names the importable processor, *workspace* stores
         logs and state, *email* configures NCBI access, *output_path* receives the
         script, and *options* supplies scheduler settings. *retry_failed* enables
         failed-task retries; *task_indices* optionally submits a subset.
         *cleanup*, *keep_failed_inputs*, and *fsync_logs* configure worker cleanup
-        and logging behavior.
+        and logging behavior. *prefetch_max_size* limits SRA Toolkit archives.
         """
 
         if task_count < 1:
-            raise ValueError("Cannot create a Slurm array for an empty plan")
+            raise ValueError("Cannot create a Slurm array for an empty job")
         resources = options.resources
         indices = list(range(task_count)) if task_indices is None else sorted(set(task_indices))
         if not indices or indices[0] < 0 or indices[-1] >= task_count:
-            raise ValueError("Slurm task indices must be a non-empty subset of the plan")
+            raise ValueError("Slurm task indices must be a non-empty subset of the job")
         array = self._array_spec(indices)
         if options.max_parallel:
             array += f"%{options.max_parallel}"
@@ -276,8 +277,8 @@ class SlurmExecutor:
             self.python_executable,
             "-m",
             "ncbi_dataset_builder.worker",
-            "--plan",
-            str(plan_path.resolve()),
+            "--job",
+            str(job_path.resolve()),
             "--task-index",
             "${SLURM_ARRAY_TASK_ID}",
             "--processor",
@@ -294,6 +295,7 @@ class SlurmExecutor:
             command.append("--discard-failed-inputs")
         if not fsync_logs:
             command.append("--no-fsync-logs")
+        command.extend(("--prefetch-max-size", prefetch_max_size))
         rendered = " ".join(
             item if item == "${SLURM_ARRAY_TASK_ID}" else shlex.quote(item) for item in command
         )
@@ -313,7 +315,7 @@ class SlurmExecutor:
     def create_dispatcher_script(
         self,
         *,
-        plan_path: Path,
+        job_path: Path,
         processor_reference: str,
         workspace: Path,
         email: str | None,
@@ -327,13 +329,16 @@ class SlurmExecutor:
         fsync_logs: bool,
         retry_failed: bool = False,
         batch_ids: set[int] | None = None,
+        prefetch_max_size: str = "u",
+        download_workers: int = 2,
     ) -> Path:
-        """Write a quota-aware dispatcher for *plan_path* and *processor_reference*.
+        """Write a quota-aware dispatcher for *job_path* and *processor_reference*.
 
         *workspace*, *email*, and *output_path* configure execution paths;
         *options* supplies Slurm limits; *prefetch_batches*, *max_staged_gb*,
         *minimum_free_gb*, *cleanup*, *keep_failed_inputs*, and *fsync_logs*
         configure storage and logs. *retry_failed* and *batch_ids* select work.
+        *prefetch_max_size* limits SRA archives and *download_workers* bounds downloads.
         """
 
         if options.mode != "distributed":
@@ -360,8 +365,8 @@ class SlurmExecutor:
             self.python_executable,
             "-m",
             "ncbi_dataset_builder.slurm_dispatcher",
-            "--plan",
-            str(plan_path.resolve()),
+            "--job",
+            str(job_path.resolve()),
             "--processor",
             processor_reference,
             "--workspace",
@@ -378,6 +383,10 @@ class SlurmExecutor:
             str(minimum_free_gb),
             "--cleanup",
             cleanup,
+            "--prefetch-max-size",
+            prefetch_max_size,
+            "--download-workers",
+            str(download_workers),
         ]
         if options.max_parallel is not None:
             command.extend(("--max-parallel", str(options.max_parallel)))
@@ -445,7 +454,7 @@ class SlurmExecutor:
     def create_coordinator_script(
         self,
         *,
-        plan_path: Path,
+        job_path: Path,
         processor_reference: str,
         workspace: Path,
         email: str | None,
@@ -462,16 +471,19 @@ class SlurmExecutor:
         fsync_logs: bool,
         retry_failed: bool = False,
         batch_ids: set[int] | None = None,
+        prefetch_max_size: str = "u",
+        download_workers: int = 2,
     ) -> Path:
         """Write one coordinator job that preserves bounded batch ordering.
 
-        *plan_path* and *processor_reference* select work, *workspace* stores
+        *job_path* and *processor_reference* select work, *workspace* stores
         durable state, *email* configures NCBI, and *output_path* receives the
         script. *options* supplies scheduler flags. *max_workers*,
         *total_threads*, and *total_memory_gb* control allocation-wide resources.
         *prefetch_batches*, *max_staged_gb*, *minimum_free_gb*, *cleanup*,
         *keep_failed_inputs*, and *fsync_logs* configure the pipeline.
         *retry_failed* enables retries and *batch_ids* optionally limits batches.
+        *prefetch_max_size* limits SRA archives and *download_workers* bounds downloads.
         """
 
         if max_workers < 1 or total_threads < 1 or total_memory_gb <= 0:
@@ -497,8 +509,8 @@ class SlurmExecutor:
             self.python_executable,
             "-m",
             "ncbi_dataset_builder.pipeline_worker",
-            "--plan",
-            str(plan_path.resolve()),
+            "--job",
+            str(job_path.resolve()),
             "--processor",
             processor_reference,
             "--workspace",
@@ -515,6 +527,10 @@ class SlurmExecutor:
             str(minimum_free_gb),
             "--cleanup",
             cleanup,
+            "--prefetch-max-size",
+            prefetch_max_size,
+            "--download-workers",
+            str(download_workers),
         ]
         if max_staged_gb is not None:
             command.extend(("--max-staged-gb", str(max_staged_gb)))

@@ -9,12 +9,12 @@ from .workflow import BuilderConfig, DatasetBuilder
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Execute one plan task from optional CLI *argv* and return an exit code."""
+    """Execute one workspace job task from optional CLI *argv* and return an exit code."""
 
     parser = argparse.ArgumentParser(
         description="Execute one durable dataset task (normally from Slurm)"
     )
-    parser.add_argument("--plan", type=Path, required=True)
+    parser.add_argument("--job", type=Path, required=True)
     parser.add_argument("--task-index", type=int, required=True)
     parser.add_argument("--processor", required=True)
     parser.add_argument("--workspace", type=Path, required=True)
@@ -23,6 +23,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cleanup", choices=("after_success", "never"), default="after_success")
     parser.add_argument("--discard-failed-inputs", action="store_true")
     parser.add_argument("--no-fsync-logs", action="store_true")
+    parser.add_argument("--prefetch-max-size", default="u")
     arguments = parser.parse_args(argv)
     policy = PipelinePolicy(
         cleanup=arguments.cleanup,
@@ -36,12 +37,13 @@ def main(argv: list[str] | None = None) -> int:
             ncbi_api_key=os.environ.get("NCBI_API_KEY"),
             max_workers=1,
             pipeline_policy=policy,
+            prefetch_max_size=arguments.prefetch_max_size,
             progress_bars=False,
         )
     )
-    plan = builder.load_plan(arguments.plan)
+    job = builder.load_job(arguments.job)
     outcome = builder.run_task(
-        plan,
+        job,
         arguments.task_index,
         arguments.processor,
         retry_failed=arguments.retry_failed,

@@ -244,6 +244,11 @@ class RunCatalog:
                 "library_strategy": self._unique(rows, "LibraryStrategy"),
                 "library_layout": self._unique(rows, "LibraryLayout"),
                 "platform": self._unique(rows, "Platform"),
+                "run_size_gb": {
+                    str(row["Run"]): float(row.get("size_MB") or 0) / 1_000
+                    for row in rows
+                    if row.get("Run") not in (None, "")
+                },
             }
             units.append(
                 ProcessingUnit(

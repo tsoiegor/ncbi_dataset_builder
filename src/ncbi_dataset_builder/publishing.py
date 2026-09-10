@@ -10,10 +10,17 @@ from typing import Any, Literal
 
 from .descriptions import training_fields_by_experiment
 from .metadata import MetadataBundle
-from .models import DatasetPlan
+from .models import WorkspaceJob
 from .progress import ProgressReporter, get_progress
 from .state import TaskStateStore
-from .util import atomic_write_json, bytes_to_gb, read_json, sanitize_identifier, sha256_file
+from .util import (
+    atomic_write_json,
+    bytes_to_gb,
+    exclusive_file_lock,
+    read_json,
+    sanitize_identifier,
+    sha256_file,
+)
 
 PublishMode = Literal["auto", "hardlink", "copy"]
 
@@ -36,7 +43,7 @@ class DatasetExport:
 
 
 class DatasetPublisher:
-    """Publish validated plan outputs as a compact model-ready dataset."""
+    """Publish validated workspace outputs as a compact model-ready dataset."""
 
     def __init__(
         self,
@@ -48,14 +55,14 @@ class DatasetPublisher:
 
         self.workspace = Path(workspace)
         self.progress = get_progress(progress)
-        self.state = TaskStateStore(self.workspace / "state" / "tasks")
+        self.state = TaskStateStore(self.workspace / "state" / "units")
         self._metadata: MetadataBundle | None = None
         self._generated_training: dict[str, dict[str, Any]] | None = None
         self._experiment_fields: dict[str, dict[str, Any]] | None = None
 
     @staticmethod
     def _remove_path(path: Path) -> None:
-        """Remove private staging or backup *path* without following symlinks."""
+        """Remove package-owned staging or backup *path* without following symlinks."""
 
         if path.is_symlink() or path.is_file():
             path.unlink(missing_ok=True)
@@ -170,32 +177,38 @@ class DatasetPublisher:
 
     def publish(
         self,
-        plan: DatasetPlan,
+        job: WorkspaceJob,
         destination: Path | None = None,
         *,
         mode: PublishMode = "auto",
         overwrite: bool = False,
     ) -> DatasetExport:
-        """Publish completed experiment *plan* into *destination* using *mode*.
+        """Publish completed experiment *job* into *destination* using *mode*.
 
         *overwrite* atomically replaces an existing destination after the new
         dataset has been fully materialized and validated.
         """
 
-        if plan.group_by != "experiment":
-            raise ValueError("Compact publishing requires a plan grouped by experiment")
+        if job.group_by != "experiment":
+            raise ValueError("Compact publishing requires a workspace grouped by experiment")
         if mode not in {"auto", "hardlink", "copy"}:
             raise ValueError(f"Unknown publish mode: {mode!r}")
-        target = Path(destination) if destination is not None else self.workspace / "dataset"
+        target = Path(destination) if destination is not None else self.workspace
+        in_place = target.resolve() == self.workspace.resolve()
         target_exists = target.exists() or target.is_symlink()
-        if target_exists and not overwrite:
+        if target_exists and not in_place and not overwrite:
             raise FileExistsError(f"Dataset destination already exists: {target}")
-        staging = target.parent / f".{target.name}.part-{uuid.uuid4().hex}"
-        backup = target.parent / f".{target.name}.backup-{uuid.uuid4().hex}"
+        staging = (
+            self.workspace / "work" / "publishing" / job.job_id
+            if in_place
+            else target.parent / f"{target.name}.staging-{uuid.uuid4().hex}"
+        )
+        backup = target.parent / f"{target.name}.backup-{uuid.uuid4().hex}"
+        self._remove_path(staging)
         records: dict[str, dict[str, Any]] = {}
         genome_records: dict[str, dict[str, Any]] = {}
         try:
-            for task in self.progress.track(plan.tasks, "Publish dataset", unit="experiments"):
+            for task in self.progress.track(job.tasks, "Publish dataset", unit="experiments"):
                 experiments = task.unit.experiment_accessions
                 samples = task.unit.sra_sample_accessions
                 if len(experiments) != 1 or experiments[0] != task.unit.unit_id:
@@ -209,7 +222,7 @@ class DatasetPublisher:
                 experiment_id = sanitize_identifier(experiments[0])
                 if experiment_id in records:
                     raise ValueError(f"Duplicate published Experiment ID: {experiment_id}")
-                state_key = f"{plan.plan_id}__{task.task_id}"
+                state_key = task.task_id
                 state = self.state.get(state_key)
                 if state is None or state.get("status") != "succeeded":
                     raise ValueError(f"Experiment {experiment_id} has not completed successfully")
@@ -278,16 +291,46 @@ class DatasetPublisher:
                 }
             manifest = {
                 "schema_version": 1,
-                "plan_id": plan.plan_id,
-                "group_by": plan.group_by,
+                "job_id": job.job_id,
+                "group_by": job.group_by,
                 "experiments": records,
                 "genomes": genome_records,
             }
             atomic_write_json(staging / "manifest.json", manifest)
-            if target_exists:
-                os.replace(target, backup)
-            os.replace(staging, target)
-            self._remove_path(backup)
+            if in_place:
+                for directory in ("bigWig", "descriptions", "genomes"):
+                    destination_root = target / directory
+                    destination_root.mkdir(parents=True, exist_ok=True)
+                    for source in (staging / directory).iterdir():
+                        os.replace(source, destination_root / source.name)
+                with exclusive_file_lock(target / "state" / "workspace-manifest.lock"):
+                    root_manifest = (
+                        read_json(target / "manifest.json")
+                        if (target / "manifest.json").is_file()
+                        else {"schema_version": 1, "units": {}}
+                    )
+                    previous_dataset = root_manifest.get("dataset", {})
+                    previous_records = previous_dataset.get("experiments", {})
+                    if isinstance(previous_records, dict):
+                        for record in previous_records.values():
+                            if isinstance(record, dict):
+                                record["requested_by_latest_job"] = False
+                        for experiment_id, record in records.items():
+                            record["requested_by_latest_job"] = True
+                            previous_records[experiment_id] = record
+                        manifest["experiments"] = previous_records
+                    previous_genomes = previous_dataset.get("genomes", {})
+                    if isinstance(previous_genomes, dict):
+                        previous_genomes.update(genome_records)
+                        manifest["genomes"] = previous_genomes
+                    root_manifest["dataset"] = manifest
+                    atomic_write_json(target / "manifest.json", root_manifest)
+                self._remove_path(staging)
+            else:
+                if target_exists:
+                    os.replace(target, backup)
+                os.replace(staging, target)
+                self._remove_path(backup)
         except BaseException:
             self._remove_path(staging)
             if (backup.exists() or backup.is_symlink()) and not target.exists():

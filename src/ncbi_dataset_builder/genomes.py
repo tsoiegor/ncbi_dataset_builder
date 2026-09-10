@@ -441,7 +441,7 @@ class GenomeManager:
         """
 
         self.root.mkdir(parents=True, exist_ok=True)
-        download_dir = self.root / ".downloads" / candidate.accession
+        download_dir = self.root / "downloads" / candidate.accession
         download_dir.mkdir(parents=True, exist_ok=True)
         archive = download_dir / f"{candidate.accession}.zip"
         fasta = self.root / f"{candidate.accession}.fasta.gz"

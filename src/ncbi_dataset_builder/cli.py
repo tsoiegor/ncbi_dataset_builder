@@ -78,6 +78,7 @@ def _builder(arguments: argparse.Namespace) -> DatasetBuilder:
             max_workers=arguments.max_workers,
             total_threads=arguments.total_threads,
             total_memory_gb=arguments.total_memory_gb,
+            prefetch_max_size=getattr(arguments, "prefetch_max_size", "u"),
             show_progress=not arguments.no_progress,
             progress_bars=not arguments.no_progress_bars,
         )
@@ -155,22 +156,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sanitize.add_argument("paths", nargs="+", type=Path)
 
-    plan = commands.add_parser("plan", help="Create a deterministic processing plan")
-    plan.add_argument("--catalog", type=Path, required=True)
-    plan.add_argument(
-        "--group-by",
-        choices=("run", "experiment", "sra_sample", "biosample"),
-        default="experiment",
-    )
-    plan.add_argument("--threads", type=int, default=4)
-    plan.add_argument("--memory-gb", type=int, default=16)
-    plan.add_argument("--time-limit", default="24:00:00")
-    plan.add_argument("--max-batch-gb", type=float)
-    plan.add_argument("--max-batch-units", type=int)
-    plan.add_argument("--output", type=Path, required=True)
-
-    build = commands.add_parser("build", help="Execute a plan on the current machine")
-    build.add_argument("--plan", type=Path, required=True)
+    build = commands.add_parser("build", help="Reconcile a catalog and build required units")
+    build.add_argument("--catalog", type=Path, required=True)
     build.add_argument("--processor", required=True)
     build.add_argument("--retry-failed", action="store_true")
     build.add_argument("--batch-id", type=int, action="append")
@@ -178,7 +165,7 @@ def build_parser() -> argparse.ArgumentParser:
     submit = commands.add_parser(
         "submit-slurm", help="Generate or submit one bounded-pipeline coordinator job"
     )
-    submit.add_argument("--plan", type=Path, required=True)
+    submit.add_argument("--catalog", type=Path, required=True)
     submit.add_argument("--processor", required=True)
     submit.add_argument("--script", type=Path)
     submit.add_argument("--partition")
@@ -199,7 +186,23 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--batch-id", type=int, action="append")
 
     for pipeline_command in (build, submit):
+        pipeline_command.add_argument(
+            "--group-by",
+            choices=("run", "experiment", "sra_sample", "biosample"),
+            default="experiment",
+        )
+        pipeline_command.add_argument("--threads", type=int, default=4)
+        pipeline_command.add_argument("--memory-gb", type=int, default=16)
+        pipeline_command.add_argument("--time-limit", default="24:00:00")
+        pipeline_command.add_argument("--max-batch-gb", type=float)
+        pipeline_command.add_argument("--max-batch-units", type=int)
+        pipeline_command.add_argument(
+            "--prefetch-max-size",
+            default="u",
+            help="SRA Toolkit archive limit such as 200G, or u for unlimited",
+        )
         pipeline_command.add_argument("--prefetch-batches", type=int, choices=(0, 1), default=1)
+        pipeline_command.add_argument("--download-workers", type=int, default=2)
         pipeline_command.add_argument("--max-staged-gb", type=float)
         pipeline_command.add_argument("--minimum-free-gb", type=float, default=0.0)
         pipeline_command.add_argument(
@@ -209,13 +212,13 @@ def build_parser() -> argparse.ArgumentParser:
         pipeline_command.add_argument("--no-fsync-logs", action="store_true")
 
     status = commands.add_parser("status", help="Summarize durable task state")
-    status.add_argument("--plan", type=Path, required=True)
+    status.add_argument("--job-id")
     status.add_argument("--batch-id", type=int, action="append")
 
     publish = commands.add_parser(
         "publish", help="Publish completed experiment outputs as a compact dataset"
     )
-    publish.add_argument("--plan", type=Path, required=True)
+    publish.add_argument("--job-id")
     publish.add_argument("--destination", type=Path)
     publish.add_argument("--mode", choices=("auto", "hardlink", "copy"), default="auto")
     publish.add_argument("--overwrite", action="store_true")
@@ -295,25 +298,6 @@ def main(argv: list[str] | None = None) -> int:
         elif arguments.command == "sanitize-legacy-metadata":
             changed = sanitize_legacy_metadata(arguments.paths)
             print(json.dumps({"changed": len(changed)}))
-        elif arguments.command == "plan":
-            resources = ResourceSpec(arguments.threads, arguments.memory_gb, arguments.time_limit)
-            plan = builder.plan(
-                builder.load_runs(arguments.catalog),
-                group_by=arguments.group_by,
-                resources=resources,
-                max_batch_gb=arguments.max_batch_gb,
-                max_batch_units=arguments.max_batch_units,
-            )
-            builder.save_plan(plan, arguments.output)
-            print(
-                json.dumps(
-                    {
-                        "plan_id": plan.plan_id,
-                        "tasks": len(plan.tasks),
-                        "output": str(arguments.output),
-                    }
-                )
-            )
         elif arguments.command == "build":
             policy = PipelinePolicy(
                 prefetch_batches=arguments.prefetch_batches,
@@ -322,10 +306,17 @@ def main(argv: list[str] | None = None) -> int:
                 cleanup=arguments.cleanup,
                 keep_failed_inputs=not arguments.discard_failed_inputs,
                 fsync_logs=not arguments.no_fsync_logs,
+                download_workers=arguments.download_workers,
             )
             report = builder.build(
-                builder.load_plan(arguments.plan),
+                builder.load_runs(arguments.catalog),
                 arguments.processor,
+                group_by=arguments.group_by,
+                resources=ResourceSpec(
+                    arguments.threads, arguments.memory_gb, arguments.time_limit
+                ),
+                max_batch_gb=arguments.max_batch_gb,
+                max_batch_units=arguments.max_batch_units,
                 retry_failed=arguments.retry_failed,
                 batch_ids=set(arguments.batch_id) if arguments.batch_id else None,
                 policy=policy,
@@ -336,15 +327,17 @@ def main(argv: list[str] | None = None) -> int:
                         "succeeded": report.succeeded,
                         "failed": report.failed,
                         "skipped": report.skipped,
+                        "job_id": report.job_id,
                     }
                 )
             )
             return 1 if report.failed else 0
         elif arguments.command == "submit-slurm":
-            plan = builder.load_plan(arguments.plan)
-            resources = plan.tasks[0].resources if plan.tasks else ResourceSpec()
-            script, job_id = builder.submit_slurm(
-                plan,
+            resources = ResourceSpec(
+                arguments.threads, arguments.memory_gb, arguments.time_limit
+            )
+            script, slurm_job_id = builder.submit_slurm(
+                builder.load_runs(arguments.catalog),
                 processor_reference=arguments.processor,
                 options=SlurmOptions(
                     resources=resources,
@@ -360,7 +353,9 @@ def main(argv: list[str] | None = None) -> int:
                     coordinator_time_limit=arguments.coordinator_time_limit,
                     cpus_per_node=arguments.cpus_per_node,
                 ),
-                plan_path=arguments.plan,
+                group_by=arguments.group_by,
+                max_batch_gb=arguments.max_batch_gb,
+                max_batch_units=arguments.max_batch_units,
                 script_path=arguments.script,
                 submit=not arguments.dry_run,
                 retry_failed=arguments.retry_failed,
@@ -372,14 +367,23 @@ def main(argv: list[str] | None = None) -> int:
                     cleanup=arguments.cleanup,
                     keep_failed_inputs=not arguments.discard_failed_inputs,
                     fsync_logs=not arguments.no_fsync_logs,
+                    download_workers=arguments.download_workers,
                 ),
             )
-            print(json.dumps({"script": str(script), "job_id": job_id}))
+            print(
+                json.dumps(
+                    {
+                        "script": str(script),
+                        "workspace_job_id": builder.workspace.latest_job().job_id,
+                        "slurm_job_id": slurm_job_id,
+                    }
+                )
+            )
         elif arguments.command == "status":
             print(
                 json.dumps(
                     builder.status(
-                        builder.load_plan(arguments.plan),
+                        arguments.job_id,
                         batch_ids=set(arguments.batch_id) if arguments.batch_id else None,
                     ),
                     indent=2,
@@ -387,8 +391,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif arguments.command == "publish":
             result = builder.publish_dataset(
-                builder.load_plan(arguments.plan),
                 destination=arguments.destination,
+                job_id=arguments.job_id,
                 mode=arguments.mode,
                 overwrite=arguments.overwrite,
             )

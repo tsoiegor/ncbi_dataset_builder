@@ -90,6 +90,7 @@ class PipelinePolicy:
         cleanup: Whether successful unit inputs are deleted after verified processing.
         keep_failed_inputs: Preserve staged inputs for failed units.
         fsync_logs: Synchronize each unit log at the end of every phase.
+        download_workers: Maximum unit downloads within one staging batch.
     """
 
     prefetch_batches: int = 1
@@ -98,6 +99,7 @@ class PipelinePolicy:
     cleanup: CleanupPolicy = "after_success"
     keep_failed_inputs: bool = True
     fsync_logs: bool = True
+    download_workers: int = 2
 
     def __post_init__(self) -> None:
         """Validate prefetch, storage, cleanup, and logging policy values."""
@@ -110,6 +112,8 @@ class PipelinePolicy:
             raise ValueError("minimum_free_gb cannot be negative")
         if self.cleanup not in {"after_success", "never"}:
             raise ValueError(f"Unknown cleanup policy: {self.cleanup!r}")
+        if self.download_workers < 1:
+            raise ValueError("download_workers must be positive")
 
 
 @dataclass(frozen=True)
@@ -117,7 +121,7 @@ class BatchManifest:
     """Persist the durable lifecycle and storage facts for one batch.
 
     Args:
-        plan_id: Owning dataset plan identifier.
+        job_id: Owning execution-snapshot identifier.
         batch_id: Integer batch identifier.
         status: Current batch lifecycle state.
         unit_ids: Ordered unit identifiers in the batch.
@@ -133,7 +137,7 @@ class BatchManifest:
         completed_at: Timestamp when processing reached a terminal state.
     """
 
-    plan_id: str
+    job_id: str
     batch_id: int
     status: BatchStatus
     unit_ids: tuple[str, ...]
@@ -173,20 +177,20 @@ class BatchStateStore:
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
 
-    def _path(self, plan_id: str, batch_id: int) -> Path:
-        """Return the state path for *plan_id* and *batch_id*."""
+    def _path(self, job_id: str, batch_id: int) -> Path:
+        """Return the state path for *job_id* and *batch_id*."""
 
-        return self.root / sanitize_identifier(plan_id) / f"batch-{batch_id:06d}.json"
+        return self.root / sanitize_identifier(job_id) / f"batch-{batch_id:06d}.json"
 
     def save(self, manifest: BatchManifest) -> Path:
         """Atomically persist *manifest* and return its path."""
 
-        path = self._path(manifest.plan_id, manifest.batch_id)
+        path = self._path(manifest.job_id, manifest.batch_id)
         atomic_write_json(path, manifest.to_dict())
         return path
 
-    def get(self, plan_id: str, batch_id: int) -> BatchManifest | None:
-        """Return saved state for *plan_id* and *batch_id*, when present."""
+    def get(self, job_id: str, batch_id: int) -> BatchManifest | None:
+        """Return saved state for *job_id* and *batch_id*, when present."""
 
-        path = self._path(plan_id, batch_id)
+        path = self._path(job_id, batch_id)
         return BatchManifest.from_dict(read_json(path)) if path.is_file() else None

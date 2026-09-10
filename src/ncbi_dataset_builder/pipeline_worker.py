@@ -9,12 +9,12 @@ from .workflow import BuilderConfig, DatasetBuilder
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Execute a bounded plan pipeline from optional command-line *argv*."""
+    """Execute a bounded workspace job from optional command-line *argv*."""
 
     parser = argparse.ArgumentParser(
         description="Coordinate bounded batch staging and processing inside one Slurm job"
     )
-    parser.add_argument("--plan", type=Path, required=True)
+    parser.add_argument("--job", type=Path, required=True)
     parser.add_argument("--processor", required=True)
     parser.add_argument("--workspace", type=Path, required=True)
     parser.add_argument("--email", default=os.environ.get("NCBI_EMAIL"))
@@ -29,6 +29,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-fsync-logs", action="store_true")
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--batch-id", type=int, action="append")
+    parser.add_argument("--prefetch-max-size", default="u")
+    parser.add_argument("--download-workers", type=int, default=2)
     arguments = parser.parse_args(argv)
     policy = PipelinePolicy(
         prefetch_batches=arguments.prefetch_batches,
@@ -37,6 +39,7 @@ def main(argv: list[str] | None = None) -> int:
         cleanup=arguments.cleanup,
         keep_failed_inputs=not arguments.discard_failed_inputs,
         fsync_logs=not arguments.no_fsync_logs,
+        download_workers=arguments.download_workers,
     )
     builder = DatasetBuilder(
         BuilderConfig(
@@ -47,11 +50,12 @@ def main(argv: list[str] | None = None) -> int:
             total_threads=arguments.total_threads,
             total_memory_gb=arguments.total_memory_gb,
             pipeline_policy=policy,
+            prefetch_max_size=arguments.prefetch_max_size,
             progress_bars=False,
         )
     )
-    report = builder.build(
-        builder.load_plan(arguments.plan),
+    report = builder.run_job(
+        builder.load_job(arguments.job),
         arguments.processor,
         retry_failed=arguments.retry_failed,
         batch_ids=set(arguments.batch_id) if arguments.batch_id else None,

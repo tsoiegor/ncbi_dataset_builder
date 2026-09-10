@@ -1,8 +1,10 @@
 import json
 
+from ncbi_dataset_builder.http import HttpResponse
 from ncbi_dataset_builder.metadata import (
     BioSampleClient,
     EntrezClient,
+    MetadataBundle,
     SraClient,
     fetch_metadata_for_accessions,
     sanitize_legacy_metadata,
@@ -72,9 +74,9 @@ class FakeEntrez:
         self.resolutions.append((database, list(identifiers), kwargs))
         return ["7807635"] if database == "sra" else ["11608754"]
 
-    def get(self, endpoint, params):
+    def get(self, endpoint, params, **kwargs):
         assert endpoint == "efetch.fcgi"
-        self.fetches.append(params)
+        self.fetches.append((params, kwargs))
         if params["db"] == "sra":
             assert params["id"] == "7807635"
             return SRA_XML
@@ -86,9 +88,25 @@ class RecordingResolver:
     def __init__(self):
         self.queries = []
 
-    def search_ids(self, database, query):
-        self.queries.append((database, query))
+    def search_ids(self, database, query, **kwargs):
+        self.queries.append((database, query, kwargs))
         return ["7807635"] if "SRS4739189" in query else ["7807636"]
+
+
+class RecordingHttp:
+    """Return numbered responses and record each network request."""
+
+    def __init__(self):
+        """Initialize an empty request log."""
+
+        self.calls = []
+
+    def request(self, url, *, params=None, headers=None):
+        """Record *url*, *params*, and *headers*, then return a numbered body."""
+
+        self.calls.append((url, params, headers))
+        body = f"response-{len(self.calls)}".encode()
+        return HttpResponse(url=url, status=200, headers={}, body=body)
 
 
 def test_accessions_are_resolved_to_numeric_uids_before_efetch():
@@ -101,9 +119,46 @@ def test_accessions_are_resolved_to_numeric_uids_before_efetch():
     )
     assert result == ["123", "7807635", "7807636"]
     assert resolver.queries == [
-        ("sra", '"SRS4739189"[Accession]'),
-        ("sra", '"SRR9032674"[Accession]'),
+        ("sra", '"SRS4739189"[Accession]', {"refresh": False}),
+        ("sra", '"SRR9032674"[Accession]', {"refresh": False}),
     ]
+
+
+def test_entrez_raw_cache_is_read_through_and_refreshable(tmp_path):
+    http = RecordingHttp()
+    client = EntrezClient(email="test@example.org", cache_dir=tmp_path, http=http)
+    params = {"db": "sra", "id": "1", "retmode": "xml"}
+
+    assert client.get("efetch.fcgi", params) == b"response-1"
+    assert client.get("efetch.fcgi", params) == b"response-1"
+    assert len(http.calls) == 1
+
+    assert client.get("efetch.fcgi", params, refresh=True) == b"response-2"
+    assert client.get("efetch.fcgi", params) == b"response-2"
+    assert len(http.calls) == 2
+    assert client.statistics() == {"raw_cache_hits": 2, "network_requests": 2}
+
+
+def test_entrez_history_never_reuses_expiring_webenv(tmp_path):
+    class HistoryHttp(RecordingHttp):
+        """Return valid ESearch history JSON with a changing WebEnv token."""
+
+        def request(self, url, *, params=None, headers=None):
+            """Record *url*, *params*, and *headers* and return changing JSON."""
+
+            self.calls.append((url, params, headers))
+            number = len(self.calls)
+            body = json.dumps(
+                {"esearchresult": {"count": "1", "querykey": "1", "webenv": f"token-{number}"}}
+            ).encode()
+            return HttpResponse(url=url, status=200, headers={}, body=body)
+
+    http = HistoryHttp()
+    client = EntrezClient(email="test@example.org", cache_dir=tmp_path, http=http)
+
+    assert client.search_history("sra", "ATAC-seq")["webenv"] == "token-1"
+    assert client.search_history("sra", "ATAC-seq")["webenv"] == "token-2"
+    assert len(http.calls) == 2
 
 
 def test_structured_sra_xml_preserves_page_entities_and_resolves_accession():
@@ -116,7 +171,7 @@ def test_structured_sra_xml_preserves_page_entities_and_resolves_accession():
         "runs": 2,
         "spots": 30,
         "bases": 300,
-        "bytes": 123,
+        "size_gb": 0.000000123,
     }
     assert bundle.studies[0]["accession"] == "SRP197260"
     assert bundle.studies[0]["bioproject"] == "PRJNA542075"
@@ -131,7 +186,7 @@ def test_structured_sra_xml_preserves_page_entities_and_resolves_accession():
     assert bundle.experiments[0]["attributes"]["GEO Accession"] == "GSM3756614"
     assert bundle.sra_samples[0]["biosample"] == "SAMN11608754"
     assert bundle.submissions[0]["organization"]["name"] == "NCBI"
-    assert bundle.runs[0]["size_bytes"] == 41
+    assert bundle.runs[0]["size_gb"] == 0.000000041
     assert bundle.runs[0]["files"][0]["alternatives"][0]["org"] == "AWS"
     assert bundle.raw_sra_packages
 
@@ -176,6 +231,7 @@ def test_combined_sample_description_and_persistence(tmp_path):
     assert (tmp_path / "packages.ndjson").stat().st_size > 0
     assert (tmp_path / "experiments.ndjson").stat().st_size > 0
     assert (tmp_path / "biosamples.ndjson").stat().st_size > 0
+    assert MetadataBundle.load(tmp_path).to_dict() == bundle.to_dict()
 
 
 def test_legacy_markup_sanitizer_removes_tags_decodes_entities_and_preserves_unicode(

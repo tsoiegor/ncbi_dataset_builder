@@ -299,6 +299,7 @@ class DatasetTask:
         batch_id: Deterministic batch assignment.
         resources: CPU, memory, and time settings.
         genome_pin: Optional exact assembly accession.
+        fingerprint: Stable semantic identity used for workspace resume decisions.
     """
 
     task_id: str
@@ -306,6 +307,7 @@ class DatasetTask:
     batch_id: int
     resources: ResourceSpec
     genome_pin: str | None = None
+    fingerprint: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize this task and its nested unit and resources."""
@@ -316,6 +318,7 @@ class DatasetTask:
             "batch_id": self.batch_id,
             "resources": asdict(self.resources),
             "genome_pin": self.genome_pin,
+            "fingerprint": self.fingerprint,
         }
 
     @classmethod
@@ -328,54 +331,59 @@ class DatasetTask:
             batch_id=int(value["batch_id"]),
             resources=ResourceSpec(**value["resources"]),
             genome_pin=value.get("genome_pin"),
+            fingerprint=value.get("fingerprint", ""),
         )
 
 
 @dataclass(frozen=True)
-class DatasetPlan:
-    """Store a reproducible collection of dataset tasks.
+class WorkspaceJob:
+    """Store one automatically generated workspace execution snapshot.
 
     Args:
-        plan_id: Unique plan identifier.
+        job_id: Human-readable timestamp and content-hash identifier.
         created_at: UTC creation timestamp.
         query: Optional source NCBI query.
         group_by: Entity level used to form processing units.
         tasks: Ordered immutable tasks.
-        catalog_audit: Catalog operations preceding the plan.
-        metadata: Additional plan-level provenance.
+        processor_identity: Stable identity of the processor used by the job.
+        catalog_audit: Catalog operations preceding the job.
+        metadata: Additional job-level provenance and reconciliation counts.
     """
 
-    plan_id: str
+    job_id: str
     created_at: str
     query: str | None
     group_by: str
     tasks: tuple[DatasetTask, ...]
+    processor_identity: str
     catalog_audit: tuple[str, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialize the plan and all nested tasks to JSON-compatible values."""
+        """Serialize the job and all nested tasks to JSON-compatible values."""
 
         return {
-            "plan_id": self.plan_id,
+            "job_id": self.job_id,
             "created_at": self.created_at,
             "query": self.query,
             "group_by": self.group_by,
             "tasks": [task.to_dict() for task in self.tasks],
+            "processor_identity": self.processor_identity,
             "catalog_audit": list(self.catalog_audit),
             "metadata": self.metadata,
         }
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> DatasetPlan:
-        """Restore a complete dataset plan from serialized mapping *value*."""
+    def from_dict(cls, value: dict[str, Any]) -> WorkspaceJob:
+        """Restore a complete workspace job from serialized mapping *value*."""
 
         return cls(
-            plan_id=value["plan_id"],
+            job_id=value["job_id"],
             created_at=value["created_at"],
             query=value.get("query"),
             group_by=value["group_by"],
             tasks=tuple(DatasetTask.from_dict(item) for item in value["tasks"]),
+            processor_identity=value["processor_identity"],
             catalog_audit=tuple(value.get("catalog_audit", ())),
             metadata=value.get("metadata", {}),
         )

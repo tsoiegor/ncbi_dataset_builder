@@ -209,6 +209,19 @@ class SraToolkitProvider:
         self.prefetch_max_size = prefetch_max_size
         self.progress = get_progress(progress)
 
+    def _prefetch_limit_gb(self) -> float | None:
+        """Return configured ``prefetch_max_size`` in GB, or ``None`` when unlimited."""
+
+        value = self.prefetch_max_size.strip().lower()
+        if value in {"u", "unlimited"}:
+            return None
+        match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([kmgt]?)b?", value)
+        if match is None:
+            raise ValueError(f"Invalid prefetch_max_size: {self.prefetch_max_size!r}")
+        number, unit = match.groups()
+        factor = {"": 1e-9, "k": 1e-6, "m": 1e-3, "g": 1.0, "t": 1_000.0}[unit]
+        return float(number) * factor
+
     def preflight(self) -> dict[str, str]:
         """Require SRA Toolkit commands and return available tool versions."""
 
@@ -245,39 +258,70 @@ class SraToolkitProvider:
         run_dir = sra_root / accession
         run_dir.mkdir(parents=True, exist_ok=True)
         complete = run_dir / "sra.complete.json"
-        if complete.is_file():
-            candidates = list(run_dir.rglob(f"{accession}.sra"))
-            if len(candidates) == 1 and existing_nonempty(candidates[0]):
-                self.progress.message(f"SRA raw cache hit: {accession}")
-                return candidates[0]
+        archive = run_dir / "data.sra"
+        if complete.is_file() and existing_nonempty(archive):
+            self.progress.message(f"SRA raw cache hit: {accession}")
+            return archive
         self.progress.message(f"Prefetch and validate SRA run {accession}")
-        # prefetch is resumable and inexpensive for an already complete run; it
-        # is deliberately called again so an interrupted/corrupt cache repairs.
-        self._retry_command(
-            [
-                "prefetch",
-                accession,
-                "--output-directory",
-                str(run_dir),
-                "--max-size",
-                self.prefetch_max_size,
-            ]
-        )
-        candidates = list(run_dir.rglob(f"{accession}.sra"))
-        if len(candidates) != 1 or not existing_nonempty(candidates[0]):
-            raise DownloadError(
-                f"Expected one non-empty {accession}.sra below {run_dir}; found {len(candidates)}"
-            )
-        self._retry_command(["vdb-validate", str(run_dir)])
-        atomic_write_json(
-            complete,
-            {
-                "accession": accession,
-                "sra_file": str(candidates[0]),
-                "size_gb": bytes_to_gb(candidates[0].stat().st_size),
-            },
-        )
-        return candidates[0]
+        native = run_dir / "download"
+        last_error: BaseException | None = None
+        for attempt in range(self.retries + 1):
+            try:
+                native.mkdir(parents=True, exist_ok=True)
+                self.progress.message(
+                    f"Run prefetch (attempt {attempt + 1}/{self.retries + 1})"
+                )
+                self.runner.run(
+                    [
+                        "prefetch",
+                        accession,
+                        "--output-directory",
+                        str(native),
+                        "--max-size",
+                        self.prefetch_max_size,
+                    ]
+                )
+                exact_sra = [
+                    path
+                    for path in native.rglob(f"{accession}.sra")
+                    if existing_nonempty(path)
+                ]
+                exact_plain = [
+                    path
+                    for path in native.rglob(accession)
+                    if existing_nonempty(path)
+                ]
+                candidates = exact_sra or exact_plain
+                if len(candidates) != 1:
+                    raise DownloadError(
+                        f"prefetch produced {len(candidates)} usable archives for {accession}; "
+                        f"expected one. The run may exceed prefetch_max_size="
+                        f"{self.prefetch_max_size!r}, or the download may be incomplete."
+                    )
+                self.runner.run(["vdb-validate", str(candidates[0])])
+                archive.unlink(missing_ok=True)
+                os.replace(candidates[0], archive)
+                shutil.rmtree(native, ignore_errors=True)
+                atomic_write_json(
+                    complete,
+                    {
+                        "accession": accession,
+                        "sra_file": str(archive),
+                        "size_gb": bytes_to_gb(archive.stat().st_size),
+                        "prefetch_max_size": self.prefetch_max_size,
+                    },
+                )
+                return archive
+            except (ExternalToolError, DownloadError, OSError) as exc:
+                last_error = exc
+                if attempt == self.retries:
+                    break
+                self.progress.message(f"Retry prefetch for {accession}: {exc}")
+                time.sleep(min(30.0, 2**attempt) + random.random())
+        raise DownloadError(
+            f"Failed to prefetch {accession} after {self.retries + 1} attempts; "
+            f"prefetch_max_size={self.prefetch_max_size!r}. Last error: {last_error}"
+        ) from last_error
 
     def _compress(self, path: Path, threads: int) -> Path:
         """Compress FASTQ *path* with pigz or gzip using available *threads*."""
@@ -321,7 +365,7 @@ class SraToolkitProvider:
     def _cached_run_fastq(self, accession: str, root: Path) -> dict[str, Path] | None:
         """Return validated per-run FASTQ for *accession* below unit *root*, when cached."""
 
-        run_fastq = root / ".runs" / accession
+        run_fastq = root / "runs" / accession
         complete = run_fastq / "run.complete.json"
         if not complete.is_file():
             return None
@@ -357,7 +401,7 @@ class SraToolkitProvider:
         if cached is not None:
             self.progress.message(f"FASTQ conversion cache hit: {accession}")
             return cached
-        run_fastq = root / ".runs" / accession
+        run_fastq = root / "runs" / accession
         run_fastq.mkdir(parents=True, exist_ok=True)
         complete = run_fastq / "run.complete.json"
         known = {
@@ -368,7 +412,7 @@ class SraToolkitProvider:
         for path in (*known.values(), *(run_fastq.glob("*.fastq"))):
             path.unlink(missing_ok=True)
         complete.unlink(missing_ok=True)
-        temporary = root / ".tmp" / accession
+        temporary = root / "temp" / accession
         temporary.mkdir(parents=True, exist_ok=True)
         self._retry_command(
             [
@@ -383,6 +427,13 @@ class SraToolkitProvider:
                 str(run_fastq),
             ]
         )
+        source_stem = sra_file.name.removesuffix(".sra")
+        if source_stem != accession:
+            for suffix in ("_1", "_2", ""):
+                generated = run_fastq / f"{source_stem}{suffix}.fastq"
+                expected = run_fastq / f"{accession}{suffix}.fastq"
+                if generated.is_file() and not expected.exists():
+                    os.replace(generated, expected)
         for fastq in sorted(run_fastq.glob("*.fastq")):
             self._compress(fastq, threads)
         present = {key: path for key, path in known.items() if existing_nonempty(path)}
@@ -402,7 +453,7 @@ class SraToolkitProvider:
                 "checksums": checksums,
             },
         )
-        raw_root = root / ".raw" / accession
+        raw_root = root / "sra" / accession
         if raw_root.is_dir():
             shutil.rmtree(raw_root)
             self.progress.message(f"Removed validated SRA archive for {accession}")
@@ -473,7 +524,14 @@ class SraToolkitProvider:
     def _remove_transient_unit_files(unit_root: Path) -> None:
         """Remove raw and per-run conversion artifacts below *unit_root*."""
 
-        for transient in (unit_root / ".raw", unit_root / ".tmp", unit_root / ".runs"):
+        for transient in (
+            unit_root / "sra",
+            unit_root / "temp",
+            unit_root / "runs",
+            unit_root / ".raw",
+            unit_root / ".tmp",
+            unit_root / ".runs",
+        ):
             if transient.is_dir():
                 shutil.rmtree(transient)
         for fastq in unit_root.glob("*.fastq"):
@@ -514,19 +572,36 @@ class SraToolkitProvider:
             )
         unit_root.mkdir(parents=True, exist_ok=True)
         self.runner.require("prefetch", "vdb-validate", "fasterq-dump")
+        limit_gb = self._prefetch_limit_gb()
+        run_sizes = unit.metadata.get("run_size_gb", {})
+        oversized = {
+            accession: float(run_sizes[accession])
+            for accession in unit.run_accessions
+            if limit_gb is not None
+            and accession in run_sizes
+            and float(run_sizes[accession]) > limit_gb
+        }
+        if oversized:
+            details = ", ".join(
+                f"{accession}={size:.3f} GB" for accession, size in oversized.items()
+            )
+            raise DownloadError(
+                f"SRA run estimate exceeds prefetch_max_size={self.prefetch_max_size!r}: "
+                f"{details}. Increase BuilderConfig(prefetch_max_size=...) or use 'u'."
+            )
         sra_files: dict[str, str] = {}
         for accession in self.progress.track(
             unit.run_accessions, f"Stage raw SRA for {unit.unit_id}", unit="runs"
         ):
             with exclusive_file_lock(
-                unit_root / f".{accession}.lock",
+                unit_root / "locks" / f"{accession}.lock",
                 timeout_seconds=7 * 24 * 60 * 60,
                 stale_after_seconds=7 * 24 * 60 * 60,
             ):
                 if self._cached_run_fastq(accession, unit_root) is not None:
                     continue
                 sra_files[accession] = str(
-                    self._download_run(accession, unit_root / ".raw")
+                    self._download_run(accession, unit_root / "sra")
                 )
         roots = self._cleanup_roots(unit, destination, unit_root)
         return StagedFastq(
@@ -554,7 +629,7 @@ class SraToolkitProvider:
         safe_id, unit_root, manifest = self._unit_locations(unit, destination)
         unit_root.mkdir(parents=True, exist_ok=True)
         with exclusive_file_lock(
-            unit_root / ".fastq.lock",
+            unit_root / "locks" / "fastq.lock",
             timeout_seconds=7 * 24 * 60 * 60,
             stale_after_seconds=7 * 24 * 60 * 60,
         ):
@@ -597,7 +672,7 @@ class SraToolkitProvider:
             unit="runs",
         ):
             with exclusive_file_lock(
-                unit_root / f".{accession}.lock",
+                unit_root / "locks" / f"{accession}.lock",
                 timeout_seconds=7 * 24 * 60 * 60,
                 stale_after_seconds=7 * 24 * 60 * 60,
             ):
@@ -609,7 +684,7 @@ class SraToolkitProvider:
                 sra_file = (
                     Path(staged_path)
                     if staged_path and existing_nonempty(Path(staged_path))
-                    else self._download_run(accession, unit_root / ".raw")
+                    else self._download_run(accession, unit_root / "sra")
                 )
                 by_run[accession] = self._materialize_run(
                     accession, sra_file, unit_root, threads
@@ -646,7 +721,7 @@ class SraToolkitProvider:
             single=(single,) if single else (),
             source="sra",
             work_dir=unit_root,
-            output_dir=destination.parent / "results" / safe_id,
+            output_dir=destination.parent / "outputs" / safe_id,
             checksums={str(path): sha256_file(path, progress=self.progress) for path in files},
             metadata={
                 "per_run_layout": {run: sorted(value) for run, value in by_run.items()}
@@ -794,7 +869,7 @@ class GeoFastqProvider:
             single=tuple(sorted(single)),
             source="geo",
             work_dir=root,
-            output_dir=destination.parent / "results" / safe_id,
+            output_dir=destination.parent / "outputs" / safe_id,
             checksums={
                 str(path): sha256_file(path, progress=self.progress)
                 for path in (*read1, *read2, *single)

@@ -8,30 +8,30 @@ import subprocess
 from pathlib import Path
 
 from .execution import SlurmExecutor, SlurmOptions
-from .models import DatasetPlan, DatasetTask
+from .models import DatasetTask, WorkspaceJob
 from .pipeline import PipelinePolicy
 from .util import exclusive_file_lock, sanitize_identifier
 from .workflow import BuilderConfig, DatasetBuilder
 
 
-def _selected_batches(plan: DatasetPlan, batch_ids: set[int] | None) -> list[int]:
-    """Return ordered batch IDs in *plan*, optionally restricted by *batch_ids*."""
+def _selected_batches(job: WorkspaceJob, batch_ids: set[int] | None) -> list[int]:
+    """Return ordered batch IDs in *job*, optionally restricted by *batch_ids*."""
 
-    available = {task.batch_id for task in plan.tasks}
+    available = {task.batch_id for task in job.tasks}
     if batch_ids is not None:
         missing = batch_ids - available
         if missing:
-            raise ValueError(f"Plan has no requested batches: {sorted(missing)}")
+            raise ValueError(f"Job has no requested batches: {sorted(missing)}")
         available &= batch_ids
     if not available:
         raise ValueError("No batches were selected for distributed execution")
     return sorted(available)
 
 
-def _batch_tasks(plan: DatasetPlan, batch_id: int) -> list[tuple[int, DatasetTask]]:
-    """Return global task indices and tasks from *plan* belonging to *batch_id*."""
+def _batch_tasks(job: WorkspaceJob, batch_id: int) -> list[tuple[int, DatasetTask]]:
+    """Return global task indices and tasks from *job* belonging to *batch_id*."""
 
-    return [(index, task) for index, task in enumerate(plan.tasks) if task.batch_id == batch_id]
+    return [(index, task) for index, task in enumerate(job.tasks) if task.batch_id == batch_id]
 
 
 def _start_array(script: Path) -> subprocess.Popen[str]:
@@ -68,7 +68,7 @@ def _validate_uniform_resources(tasks: list[tuple[int, DatasetTask]], batch_id: 
     if len(resources) != 1:
         raise ValueError(
             f"Distributed batch {batch_id} has heterogeneous resources; "
-            "create separate plans or resource classes"
+            "submit separate jobs or resource classes"
         )
 
 
@@ -78,7 +78,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Stage bounded batches and dispatch one quota-limited Slurm array per batch"
     )
-    parser.add_argument("--plan", type=Path, required=True)
+    parser.add_argument("--job", type=Path, required=True)
     parser.add_argument("--processor", required=True)
     parser.add_argument("--workspace", type=Path, required=True)
     parser.add_argument("--email", default=os.environ.get("NCBI_EMAIL"))
@@ -98,6 +98,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-fsync-logs", action="store_true")
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--batch-id", type=int, action="append")
+    parser.add_argument("--prefetch-max-size", default="u")
+    parser.add_argument("--download-workers", type=int, default=2)
     arguments = parser.parse_args(argv)
 
     policy = PipelinePolicy(
@@ -107,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
         cleanup=arguments.cleanup,
         keep_failed_inputs=not arguments.discard_failed_inputs,
         fsync_logs=not arguments.no_fsync_logs,
+        download_workers=arguments.download_workers,
     )
     builder = DatasetBuilder(
         BuilderConfig(
@@ -114,14 +117,15 @@ def main(argv: list[str] | None = None) -> int:
             email=arguments.email,
             ncbi_api_key=os.environ.get("NCBI_API_KEY"),
             pipeline_policy=policy,
+            prefetch_max_size=arguments.prefetch_max_size,
             progress_bars=False,
         )
     )
-    plan = builder.load_plan(arguments.plan)
+    job = builder.load_job(arguments.job)
     batches = _selected_batches(
-        plan, set(arguments.batch_id) if arguments.batch_id is not None else None
+        job, set(arguments.batch_id) if arguments.batch_id is not None else None
     )
-    all_tasks = [item for batch_id in batches for item in _batch_tasks(plan, batch_id)]
+    all_tasks = [item for batch_id in batches for item in _batch_tasks(job, batch_id)]
     resources = {task.resources for _, task in all_tasks}
     if len(resources) != 1:
         raise ValueError(
@@ -146,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
         f"quota {arguments.total_cpu_quota} CPUs/{arguments.max_running_jobs} jobs",
         flush=True,
     )
-    lock = arguments.workspace / "state" / ".pipeline-coordinator.lock"
+    lock = arguments.workspace / "state" / "pipeline-coordinator.lock"
     executor = SlurmExecutor()
     with exclusive_file_lock(
         lock,
@@ -155,14 +159,14 @@ def main(argv: list[str] | None = None) -> int:
         heartbeat_seconds=30,
     ):
         current = builder.prefetch_batch(
-            plan,
+            job,
             batches[0],
             retry_failed=arguments.retry_failed,
             policy=policy,
         )
         failed = False
         for position, batch_id in enumerate(batches):
-            indexed_tasks = _batch_tasks(plan, batch_id)
+            indexed_tasks = _batch_tasks(job, batch_id)
             _validate_uniform_resources(indexed_tasks, batch_id)
             worker_options = SlurmOptions(
                 resources=indexed_tasks[0][1].resources,
@@ -174,12 +178,12 @@ def main(argv: list[str] | None = None) -> int:
             worker_script = (
                 arguments.workspace
                 / "slurm"
-                / sanitize_identifier(plan.plan_id)
+                / sanitize_identifier(job.job_id)
                 / f"batch-{batch_id:06d}.sbatch"
             )
             executor.create_script(
-                plan_path=arguments.plan,
-                task_count=len(plan.tasks),
+                job_path=arguments.job,
+                task_count=len(job.tasks),
                 processor_reference=arguments.processor,
                 workspace=arguments.workspace,
                 email=arguments.email,
@@ -190,6 +194,7 @@ def main(argv: list[str] | None = None) -> int:
                 cleanup=policy.cleanup,
                 keep_failed_inputs=policy.keep_failed_inputs,
                 fsync_logs=policy.fsync_logs,
+                prefetch_max_size=arguments.prefetch_max_size,
             )
             process = _start_array(worker_script)
             next_manifest = None
@@ -197,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
             if position + 1 < len(batches) and policy.prefetch_batches == 1:
                 try:
                     next_manifest = builder.prefetch_batch(
-                        plan,
+                        job,
                         batches[position + 1],
                         retry_failed=arguments.retry_failed,
                         policy=policy,
@@ -210,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"Batch {batch_id} worker array {job_id} exited with code {return_code}",
                 flush=True,
             )
-            finalized = builder.finalize_distributed_batch(plan, batch_id)
+            finalized = builder.finalize_distributed_batch(job, batch_id)
             failed = failed or return_code != 0 or any(
                 status != "succeeded" for status in finalized.task_statuses.values()
             )
@@ -218,7 +223,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise stage_error
             if position + 1 < len(batches):
                 current = next_manifest or builder.prefetch_batch(
-                    plan,
+                    job,
                     batches[position + 1],
                     retry_failed=arguments.retry_failed,
                     policy=policy,
