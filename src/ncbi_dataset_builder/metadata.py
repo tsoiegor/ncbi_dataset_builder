@@ -763,21 +763,61 @@ class MetadataBundle:
     def attach_to_runs(self, catalog: RunCatalog) -> RunCatalog:
         """Join normalized metadata columns onto *catalog* by entity accession."""
 
+        def text(value: Any) -> str | None:
+            """Convert an optional NCBI value to stable nullable text."""
+
+            return None if value in (None, "") else str(value)
+
+        def integer(value: Any) -> int | None:
+            """Convert an optional NCBI count to an integer when possible."""
+
+            if value in (None, ""):
+                return None
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                return None
+
+        def real(value: Any) -> float | None:
+            """Convert an optional NCBI size to a floating-point value."""
+
+            if value in (None, ""):
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
         frame = catalog.frame
         if self.runs:
             run_fields = [
                 {
-                    "Run": row.get("accession"),
-                    "sra_run_title": row.get("title"),
-                    "sra_run_spots": row.get("spots"),
-                    "sra_run_bases": row.get("bases"),
-                    "sra_run_size_gb": row.get("size_gb"),
-                    "sra_run_published_at": row.get("published_at"),
+                    "Run": text(row.get("accession")),
+                    "sra_run_title": text(row.get("title")),
+                    "sra_run_spots": integer(row.get("spots")),
+                    "sra_run_bases": integer(row.get("bases")),
+                    "sra_run_size_gb": real(row.get("size_gb")),
+                    "sra_run_published_at": text(row.get("published_at")),
                 }
                 for row in self.runs
                 if row.get("accession")
             ]
-            frame = frame.join(pl.DataFrame(run_fields, strict=False), on="Run", how="left")
+            if run_fields:
+                frame = frame.join(
+                    pl.DataFrame(
+                        run_fields,
+                        schema={
+                            "Run": pl.String,
+                            "sra_run_title": pl.String,
+                            "sra_run_spots": pl.Int64,
+                            "sra_run_bases": pl.Int64,
+                            "sra_run_size_gb": pl.Float64,
+                            "sra_run_published_at": pl.String,
+                        },
+                    ),
+                    on="Run",
+                    how="left",
+                )
         if self.experiments and "Experiment" in frame.columns:
             studies = {row.get("accession"): row for row in self.studies}
             experiment_fields = []
@@ -789,28 +829,34 @@ class MetadataBundle:
                 study = studies.get(row.get("study_accession"), {})
                 experiment_fields.append(
                     {
-                        "Experiment": row["accession"],
-                        "sra_experiment_title": row.get("title"),
-                        "sra_library_strategy": library.get("strategy"),
-                        "sra_library_source": library.get("source"),
-                        "sra_library_selection": library.get("selection"),
-                        "sra_library_layout": library.get("layout"),
-                        "sra_library_construction_protocol": library.get("construction_protocol"),
-                        "sra_instrument_model": platform.get("instrument_model"),
-                        "sra_study_accession": row.get("study_accession"),
-                        "sra_study_title": study.get("title"),
-                        "sra_study_abstract": study.get("abstract"),
-                        "sra_bioproject": study.get("bioproject"),
+                        "Experiment": text(row["accession"]),
+                        "sra_experiment_title": text(row.get("title")),
+                        "sra_library_strategy": text(library.get("strategy")),
+                        "sra_library_source": text(library.get("source")),
+                        "sra_library_selection": text(library.get("selection")),
+                        "sra_library_layout": text(library.get("layout")),
+                        "sra_library_construction_protocol": text(library.get("construction_protocol")),
+                        "sra_instrument_model": text(platform.get("instrument_model")),
+                        "sra_study_accession": text(row.get("study_accession")),
+                        "sra_study_title": text(study.get("title")),
+                        "sra_study_abstract": text(study.get("abstract")),
+                        "sra_bioproject": text(study.get("bioproject")),
                     }
                 )
-            frame = frame.join(
-                pl.DataFrame(experiment_fields, strict=False), on="Experiment", how="left"
-            )
+            if experiment_fields:
+                frame = frame.join(
+                    pl.DataFrame(
+                        experiment_fields,
+                        schema={name: pl.String for name in experiment_fields[0]},
+                    ),
+                    on="Experiment",
+                    how="left",
+                )
         if self.sra_samples and "Sample" in frame.columns:
             sample_fields = [
                 {
-                    "Sample": row.get("accession"),
-                    "sra_sample_title": row.get("title"),
+                    "Sample": text(row.get("accession")),
+                    "sra_sample_title": text(row.get("title")),
                     "sra_sample_attributes_json": json.dumps(
                         row.get("attributes", {}), sort_keys=True, ensure_ascii=False
                     ),
@@ -818,13 +864,21 @@ class MetadataBundle:
                 for row in self.sra_samples
                 if row.get("accession")
             ]
-            frame = frame.join(pl.DataFrame(sample_fields, strict=False), on="Sample", how="left")
+            if sample_fields:
+                frame = frame.join(
+                    pl.DataFrame(
+                        sample_fields,
+                        schema={name: pl.String for name in sample_fields[0]},
+                    ),
+                    on="Sample",
+                    how="left",
+                )
         if self.biosamples and "BioSample" in frame.columns:
             sample_fields = [
                 {
-                    "BioSample": row["accession"],
-                    "biosample_title": row.get("title"),
-                    "biosample_organism": row.get("organism"),
+                    "BioSample": text(row["accession"]),
+                    "biosample_title": text(row.get("title")),
+                    "biosample_organism": text(row.get("organism")),
                     "biosample_attributes_json": json.dumps(
                         row.get("attributes", {}), sort_keys=True, ensure_ascii=False
                     ),
@@ -832,9 +886,15 @@ class MetadataBundle:
                 for row in self.biosamples
                 if row.get("accession")
             ]
-            frame = frame.join(
-                pl.DataFrame(sample_fields, strict=False), on="BioSample", how="left"
-            )
+            if sample_fields:
+                frame = frame.join(
+                    pl.DataFrame(
+                        sample_fields,
+                        schema={name: pl.String for name in sample_fields[0]},
+                    ),
+                    on="BioSample",
+                    how="left",
+                )
         return catalog.replace_frame(frame, event="attached normalized SRA/BioSample metadata")
 
 
