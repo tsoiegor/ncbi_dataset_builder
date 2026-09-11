@@ -7,6 +7,7 @@ from ncbi_dataset_builder.models import DatasetTask, ProcessingUnit, ResourceSpe
 from ncbi_dataset_builder.slurm_dispatcher import (
     _fits_window,
     _planned_processing_count,
+    _report_progress,
     _slurm_job_statuses,
 )
 from ncbi_dataset_builder.state import TaskStateStore
@@ -227,12 +228,65 @@ def test_distributed_planning_gives_an_oversized_unit_a_single_unit_cohort():
     assert _planned_processing_count(
         huge,
         active=[],
-        waiting=[small],
+        ready=[small],
         processing_window_gb=100,
         processing_unit_limit=None,
         worker_job_limit=49,
         worker_cpu_budget=499,
     ) == 1
+
+
+def test_distributed_planning_shares_cpus_only_with_ready_units():
+    first = DatasetTask(
+        "SRX_FIRST",
+        ProcessingUnit(("SRX_FIRST"), ("SRR_FIRST",), total_size_gb=10),
+        0,
+        ResourceSpec(24, 64),
+    )
+    second = DatasetTask(
+        "SRX_SECOND",
+        ProcessingUnit(("SRX_SECOND"), ("SRR_SECOND",), total_size_gb=10),
+        1,
+        ResourceSpec(24, 64),
+    )
+
+    assert _planned_processing_count(
+        first,
+        active=[],
+        ready=[second],
+        processing_window_gb=800,
+        processing_unit_limit=None,
+        worker_job_limit=49,
+        worker_cpu_budget=499,
+    ) == 2
+
+
+def test_distributed_progress_suppresses_unchanged_snapshots(capsys):
+    snapshot = _report_progress(
+        total=45,
+        pending=33,
+        downloading=10,
+        ready=0,
+        running={},
+        succeeded=0,
+        failed=0,
+    )
+    first_output = capsys.readouterr().out
+
+    repeated = _report_progress(
+        total=45,
+        pending=33,
+        downloading=10,
+        ready=0,
+        running={},
+        succeeded=0,
+        failed=0,
+        previous=snapshot,
+    )
+
+    assert "Streaming progress" in first_output
+    assert capsys.readouterr().out == ""
+    assert repeated == snapshot
 
 
 def test_slurm_status_query_parses_held_jobs(monkeypatch):

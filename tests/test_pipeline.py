@@ -7,10 +7,12 @@ from ncbi_dataset_builder.catalog import RunCatalog
 from ncbi_dataset_builder.commands import CommandRunner
 from ncbi_dataset_builder.execution import SlurmExecutor, SlurmOptions
 from ncbi_dataset_builder.models import (
+    DatasetTask,
     FastqLayout,
     FastqSet,
     GenomeRef,
     ProcessingResult,
+    ProcessingUnit,
     ResourceSpec,
     StagedFastq,
 )
@@ -88,6 +90,39 @@ def two_batch_catalog():
             },
         ]
     )
+
+
+def test_local_planning_shares_cpus_only_with_ready_units(tmp_path):
+    builder = DatasetBuilder(
+        BuilderConfig(
+            tmp_path,
+            max_workers=20,
+            total_threads=499,
+            total_memory_gb=1280,
+        )
+    )
+    first = DatasetTask(
+        "SRX_FIRST",
+        ProcessingUnit(("SRX_FIRST"), ("SRR_FIRST",), total_size_gb=10),
+        0,
+        ResourceSpec(24, 64),
+    )
+    second = DatasetTask(
+        "SRX_SECOND",
+        ProcessingUnit(("SRX_SECOND"), ("SRR_SECOND",), total_size_gb=10),
+        1,
+        ResourceSpec(24, 64),
+    )
+
+    assert builder._planned_processing_count(
+        first,
+        active=[],
+        ready=[second],
+        processing_window_gb=800,
+        processing_unit_limit=None,
+        total_threads=499,
+        total_memory_gb=1280,
+    ) == 2
 
 
 def test_units_from_different_batches_stream_without_a_batch_barrier(tmp_path):

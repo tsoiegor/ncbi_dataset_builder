@@ -8,10 +8,11 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from ..commands import CommandRunner
 from ..errors import ExternalToolError, ProcessingError
-from ..models import FastqSet, GenomeRef, ProcessingResult
+from ..models import FastqLayout, FastqSet, GenomeRef, ProcessingResult
 from ..progress import ProgressReporter
 from ..unit_logging import current_unit_log_handle
 from ..util import bytes_to_gb, exclusive_file_lock, existing_nonempty, sanitize_identifier
@@ -35,6 +36,17 @@ class AtacSeqConfig:
         coverage_strands: Optional forward/reverse RNA-strand filters.
         fastp_deduplicate: Enable fastp duplicate removal.
         fastp_max_threads: Maximum threads passed to fastp.
+        strict_mixed_layout: Inspect fastp reports for mixed paired/single input
+            and exclude the complete single-end component when it looks
+            technically suspicious or cannot be validated.
+        mixed_count_tolerance: Maximum relative difference when comparing the
+            single-read count with the paired-fragment count.
+        mixed_max_short_read_length: Single-end mean length at or below this
+            value is suspicious in a mixed ATAC-seq input.
+        mixed_min_length_ratio: Minimum acceptable ratio of the single-end mean
+            length to the shorter paired-end mean length.
+        mixed_min_retained_fraction: Minimum acceptable fraction of single-end
+            reads remaining after fastp.
         coverage_ignore_duplicates: Ignore duplicate reads in coverage output.
         keep_intermediates: Retain intermediate BAM files after success.
     """
@@ -50,6 +62,11 @@ class AtacSeqConfig:
     coverage_strands: tuple[str, ...] = ()
     fastp_deduplicate: bool = True
     fastp_max_threads: int = 16
+    strict_mixed_layout: bool = True
+    mixed_count_tolerance: float = 0.001
+    mixed_max_short_read_length: int = 30
+    mixed_min_length_ratio: float = 0.5
+    mixed_min_retained_fraction: float = 0.1
     coverage_ignore_duplicates: bool = True
     keep_intermediates: bool = True
 
@@ -60,6 +77,14 @@ class AtacSeqConfig:
             raise ValueError(
                 "maximum_insert_size, bin_size, and fastp_max_threads must be positive"
             )
+        if not 0 <= self.mixed_count_tolerance < 1:
+            raise ValueError("mixed_count_tolerance must be in [0, 1)")
+        if self.mixed_max_short_read_length < 1:
+            raise ValueError("mixed_max_short_read_length must be positive")
+        if not 0 < self.mixed_min_length_ratio <= 1:
+            raise ValueError("mixed_min_length_ratio must be in (0, 1]")
+        if not 0 <= self.mixed_min_retained_fraction <= 1:
+            raise ValueError("mixed_min_retained_fraction must be in [0, 1]")
         invalid = set(self.coverage_strands) - {"forward", "reverse"}
         if invalid:
             raise ValueError(f"Unknown coverage strand(s): {sorted(invalid)}")
@@ -295,6 +320,99 @@ class AtacSeqProcessor:
                 raise ProcessingError(f"fastp output is missing or empty: {path}")
         return clean1, clean2, clean_single, outputs
 
+    @staticmethod
+    def _load_fastp_summary(path: Path) -> dict[str, float]:
+        """Return validated before/after read statistics from a fastp JSON report."""
+
+        with path.open("r", encoding="utf-8") as handle:
+            report: Any = json.load(handle)
+        try:
+            before = report["summary"]["before_filtering"]
+            after = report["summary"]["after_filtering"]
+            summary = {
+                "before_reads": float(before["total_reads"]),
+                "after_reads": float(after["total_reads"]),
+                "read1_mean_length": float(before["read1_mean_length"]),
+            }
+            if "read2_mean_length" in before:
+                summary["read2_mean_length"] = float(before["read2_mean_length"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"invalid fastp summary in {path}") from exc
+        if (
+            summary["before_reads"] <= 0
+            or summary["after_reads"] < 0
+            or summary["after_reads"] > summary["before_reads"]
+            or summary["read1_mean_length"] <= 0
+            or summary.get("read2_mean_length", 1.0) <= 0
+        ):
+            raise ValueError(f"non-positive or inconsistent fastp summary in {path}")
+        return summary
+
+    def _mixed_layout_defense(self, root: Path) -> dict[str, Any]:
+        """Decide whether a mixed input's complete single-end branch is suspicious."""
+
+        paired_path = root / "paired.fastp.json"
+        single_path = root / "single.fastp.json"
+        decision: dict[str, Any] = {
+            "enabled": self.config.strict_mixed_layout,
+            "action": "kept_single_end",
+            "reasons": [],
+        }
+        if not self.config.strict_mixed_layout:
+            decision["action"] = "disabled"
+            return decision
+        try:
+            paired = self._load_fastp_summary(paired_path)
+            single = self._load_fastp_summary(single_path)
+            paired_read2_length = paired["read2_mean_length"]
+        except (OSError, ValueError, KeyError) as exc:
+            decision["action"] = "excluded_single_end"
+            decision["reasons"] = [f"mixed-layout fastp statistics are unavailable: {exc}"]
+            return decision
+
+        paired_fragments = paired["before_reads"] / 2.0
+        count_difference = abs(single["before_reads"] - paired_fragments) / max(
+            single["before_reads"], paired_fragments
+        )
+        paired_mean_length = min(paired["read1_mean_length"], paired_read2_length)
+        length_ratio = single["read1_mean_length"] / paired_mean_length
+        single_retained_fraction = single["after_reads"] / single["before_reads"]
+        reasons: list[str] = []
+        if count_difference <= self.config.mixed_count_tolerance:
+            reasons.append(
+                "single-read count matches paired-fragment count "
+                f"(relative difference {count_difference:.6g})"
+            )
+        if single["read1_mean_length"] <= self.config.mixed_max_short_read_length:
+            reasons.append(
+                f"single-end mean length is only {single['read1_mean_length']:g} bp"
+            )
+        if length_ratio < self.config.mixed_min_length_ratio:
+            reasons.append(
+                "single-end reads are substantially shorter than paired reads "
+                f"(length ratio {length_ratio:.3f})"
+            )
+        if single_retained_fraction < self.config.mixed_min_retained_fraction:
+            reasons.append(
+                "fastp retained an unusually small single-end fraction "
+                f"({single_retained_fraction:.3%})"
+            )
+        decision["statistics"] = {
+            "single_before_reads": int(single["before_reads"]),
+            "paired_before_reads": int(paired["before_reads"]),
+            "paired_fragments": paired_fragments,
+            "single_mean_length": single["read1_mean_length"],
+            "paired_read1_mean_length": paired["read1_mean_length"],
+            "paired_read2_mean_length": paired_read2_length,
+            "count_relative_difference": count_difference,
+            "single_to_paired_length_ratio": length_ratio,
+            "single_retained_fraction": single_retained_fraction,
+        }
+        if reasons:
+            decision["action"] = "excluded_single_end"
+            decision["reasons"] = reasons
+        return decision
+
     def _align(
         self,
         *,
@@ -419,6 +537,16 @@ class AtacSeqProcessor:
             root=work,
             threads=threads,
         )
+        mixed_layout_decision: dict[str, Any] | None = None
+        if fastq.layout == FastqLayout.MIXED:
+            mixed_layout_decision = self._mixed_layout_defense(work)
+            if mixed_layout_decision["action"] == "excluded_single_end":
+                reasons = "; ".join(mixed_layout_decision["reasons"])
+                self.progress.message(
+                    "Strict mixed-layout defense excluded all single-end reads; "
+                    f"continuing with paired-end reads only: {reasons}"
+                )
+                clean_single = None
         prefix = self._ensure_index(genome, threads)
         bams: list[Path] = []
         if clean1 and clean2:
@@ -516,6 +644,8 @@ class AtacSeqProcessor:
             if report.suffix == ".json" and existing_nonempty(report):
                 with report.open("r", encoding="utf-8") as handle:
                     metrics[report.stem] = json.load(handle)
+        if mixed_layout_decision is not None:
+            metrics["mixed_layout_defense"] = mixed_layout_decision
         result = ProcessingResult(
             success=True,
             outputs=tuple(outputs),

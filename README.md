@@ -54,6 +54,13 @@ Slurm submission: sbatch
 Run `ncbi-dataset --workspace workspace preflight --processor
 ncbi_dataset_builder.processing.atac:default_atac_processor` before a large job.
 
+The built-in processor applies a strict safeguard to mixed paired/single FASTQ sets. It compares
+the paired and single `fastp` reports before alignment and excludes the complete single-end
+component if its count, mean length, retained fraction, or report validity looks suspicious. The
+decision and supporting statistics are stored in the result metrics under
+`mixed_layout_defense`. Set `AtacSeqConfig(strict_mixed_layout=False)` only when mixed biological
+reads are expected and should all be aligned.
+
 Do not install both `polars` and `polars-lts-cpu` in one environment. Restart notebook kernels
 after changing Polars or this package.
 
