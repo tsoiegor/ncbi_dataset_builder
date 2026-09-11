@@ -92,7 +92,7 @@ def _planned_processing_count(
     candidate: DatasetTask,
     *,
     active: list[DatasetTask],
-    waiting: list[DatasetTask],
+    ready: list[DatasetTask],
     processing_window_gb: float | None,
     processing_unit_limit: int | None,
     worker_job_limit: int,
@@ -100,7 +100,9 @@ def _planned_processing_count(
 ) -> int:
     """Estimate a feasible cohort containing *candidate*.
 
-    Existing *active* tasks precede *waiting* tasks. *processing_window_gb*,
+    Existing *active* tasks precede downloaded *ready* tasks. Units that are
+    pending or still downloading are deliberately excluded because they cannot
+    consume processing resources yet. *processing_window_gb*,
     *processing_unit_limit*, *worker_job_limit*, and *worker_cpu_budget* bound
     the cohort used for equal launch-time CPU sharing.
     """
@@ -113,7 +115,7 @@ def _planned_processing_count(
         worker_job_limit,
         processing_unit_limit or worker_job_limit,
     )
-    for task in [*active, candidate, *waiting]:
+    for task in [*active, candidate, *ready]:
         if task.task_id in selected_ids or selected_count >= maximum_units:
             continue
         size_gb = max(0.0, task.unit.total_size_gb)
@@ -186,14 +188,28 @@ def _report_progress(
     running: dict[int, _RunningUnit],
     succeeded: int,
     failed: int,
-) -> None:
+    previous: tuple[int, ...] | None = None,
+) -> tuple[int, ...]:
     """Print aggregate *total*, *pending*, *downloading*, and *ready* counts.
 
     *running* supplies active CPU allocations; *succeeded* and *failed* supply
-    terminal counts.
+    terminal counts. *previous* suppresses an unchanged periodic report. The
+    returned snapshot can be passed to the next call.
     """
 
     allocated = sum(item.threads for item in running.values())
+    snapshot = (
+        total,
+        pending,
+        downloading,
+        ready,
+        len(running),
+        allocated,
+        succeeded,
+        failed,
+    )
+    if snapshot == previous:
+        return snapshot
     print(
         "Streaming progress: "
         f"{succeeded + failed:,}/{total:,} terminal "
@@ -202,6 +218,7 @@ def _report_progress(
         f"{len(running):,} processing; {allocated:,} worker CPUs allocated",
         flush=True,
     )
+    return snapshot
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -399,7 +416,7 @@ def main(argv: list[str] | None = None) -> int:
                     submitted_epoch=float(state.get("submitted_epoch") or now),
                 )
             pending.sort(key=lambda item: item[0])
-            _report_progress(
+            last_progress = _report_progress(
                 total=len(tasks),
                 pending=len(pending),
                 downloading=0,
@@ -510,9 +527,7 @@ def main(argv: list[str] | None = None) -> int:
                     max(0.0, item.task.unit.total_size_gb) for item in running.values()
                 )
                 active_threads = sum(item.threads for item in running.values())
-                waiting_tasks = [item.task for item in ready]
-                waiting_tasks.extend(task for _index, task in downloads.values())
-                waiting_tasks.extend(task for _index, task in pending)
+                ready_tasks = [item.task for item in ready]
                 ready_storage_gb = sum(item.staged_size_gb for item in ready)
                 download_storage_gb = sum(
                     max(0.0, task.unit.total_size_gb)
@@ -530,8 +545,8 @@ def main(argv: list[str] | None = None) -> int:
                     current_state = builder.state.get(task.task_id) or {}
                     if _state_is_valid_success(builder, task):
                         ready.remove(item)
-                        waiting_tasks = [
-                            entry for entry in waiting_tasks if entry.task_id != task.task_id
+                        ready_tasks = [
+                            entry for entry in ready_tasks if entry.task_id != task.task_id
                         ]
                         ready_storage_gb -= item.staged_size_gb
                         terminal[item.index] = "succeeded"
@@ -542,8 +557,8 @@ def main(argv: list[str] | None = None) -> int:
                         and current_state.get("status") == "failed"
                     ):
                         ready.remove(item)
-                        waiting_tasks = [
-                            entry for entry in waiting_tasks if entry.task_id != task.task_id
+                        ready_tasks = [
+                            entry for entry in ready_tasks if entry.task_id != task.task_id
                         ]
                         ready_storage_gb -= item.staged_size_gb
                         terminal[item.index] = "failed"
@@ -567,13 +582,13 @@ def main(argv: list[str] | None = None) -> int:
                     available_threads = worker_cpu_budget - active_threads
                     if available_threads < task.resources.threads:
                         continue
-                    other_waiting = [
-                        entry for entry in waiting_tasks if entry.task_id != task.task_id
+                    other_ready = [
+                        entry for entry in ready_tasks if entry.task_id != task.task_id
                     ]
                     planned_count = _planned_processing_count(
                         task,
                         active=active_tasks,
-                        waiting=other_waiting,
+                        ready=other_ready,
                         processing_window_gb=processing_window_gb,
                         processing_unit_limit=processing_unit_limit,
                         worker_job_limit=worker_job_limit,
@@ -667,8 +682,8 @@ def main(argv: list[str] | None = None) -> int:
                         continue
 
                     ready.remove(item)
-                    waiting_tasks = [
-                        entry for entry in waiting_tasks if entry.task_id != task.task_id
+                    ready_tasks = [
+                        entry for entry in ready_tasks if entry.task_id != task.task_id
                     ]
                     ready_storage_gb -= item.staged_size_gb
                     running_storage_gb += item.staged_size_gb * (
@@ -740,7 +755,7 @@ def main(argv: list[str] | None = None) -> int:
 
                 now_for_report = time.monotonic()
                 if now_for_report - last_report >= 30.0:
-                    _report_progress(
+                    last_progress = _report_progress(
                         total=len(tasks),
                         pending=len(pending),
                         downloading=len(downloads),
@@ -748,6 +763,7 @@ def main(argv: list[str] | None = None) -> int:
                         running=running,
                         succeeded=sum(value == "succeeded" for value in terminal.values()),
                         failed=sum(value == "failed" for value in terminal.values()),
+                        previous=last_progress,
                     )
                     last_report = now_for_report
 
@@ -774,6 +790,7 @@ def main(argv: list[str] | None = None) -> int:
                 running={},
                 succeeded=sum(value == "succeeded" for value in terminal.values()),
                 failed=sum(value == "failed" for value in terminal.values()),
+                previous=last_progress,
             )
     finally:
         download_pool.shutdown(wait=False, cancel_futures=True)

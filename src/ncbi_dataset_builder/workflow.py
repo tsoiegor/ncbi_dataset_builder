@@ -1832,7 +1832,7 @@ class DatasetBuilder:
         candidate: DatasetTask,
         *,
         active: list[DatasetTask],
-        waiting: list[DatasetTask],
+        ready: list[DatasetTask],
         processing_window_gb: float | None,
         processing_unit_limit: int | None,
         total_threads: int,
@@ -1840,10 +1840,12 @@ class DatasetBuilder:
     ) -> int:
         """Estimate a feasible processing cohort containing *candidate*.
 
-        The *active*, *candidate*, and *waiting* tasks are considered in that
-        order. *processing_window_gb* and *processing_unit_limit* bound storage
-        and count, while *total_threads* and *total_memory_gb* bound resources.
-        The resulting cohort controls equal launch-time CPU allocation.
+        The *active*, *candidate*, and downloaded *ready* tasks are considered
+        in that order. Pending and downloading tasks are excluded because they
+        cannot consume processing CPUs yet. *processing_window_gb* and
+        *processing_unit_limit* bound storage and count, while *total_threads*
+        and *total_memory_gb* bound resources. The resulting cohort controls
+        equal launch-time CPU allocation.
         """
 
         selected: list[DatasetTask] = []
@@ -1855,7 +1857,7 @@ class DatasetBuilder:
             self.config.max_workers,
             processing_unit_limit or self.config.max_workers,
         )
-        ordered = [*active, candidate, *waiting]
+        ordered = [*active, candidate, *ready]
         for task in ordered:
             if task.task_id in selected_ids or len(selected) >= maximum_units:
                 continue
@@ -2096,9 +2098,7 @@ class DatasetBuilder:
                 active_memory_gb = sum(
                     entry.task.resources.memory_gb for entry in active_entries
                 )
-                waiting_tasks = [entry.task for entry in ready]
-                waiting_tasks.extend(downloads.values())
-                waiting_tasks.extend(pending)
+                ready_tasks = [entry.task for entry in ready]
 
                 for prepared in list(ready):
                     task = prepared.task
@@ -2121,13 +2121,13 @@ class DatasetBuilder:
                     available_threads = total_threads - active_threads
                     if available_threads < task.resources.threads:
                         continue
-                    other_waiting = [
-                        item for item in waiting_tasks if item.task_id != task.task_id
+                    other_ready = [
+                        item for item in ready_tasks if item.task_id != task.task_id
                     ]
                     planned_count = self._planned_processing_count(
                         task,
                         active=[entry.task for entry in active_entries],
-                        waiting=other_waiting,
+                        ready=other_ready,
                         processing_window_gb=processing_window_gb,
                         processing_unit_limit=processing_unit_limit,
                         total_threads=total_threads,
@@ -2181,8 +2181,8 @@ class DatasetBuilder:
                         memory_gb=allocated_task.resources.memory_gb,
                     )
                     ready.remove(prepared)
-                    waiting_tasks = [
-                        item for item in waiting_tasks if item.task_id != task.task_id
+                    ready_tasks = [
+                        item for item in ready_tasks if item.task_id != task.task_id
                     ]
                     future = process_pool.submit(
                         self._process_prepared_task,

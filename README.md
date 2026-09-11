@@ -169,8 +169,9 @@ script, slurm_job_id = builder.submit_slurm(
 The coordinator maintains a unit queue instead of waiting at batch boundaries. As soon as one
 unit is staged it can receive a worker job, while downloads continue until the raw-data queue
 contains the processing window plus `prefetch_batches` additional windows. With the example
-above, one coordinator CPU leaves 499 worker CPUs. If 31 units fit the processing window they
-receive 16 CPUs each; a single 350 GB unit that must run alone can receive up to 128 CPUs.
+above, one coordinator CPU leaves 499 worker CPUs. If 31 downloaded-ready units fit the processing
+window they receive 16 CPUs each; a single ready 350 GB unit that must run alone can receive up to
+128 CPUs. Pending and downloading units do not reserve processing CPUs.
 Concrete allocations and Slurm job IDs are persisted before held workers are released, so a
 replacement coordinator can reattach to active workers after interruption.
 
