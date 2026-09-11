@@ -271,7 +271,8 @@ class ResourceSpec:
     """Specify task resources.
 
     Args:
-        threads: CPU threads available to the task.
+        threads: Minimum CPU threads required by the task. A streaming
+            scheduler may allocate more up to its configured per-unit ceiling.
         memory_gb: Requested memory in gigabytes.
         time_limit: Slurm-compatible wall-time limit.
     """

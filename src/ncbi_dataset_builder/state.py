@@ -101,6 +101,7 @@ class TaskStateStore:
                 if previous and previous.get("fingerprint", "") == fingerprint
                 else 1
             )
+            submitted = previous or {}
             atomic_write_json(
                 self._path(task_id),
                 {
@@ -115,9 +116,76 @@ class TaskStateStore:
                     "fingerprint": fingerprint,
                     "job_id": job_id,
                     "task": task,
+                    "slurm_job_id": submitted.get("slurm_job_id"),
+                    "submitted_at": submitted.get("submitted_at"),
+                    "submitted_epoch": submitted.get("submitted_epoch"),
+                    "allocated_threads": submitted.get("allocated_threads"),
+                    "allocated_memory_gb": submitted.get("allocated_memory_gb"),
                 },
             )
             return True
+
+    def record_submission(
+        self,
+        task_id: str,
+        *,
+        slurm_job_id: str,
+        threads: int,
+        memory_gb: float,
+        fingerprint: str,
+        job_id: str,
+        task: dict[str, Any],
+        log_path: Path | None = None,
+    ) -> None:
+        """Record a queued Slurm execution for *task_id*.
+
+        *slurm_job_id* identifies the submitted worker, *threads* and
+        *memory_gb* are its concrete allocation, *fingerprint* identifies the
+        semantic work, *job_id* identifies the workspace snapshot, *task*
+        stores the allocated task, and *log_path* points to its durable unit log.
+        A different fingerprint archives the previous state before replacement.
+        """
+
+        if not slurm_job_id:
+            raise ValueError("slurm_job_id cannot be empty")
+        if threads < 1 or memory_gb <= 0:
+            raise ValueError("Submitted threads and memory_gb must be positive")
+        with exclusive_file_lock(self._lock(task_id), timeout_seconds=60):
+            previous = self.get(task_id)
+            same_work = bool(previous and previous.get("fingerprint", "") == fingerprint)
+            if previous and not same_work:
+                self._archive(task_id, previous)
+            retained = previous if same_work else {}
+            reset_outputs_required = bool(
+                retained.get("reset_outputs_required")
+                or retained.get("status") == "failed"
+                or retained.get("status") == "running"
+                and retained.get("phase") == "processing"
+            )
+            atomic_write_json(
+                self._path(task_id),
+                {
+                    **retained,
+                    "task_id": task_id,
+                    "status": "submitted",
+                    "phase": "queued",
+                    "submitted_at": utc_timestamp(),
+                    "submitted_epoch": time.time(),
+                    "slurm_job_id": slurm_job_id,
+                    "allocated_threads": threads,
+                    "allocated_memory_gb": memory_gb,
+                    "fingerprint": fingerprint,
+                    "job_id": job_id,
+                    "task": task,
+                    "log_path": str(log_path) if log_path is not None else None,
+                    "started_at": None,
+                    "started_epoch": None,
+                    "finished_at": None,
+                    "result": None,
+                    "error": None,
+                    "reset_outputs_required": reset_outputs_required,
+                },
+            )
 
     def set_phase(self, task_id: str, phase: str) -> None:
         """Set the current *phase* for a claimed *task_id*."""
@@ -129,6 +197,29 @@ class TaskStateStore:
             atomic_write_json(
                 self._path(task_id),
                 {**previous, "phase": phase, "phase_updated_at": utc_timestamp()},
+            )
+
+    def set_runtime_resources(
+        self,
+        task_id: str,
+        *,
+        threads: int,
+        memory_gb: float,
+    ) -> None:
+        """Persist *threads* and *memory_gb* allocated to running *task_id*."""
+
+        with exclusive_file_lock(self._lock(task_id), timeout_seconds=60):
+            previous = self.get(task_id)
+            if not previous or previous.get("status") != "running":
+                raise ValueError(f"Cannot allocate resources to an unclaimed task: {task_id}")
+            atomic_write_json(
+                self._path(task_id),
+                {
+                    **previous,
+                    "allocated_threads": threads,
+                    "allocated_memory_gb": memory_gb,
+                    "resources_updated_at": utc_timestamp(),
+                },
             )
 
     def succeed(self, task_id: str, result: dict[str, Any]) -> None:

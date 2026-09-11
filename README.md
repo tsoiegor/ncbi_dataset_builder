@@ -21,7 +21,7 @@ resource requests are operational details and do not invalidate successful sampl
 - Deterministic NCBI genome selection, exact accession pins, checksums, and a workspace lockfile.
 - Local execution and Slurm execution with per-unit CPU/memory, total CPU quota, running-job
   quota, and node-capacity checks.
-- A bounded two-batch pipeline: download the next batch while processing the current batch.
+- A bounded unit-streaming pipeline: every ready unit can start while other units download.
 - Visible staging directories, storage accounting in decimal GB, atomic state, progress bars,
   and one append-only log per unit.
 - Compact checkout as `bigWig/<experiment>.bw`, `descriptions/<experiment>.json`, and
@@ -84,6 +84,8 @@ builder = DatasetBuilder(
             download_workers=2,
             max_staged_gb=500,
             minimum_free_gb=50,
+            processing_storage_multiplier=4,
+            max_threads_per_unit=128,
             cleanup="after_success",
         ),
     )
@@ -164,9 +166,13 @@ script, slurm_job_id = builder.submit_slurm(
 )
 ```
 
-The coordinator stages batch 0, launches a quota-throttled worker array, starts staging batch 1,
-and waits for batch 0 before advancing. With the example above, one coordinator CPU leaves room
-for 31 simultaneous 16-CPU units: 497 CPUs and 32 jobs, both below the supplied limits.
+The coordinator maintains a unit queue instead of waiting at batch boundaries. As soon as one
+unit is staged it can receive a worker job, while downloads continue until the raw-data queue
+contains the processing window plus `prefetch_batches` additional windows. With the example
+above, one coordinator CPU leaves 499 worker CPUs. If 31 units fit the processing window they
+receive 16 CPUs each; a single 350 GB unit that must run alone can receive up to 128 CPUs.
+Concrete allocations and Slurm job IDs are persisted before held workers are released, so a
+replacement coordinator can reattach to active workers after interruption.
 
 ## CLI outline
 
@@ -177,12 +183,14 @@ ncbi-dataset --workspace workspace --email you@institute.org fetch-runs \
 ncbi-dataset --workspace workspace build --catalog selected.csv \
   --processor my_pipeline:process --group-by experiment \
   --threads 8 --memory-gb 32 --max-batch-gb 100 \
-  --download-workers 2 --max-staged-gb 500 --minimum-free-gb 50
+  --download-workers 2 --processing-storage-multiplier 4 \
+  --max-threads-per-unit 32 --max-staged-gb 500 --minimum-free-gb 50
 
 ncbi-dataset --workspace workspace submit-slurm --catalog selected.csv \
   --processor my_pipeline:process --threads 16 --memory-gb 64 \
   --slurm-mode distributed --total-cpu-quota 500 --max-running-jobs 50 \
-  --coordinator-cpus 1 --cpus-per-node 128 \
+  --coordinator-cpus 1 --cpus-per-node 128 --max-threads-per-unit 128 \
+  --processing-storage-multiplier 4 \
   --partition amd_256M,amd_1Tb,amd_2Tb
 
 ncbi-dataset --workspace workspace status

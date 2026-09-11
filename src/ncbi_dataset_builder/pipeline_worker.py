@@ -12,7 +12,7 @@ def main(argv: list[str] | None = None) -> int:
     """Execute a bounded workspace job from optional command-line *argv*."""
 
     parser = argparse.ArgumentParser(
-        description="Coordinate bounded batch staging and processing inside one Slurm job"
+        description="Coordinate unit-level streaming inside one Slurm job"
     )
     parser.add_argument("--job", type=Path, required=True)
     parser.add_argument("--processor", required=True)
@@ -21,9 +21,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-workers", type=int, required=True)
     parser.add_argument("--total-threads", type=int, required=True)
     parser.add_argument("--total-memory-gb", type=float, required=True)
-    parser.add_argument("--prefetch-batches", type=int, choices=(0, 1), default=1)
+    parser.add_argument("--prefetch-batches", type=int, default=1)
     parser.add_argument("--max-staged-gb", type=float)
     parser.add_argument("--minimum-free-gb", type=float, default=0.0)
+    parser.add_argument("--processing-storage-multiplier", type=float, default=1.0)
+    parser.add_argument("--max-threads-per-unit", type=int)
+    parser.add_argument("--scheduler-poll-seconds", type=float, default=1.0)
     parser.add_argument("--cleanup", choices=("after_success", "never"), default="after_success")
     parser.add_argument("--discard-failed-inputs", action="store_true")
     parser.add_argument("--no-fsync-logs", action="store_true")
@@ -40,6 +43,9 @@ def main(argv: list[str] | None = None) -> int:
         keep_failed_inputs=not arguments.discard_failed_inputs,
         fsync_logs=not arguments.no_fsync_logs,
         download_workers=arguments.download_workers,
+        processing_storage_multiplier=arguments.processing_storage_multiplier,
+        max_threads_per_unit=arguments.max_threads_per_unit,
+        scheduler_poll_seconds=arguments.scheduler_poll_seconds,
     )
     builder = DatasetBuilder(
         BuilderConfig(

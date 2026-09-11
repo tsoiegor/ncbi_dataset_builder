@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+dist/
+build/
+
+# Runtime data are intentionally outside source control.
+workspace/
+*.part
+*.lock
+*.sra
+*.fastq
+*.fastq.gz
+*.bam
+*.bai
+*.csi
+*.bw
+

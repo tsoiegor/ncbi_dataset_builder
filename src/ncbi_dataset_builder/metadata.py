@@ -769,7 +769,7 @@ class MetadataBundle:
             return None if value in (None, "") else str(value)
 
         def integer(value: Any) -> int | None:
-            """Convert an optional NCBI count to an integer when possible."""
+            """Convert optional NCBI *value* to an integer when possible."""
 
             if value in (None, ""):
                 return None

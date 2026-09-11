@@ -324,6 +324,9 @@ class SlurmExecutor:
         prefetch_batches: int,
         max_staged_gb: float | None,
         minimum_free_gb: float,
+        processing_storage_multiplier: float = 1.0,
+        max_threads_per_unit: int | None = None,
+        scheduler_poll_seconds: float = 1.0,
         cleanup: str,
         keep_failed_inputs: bool,
         fsync_logs: bool,
@@ -336,8 +339,10 @@ class SlurmExecutor:
 
         *workspace*, *email*, and *output_path* configure execution paths;
         *options* supplies Slurm limits; *prefetch_batches*, *max_staged_gb*,
-        *minimum_free_gb*, *cleanup*, *keep_failed_inputs*, and *fsync_logs*
-        configure storage and logs. *retry_failed* and *batch_ids* select work.
+        *minimum_free_gb*, *processing_storage_multiplier*,
+        *max_threads_per_unit*, and *scheduler_poll_seconds* configure streaming
+        admission. *cleanup*, *keep_failed_inputs*, and *fsync_logs* configure
+        cleanup and logs. *retry_failed* and *batch_ids* select work.
         *prefetch_max_size* limits SRA archives and *download_workers* bounds downloads.
         """
 
@@ -381,6 +386,10 @@ class SlurmExecutor:
             str(prefetch_batches),
             "--minimum-free-gb",
             str(minimum_free_gb),
+            "--processing-storage-multiplier",
+            str(processing_storage_multiplier),
+            "--scheduler-poll-seconds",
+            str(scheduler_poll_seconds),
             "--cleanup",
             cleanup,
             "--prefetch-max-size",
@@ -394,6 +403,8 @@ class SlurmExecutor:
             command.extend(("--cpus-per-node", str(options.cpus_per_node)))
         if max_staged_gb is not None:
             command.extend(("--max-staged-gb", str(max_staged_gb)))
+        if max_threads_per_unit is not None:
+            command.extend(("--max-threads-per-unit", str(max_threads_per_unit)))
         if options.partition:
             command.extend(("--partition", options.partition))
         if options.account:
@@ -439,17 +450,42 @@ class SlurmExecutor:
         ranges.append(str(start) if start == previous else f"{start}-{previous}")
         return ",".join(ranges)
 
-    def submit(self, script: Path) -> str:
-        """Submit *script* with ``sbatch`` and return the scheduler job ID."""
+    def submit(self, script: Path, *, hold: bool = False) -> str:
+        """Submit *script* and return its scheduler job ID.
+
+        When *hold* is true, Slurm keeps the job pending until :meth:`release`
+        is called. This lets a coordinator durably record ownership before a
+        very short worker can start.
+        """
 
         self.runner.require("sbatch")
         self.progress.message(f"Submit Slurm script: {script}")
-        completed = self.runner.run(["sbatch", "--parsable", str(script)])
+        command = ["sbatch", "--parsable"]
+        if hold:
+            command.append("--hold")
+        command.append(str(script))
+        completed = self.runner.run(command)
         job_id = (completed.stdout or "").strip().split(";", 1)[0]
         if not job_id:
             raise RuntimeError(f"sbatch returned no job id: {completed.stdout!r}")
         self.progress.message(f"Slurm job submitted: {job_id}")
         return job_id
+
+    def release(self, job_id: str) -> None:
+        """Release held Slurm *job_id* after its durable state is recorded."""
+
+        if not job_id:
+            raise ValueError("job_id cannot be empty")
+        self.runner.require("scontrol")
+        self.runner.run(["scontrol", "release", job_id])
+
+    def cancel(self, job_id: str) -> None:
+        """Cancel Slurm *job_id* after a failed submission transaction."""
+
+        if not job_id:
+            raise ValueError("job_id cannot be empty")
+        self.runner.require("scancel")
+        self.runner.run(["scancel", job_id])
 
     def create_coordinator_script(
         self,
@@ -466,6 +502,9 @@ class SlurmExecutor:
         prefetch_batches: int,
         max_staged_gb: float | None,
         minimum_free_gb: float,
+        processing_storage_multiplier: float = 1.0,
+        max_threads_per_unit: int | None = None,
+        scheduler_poll_seconds: float = 1.0,
         cleanup: str,
         keep_failed_inputs: bool,
         fsync_logs: bool,
@@ -480,8 +519,10 @@ class SlurmExecutor:
         durable state, *email* configures NCBI, and *output_path* receives the
         script. *options* supplies scheduler flags. *max_workers*,
         *total_threads*, and *total_memory_gb* control allocation-wide resources.
-        *prefetch_batches*, *max_staged_gb*, *minimum_free_gb*, *cleanup*,
-        *keep_failed_inputs*, and *fsync_logs* configure the pipeline.
+        *prefetch_batches*, *max_staged_gb*, *minimum_free_gb*,
+        *processing_storage_multiplier*, *max_threads_per_unit*, and
+        *scheduler_poll_seconds* configure streaming admission. *cleanup*,
+        *keep_failed_inputs*, and *fsync_logs* configure cleanup and logs.
         *retry_failed* enables retries and *batch_ids* optionally limits batches.
         *prefetch_max_size* limits SRA archives and *download_workers* bounds downloads.
         """
@@ -525,6 +566,10 @@ class SlurmExecutor:
             str(prefetch_batches),
             "--minimum-free-gb",
             str(minimum_free_gb),
+            "--processing-storage-multiplier",
+            str(processing_storage_multiplier),
+            "--scheduler-poll-seconds",
+            str(scheduler_poll_seconds),
             "--cleanup",
             cleanup,
             "--prefetch-max-size",
@@ -534,6 +579,8 @@ class SlurmExecutor:
         ]
         if max_staged_gb is not None:
             command.extend(("--max-staged-gb", str(max_staged_gb)))
+        if max_threads_per_unit is not None:
+            command.extend(("--max-threads-per-unit", str(max_threads_per_unit)))
         if email:
             command.extend(("--email", email))
         if retry_failed:

@@ -10,7 +10,7 @@ import tempfile
 import threading
 import traceback
 from collections.abc import Iterable, Mapping
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -1010,7 +1010,17 @@ class DatasetBuilder:
             and previous.get("fingerprint") == task.fingerprint
             and not self._state_artifacts_valid(previous)
         )
-        reset_outputs = previous is None or force or previous.get("fingerprint") != task.fingerprint
+        reset_outputs = (
+            previous is None
+            or force
+            or previous.get("fingerprint") != task.fingerprint
+            or previous.get("status") == "failed"
+            or bool(previous.get("reset_outputs_required"))
+            or (
+                previous.get("status") == "running"
+                and previous.get("phase") == "processing"
+            )
+        )
         try:
             claimed = self.state.start(
                 state_key,
@@ -1246,6 +1256,67 @@ class DatasetBuilder:
         )
         return _PreparedBatch(entries, manifest)
 
+    def _prefetch_distributed_task(
+        self,
+        task: DatasetTask,
+        *,
+        policy: PipelinePolicy,
+    ) -> StagedFastq:
+        """Resolve the genome and stage one distributed *task* under *policy*.
+
+        The operation writes to the task's single durable unit log but does not
+        claim task state; the eventual Slurm worker owns that transition.
+        """
+
+        log_path = self._unit_log_path(task)
+        with (
+            unit_log(
+                log_path,
+                phase="distributed-prefetch",
+                unit_id=task.task_id,
+                fsync=policy.fsync_logs,
+            ),
+            self.progress.minimum_level(logging.WARNING),
+        ):
+            if task.unit.taxid is None:
+                raise ValueError(f"Task {task.task_id} has no species taxid")
+            self.genomes.resolve(
+                taxid=task.unit.taxid,
+                scientific_name=task.unit.scientific_name,
+                pin=task.genome_pin,
+            )
+            return self._stage_fastq(task)
+
+    def prefetch_unit(
+        self,
+        job: WorkspaceJob,
+        task_index: int,
+        *,
+        policy: PipelinePolicy | None = None,
+    ) -> StagedFastq:
+        """Stage one *task_index* from *job* for a distributed worker.
+
+        Optional *policy* controls durable unit logging. Task state is not
+        claimed, because the Slurm worker claims it after submission.
+        """
+
+        if task_index < 0 or task_index >= len(job.tasks):
+            raise IndexError(f"Task index {task_index} is outside 0..{len(job.tasks) - 1}")
+        task = job.tasks[task_index]
+        active_policy = policy or self.config.pipeline_policy
+        try:
+            return self._prefetch_distributed_task(task, policy=active_policy)
+        except Exception:
+            error = traceback.format_exc()
+            with unit_log(
+                self._unit_log_path(task),
+                phase="distributed-prefetch-error",
+                unit_id=task.task_id,
+                fsync=active_policy.fsync_logs,
+            ):
+                LOGGER.error("Distributed prefetch failed:\n%s", error)
+            raise
+
     def prefetch_batch(
         self,
         job: WorkspaceJob,
@@ -1303,24 +1374,8 @@ class DatasetBuilder:
 
             log_path = self._unit_log_path(task)
             try:
-                with (
-                    unit_log(
-                        log_path,
-                        phase="distributed-prefetch",
-                        unit_id=task.task_id,
-                        fsync=active_policy.fsync_logs,
-                    ),
-                    self.progress.minimum_level(logging.WARNING),
-                ):
-                    if task.unit.taxid is None:
-                        raise ValueError(f"Task {task.task_id} has no species taxid")
-                    self.genomes.resolve(
-                        taxid=task.unit.taxid,
-                        scientific_name=task.unit.scientific_name,
-                        pin=task.genome_pin,
-                    )
-                    staged = self._stage_fastq(task)
-                    return task, staged, None
+                staged = self._prefetch_distributed_task(task, policy=active_policy)
+                return task, staged, None
             except Exception:  # noqa: BLE001 - worker receives a later independent retry
                 error = traceback.format_exc()
                 with unit_log(
@@ -1704,9 +1759,9 @@ class DatasetBuilder:
         lock = self.config.workspace / "state" / "pipeline-coordinator.lock"
         with exclusive_file_lock(
             lock,
-            timeout_seconds=5,
-            stale_after_seconds=5 * 60,
-            heartbeat_seconds=30,
+            timeout_seconds=120,
+            stale_after_seconds=90,
+            heartbeat_seconds=15,
         ):
             report = self._run_job(
                 job,
@@ -1740,9 +1795,9 @@ class DatasetBuilder:
         lock = self.config.workspace / "state" / "pipeline-coordinator.lock"
         with exclusive_file_lock(
             lock,
-            timeout_seconds=5,
-            stale_after_seconds=5 * 60,
-            heartbeat_seconds=30,
+            timeout_seconds=120,
+            stale_after_seconds=90,
+            heartbeat_seconds=15,
         ):
             return self._run_job(
                 job,
@@ -1752,6 +1807,467 @@ class DatasetBuilder:
                 processor_id=processor_id,
                 policy=policy,
             )
+
+    @staticmethod
+    def _fits_stream_window(
+        occupied_gb: float,
+        candidate_gb: float,
+        limit_gb: float | None,
+        occupied_units: int,
+    ) -> bool:
+        """Test *candidate_gb* against *occupied_gb* and optional *limit_gb*.
+
+        *occupied_units* permits one oversized candidate only when the window
+        has no other units.
+        """
+
+        if limit_gb is None:
+            return True
+        if candidate_gb > limit_gb:
+            return occupied_units == 0
+        return occupied_gb + candidate_gb <= limit_gb + 1e-12
+
+    def _planned_processing_count(
+        self,
+        candidate: DatasetTask,
+        *,
+        active: list[DatasetTask],
+        waiting: list[DatasetTask],
+        processing_window_gb: float | None,
+        processing_unit_limit: int | None,
+        total_threads: int,
+        total_memory_gb: float | None,
+    ) -> int:
+        """Estimate a feasible processing cohort containing *candidate*.
+
+        The *active*, *candidate*, and *waiting* tasks are considered in that
+        order. *processing_window_gb* and *processing_unit_limit* bound storage
+        and count, while *total_threads* and *total_memory_gb* bound resources.
+        The resulting cohort controls equal launch-time CPU allocation.
+        """
+
+        selected: list[DatasetTask] = []
+        selected_ids: set[str] = set()
+        raw_gb = 0.0
+        minimum_threads = 0
+        memory_gb = 0.0
+        maximum_units = min(
+            self.config.max_workers,
+            processing_unit_limit or self.config.max_workers,
+        )
+        ordered = [*active, candidate, *waiting]
+        for task in ordered:
+            if task.task_id in selected_ids or len(selected) >= maximum_units:
+                continue
+            size_gb = max(0.0, task.unit.total_size_gb)
+            if not self._fits_stream_window(
+                raw_gb, size_gb, processing_window_gb, len(selected)
+            ):
+                continue
+            next_threads = minimum_threads + task.resources.threads
+            next_memory = memory_gb + task.resources.memory_gb
+            if next_threads > total_threads:
+                continue
+            if total_memory_gb is not None and next_memory > total_memory_gb:
+                continue
+            selected.append(task)
+            selected_ids.add(task.task_id)
+            raw_gb += size_gb
+            minimum_threads = next_threads
+            memory_gb = next_memory
+        return max(1, len(selected))
+
+    def _initialize_streaming_manifests(
+        self,
+        job: WorkspaceJob,
+        tasks: list[DatasetTask],
+    ) -> None:
+        """Persist initial manifests for selected *tasks* in *job* batch groups."""
+
+        grouped: dict[int, list[DatasetTask]] = {}
+        for task in tasks:
+            grouped.setdefault(task.batch_id, []).append(task)
+        for batch_id, entries in grouped.items():
+            statuses = {
+                task.task_id: str((self.state.get(task.task_id) or {}).get("status", "pending"))
+                for task in entries
+            }
+            self.batch_state.save(
+                BatchManifest(
+                    job_id=job.job_id,
+                    batch_id=batch_id,
+                    status="streaming",
+                    unit_ids=tuple(task.task_id for task in entries),
+                    estimated_size_gb=sum(task.unit.total_size_gb for task in entries),
+                    task_statuses=statuses,
+                    log_paths={
+                        task.task_id: str(self._unit_log_path(task)) for task in entries
+                    },
+                )
+            )
+
+    def _finalize_streaming_manifests(
+        self,
+        job: WorkspaceJob,
+        tasks: list[DatasetTask],
+        *,
+        policy: PipelinePolicy,
+    ) -> None:
+        """Finalize *job* summaries for *tasks* after streaming under *policy*."""
+
+        grouped: dict[int, list[DatasetTask]] = {}
+        for task in tasks:
+            grouped.setdefault(task.batch_id, []).append(task)
+        for batch_id, entries in sorted(grouped.items()):
+            statuses = {
+                task.task_id: str((self.state.get(task.task_id) or {}).get("status", "pending"))
+                for task in entries
+            }
+            roots = tuple(
+                self.config.workspace / "fastq" / sanitize_identifier(task.task_id)
+                for task in entries
+                if (self.config.workspace / "fastq" / sanitize_identifier(task.task_id)).exists()
+            )
+            retained = paths_size_gb(list(roots))
+            failed = sum(status == "failed" for status in statuses.values())
+            succeeded = sum(status == "succeeded" for status in statuses.values())
+            pending = len(entries) - failed - succeeded
+            if failed or pending:
+                status = "partially_failed"
+            elif policy.cleanup == "after_success" and retained == 0:
+                status = "cleaned"
+            else:
+                status = "completed"
+            manifest = BatchManifest(
+                job_id=job.job_id,
+                batch_id=batch_id,
+                status=status,
+                unit_ids=tuple(task.task_id for task in entries),
+                estimated_size_gb=sum(task.unit.total_size_gb for task in entries),
+                staged_size_gb=retained,
+                retained_size_gb=retained,
+                free_space_gb=free_space_gb(self.config.workspace),
+                task_statuses=statuses,
+                log_paths={task.task_id: str(self._unit_log_path(task)) for task in entries},
+                cleanup_roots={
+                    task.task_id: [
+                        str(
+                            self.config.workspace
+                            / "fastq"
+                            / sanitize_identifier(task.task_id)
+                        )
+                    ]
+                    for task in entries
+                    if (
+                        self.config.workspace
+                        / "fastq"
+                        / sanitize_identifier(task.task_id)
+                    ).exists()
+                },
+                completed_at=utc_timestamp(),
+            )
+            self.batch_state.save(manifest)
+            self.progress.message(
+                f"Batch {batch_id} complete: {succeeded:,} succeeded; "
+                f"{failed:,} failed; {pending:,} skipped; {retained:.3f} GB retained",
+                level=logging.WARNING if failed or pending else logging.INFO,
+            )
+
+    def _run_streaming_job(
+        self,
+        job: WorkspaceJob,
+        tasks: list[DatasetTask],
+        processor: Processor,
+        *,
+        retry_failed: bool,
+        policy: PipelinePolicy,
+    ) -> BuildReport:
+        """Stream *tasks* from download through *processor* for *job*.
+
+        *retry_failed* controls prior failed state and *policy* supplies queue,
+        storage, CPU-ceiling, cleanup, and logging behavior.
+        """
+
+        if not tasks:
+            return BuildReport((), job.job_id)
+        processing_window_gb = job.metadata.get("max_batch_gb")
+        processing_window_gb = (
+            float(processing_window_gb) if processing_window_gb is not None else None
+        )
+        processing_unit_limit_value = job.metadata.get("max_batch_units")
+        processing_unit_limit = (
+            int(processing_unit_limit_value)
+            if processing_unit_limit_value is not None
+            else None
+        )
+        total_raw_window_gb = (
+            processing_window_gb * (policy.prefetch_batches + 1)
+            if processing_window_gb is not None
+            else None
+        )
+        queue_unit_limit = (
+            (processing_unit_limit or self.config.max_workers)
+            * (policy.prefetch_batches + 1)
+        )
+        minimum_threads = max(task.resources.threads for task in tasks)
+        total_threads = self.config.total_threads or minimum_threads * self.config.max_workers
+        total_memory_gb = self.config.total_memory_gb
+        maximum_threads = policy.max_threads_per_unit or total_threads
+        if maximum_threads < minimum_threads:
+            raise ValueError(
+                f"max_threads_per_unit={maximum_threads} is below a unit minimum of "
+                f"{minimum_threads}"
+            )
+        if any(task.resources.threads > total_threads for task in tasks):
+            raise ValueError("A unit minimum thread request exceeds total_threads")
+        if total_memory_gb is not None and any(
+            task.resources.memory_gb > total_memory_gb for task in tasks
+        ):
+            raise ValueError("A unit memory request exceeds total_memory_gb")
+
+        self._initialize_streaming_manifests(job, tasks)
+        self.progress.message(
+            f"Streaming scheduler: {len(tasks):,} units; processing window "
+            f"{processing_window_gb if processing_window_gb is not None else 'unbounded'} GB; "
+            f"{policy.prefetch_batches} prefetch window(s); {total_threads:,} CPUs"
+        )
+        order = {task.task_id: index for index, task in enumerate(tasks)}
+        pending = list(tasks)
+        ready: list[_PreparedTask] = []
+        downloads: dict[Future[_PreparedTask], DatasetTask] = {}
+        processing: dict[Future[TaskOutcome], tuple[_PreparedTask, int]] = {}
+        outcomes: dict[str, TaskOutcome] = {}
+        retained_storage_gb = paths_size_gb(
+            [
+                self.config.workspace / "fastq" / sanitize_identifier(task.task_id)
+                for task in tasks
+                if not self._task_requires_work(task, retry_failed=retry_failed)
+            ]
+        )
+
+        download_pool = ThreadPoolExecutor(
+            max_workers=policy.download_workers,
+            thread_name_prefix="stream-download",
+        )
+        process_pool = ThreadPoolExecutor(
+            max_workers=self.config.max_workers,
+            thread_name_prefix="stream-process",
+        )
+        stream_progress = self.progress.task(
+            "Stream dataset units", total=len(tasks), unit="units"
+        )
+        completed_cleanly = False
+        try:
+            while pending or downloads or ready or processing:
+                made_progress = False
+
+                for future in [item for item in downloads if item.done()]:
+                    task = downloads.pop(future)
+                    prepared = future.result()
+                    if prepared.outcome is not None:
+                        outcomes[task.task_id] = prepared.outcome
+                        stream_progress.update()
+                    else:
+                        ready.append(prepared)
+                        ready.sort(key=lambda item: order[item.task.task_id])
+                    made_progress = True
+
+                for future in [item for item in processing if item.done()]:
+                    prepared, _allocated_threads = processing.pop(future)
+                    outcome = future.result()
+                    cleanup_ok = self._cleanup_inputs(prepared, outcome, policy=policy)
+                    if prepared.staged is not None and (
+                        not cleanup_ok
+                        or outcome.status != "succeeded" and policy.keep_failed_inputs
+                        or policy.cleanup == "never"
+                    ):
+                        retained_storage_gb += paths_size_gb(
+                            list(prepared.staged.cleanup_roots)
+                        )
+                    outcomes[prepared.task.task_id] = outcome
+                    stream_progress.update()
+                    made_progress = True
+
+                active_entries = [entry for entry, _threads in processing.values()]
+                active_raw_gb = sum(
+                    max(0.0, entry.task.unit.total_size_gb) for entry in active_entries
+                )
+                active_threads = sum(threads for _entry, threads in processing.values())
+                active_memory_gb = sum(
+                    entry.task.resources.memory_gb for entry in active_entries
+                )
+                waiting_tasks = [entry.task for entry in ready]
+                waiting_tasks.extend(downloads.values())
+                waiting_tasks.extend(pending)
+
+                for prepared in list(ready):
+                    task = prepared.task
+                    raw_gb = max(0.0, task.unit.total_size_gb)
+                    if len(processing) >= self.config.max_workers:
+                        break
+                    if (
+                        processing_unit_limit is not None
+                        and len(processing) >= processing_unit_limit
+                    ):
+                        break
+                    if not self._fits_stream_window(
+                        active_raw_gb, raw_gb, processing_window_gb, len(processing)
+                    ):
+                        continue
+                    if total_memory_gb is not None and (
+                        active_memory_gb + task.resources.memory_gb > total_memory_gb
+                    ):
+                        continue
+                    available_threads = total_threads - active_threads
+                    if available_threads < task.resources.threads:
+                        continue
+                    other_waiting = [
+                        item for item in waiting_tasks if item.task_id != task.task_id
+                    ]
+                    planned_count = self._planned_processing_count(
+                        task,
+                        active=[entry.task for entry in active_entries],
+                        waiting=other_waiting,
+                        processing_window_gb=processing_window_gb,
+                        processing_unit_limit=processing_unit_limit,
+                        total_threads=total_threads,
+                        total_memory_gb=total_memory_gb,
+                    )
+                    fair_share = max(task.resources.threads, total_threads // planned_count)
+                    allocated_threads = min(
+                        maximum_threads,
+                        available_threads,
+                        fair_share,
+                    )
+                    staged_gb = max(
+                        raw_gb,
+                        prepared.staged.size_gb if prepared.staged is not None else 0.0,
+                    )
+                    additional_processing_gb = staged_gb * (
+                        policy.processing_storage_multiplier - 1
+                    )
+                    resident_gb = retained_storage_gb
+                    resident_gb += sum(
+                        max(0.0, item.unit.total_size_gb) for item in downloads.values()
+                    )
+                    resident_gb += sum(
+                        max(
+                            0.0,
+                            item.task.unit.total_size_gb,
+                            item.staged.size_gb if item.staged is not None else 0.0,
+                        )
+                        for item in ready
+                    )
+                    resident_gb += sum(
+                        max(
+                            entry.task.unit.total_size_gb,
+                            entry.staged.size_gb if entry.staged is not None else 0.0,
+                        )
+                        * policy.processing_storage_multiplier
+                        for entry in active_entries
+                    )
+                    if policy.max_staged_gb is not None and (
+                        resident_gb + additional_processing_gb > policy.max_staged_gb
+                    ):
+                        continue
+                    allocated_task = replace(
+                        task,
+                        resources=replace(task.resources, threads=allocated_threads),
+                    )
+                    allocated = replace(prepared, task=allocated_task)
+                    self.state.set_runtime_resources(
+                        allocated.state_key,
+                        threads=allocated_threads,
+                        memory_gb=allocated_task.resources.memory_gb,
+                    )
+                    ready.remove(prepared)
+                    waiting_tasks = [
+                        item for item in waiting_tasks if item.task_id != task.task_id
+                    ]
+                    future = process_pool.submit(
+                        self._process_prepared_task,
+                        allocated,
+                        processor,
+                        policy=policy,
+                    )
+                    processing[future] = (allocated, allocated_threads)
+                    active_entries.append(allocated)
+                    active_raw_gb += raw_gb
+                    active_threads += allocated_threads
+                    active_memory_gb += task.resources.memory_gb
+                    made_progress = True
+
+                inflight_tasks = [*downloads.values(), *(entry.task for entry in ready)]
+                inflight_tasks.extend(entry.task for entry, _threads in processing.values())
+                inflight_raw_gb = sum(
+                    max(0.0, task.unit.total_size_gb) for task in inflight_tasks
+                )
+                while pending and len(downloads) < policy.download_workers:
+                    candidate_index = None
+                    for index, task in enumerate(pending):
+                        raw_gb = max(0.0, task.unit.total_size_gb)
+                        if len(inflight_tasks) >= queue_unit_limit:
+                            break
+                        if not self._fits_stream_window(
+                            inflight_raw_gb,
+                            raw_gb,
+                            total_raw_window_gb,
+                            len(inflight_tasks),
+                        ):
+                            continue
+                        estimated_resident = retained_storage_gb + inflight_raw_gb + raw_gb
+                        estimated_resident += active_raw_gb * (
+                            policy.processing_storage_multiplier - 1
+                        )
+                        if policy.max_staged_gb is not None and (
+                            estimated_resident > policy.max_staged_gb
+                        ):
+                            continue
+                        available = free_space_gb(self.config.workspace)
+                        if available - raw_gb < policy.minimum_free_gb:
+                            continue
+                        candidate_index = index
+                        break
+                    if candidate_index is None:
+                        break
+                    task = pending.pop(candidate_index)
+                    future = download_pool.submit(
+                        self._claim_and_stage_task,
+                        task,
+                        job_id=job.job_id,
+                        retry_failed=retry_failed,
+                        policy=policy,
+                        reclaim_running=True,
+                    )
+                    downloads[future] = task
+                    inflight_tasks.append(task)
+                    inflight_raw_gb += max(0.0, task.unit.total_size_gb)
+                    made_progress = True
+
+                if not made_progress:
+                    active_futures = [*downloads, *processing]
+                    if active_futures:
+                        wait(
+                            active_futures,
+                            timeout=policy.scheduler_poll_seconds,
+                            return_when=FIRST_COMPLETED,
+                        )
+                    else:
+                        blocked = ready[0].task if ready else pending[0]
+                        raise RuntimeError(
+                            f"Streaming scheduler cannot admit unit {blocked.task_id}; "
+                            "increase CPU, memory, max_batch_gb, max_batch_units, "
+                            "max_staged_gb, or available storage"
+                        )
+            completed_cleanly = True
+        finally:
+            download_pool.shutdown(wait=False, cancel_futures=True)
+            process_pool.shutdown(wait=False, cancel_futures=True)
+            stream_progress.close(status="complete" if completed_cleanly else "failed")
+
+        self._finalize_streaming_manifests(job, tasks, policy=policy)
+        ordered_outcomes = tuple(outcomes[task.task_id] for task in tasks)
+        return BuildReport(ordered_outcomes, job.job_id)
 
     def _run_job(
         self,
@@ -1763,11 +2279,11 @@ class DatasetBuilder:
         processor_id: str | None = None,
         policy: PipelinePolicy | None = None,
     ) -> BuildReport:
-        """Run internal *job* with *processor* using bounded batch staging.
+        """Run internal *job* with *processor* using unit-level streaming.
 
         *retry_failed* enables failed units, *batch_ids* limits execution,
         *processor_id* identifies dynamic callables, and optional *policy*
-        overrides staging and cleanup configuration.
+        overrides queue, resources, storage, logging, and cleanup configuration.
         """
 
         callable_processor = load_processor(processor) if isinstance(processor, str) else processor
@@ -1791,52 +2307,13 @@ class DatasetBuilder:
             ),
         )
         active_policy = policy or self.config.pipeline_policy
-        grouped: dict[int, list[DatasetTask]] = {}
-        for task in tasks:
-            grouped.setdefault(task.batch_id, []).append(task)
-        batches = [grouped[batch_id] for batch_id in sorted(grouped)]
-        outcomes: list[TaskOutcome] = []
-        current = self._stage_batch(
+        report = self._run_streaming_job(
             job,
-            batches[0],
+            tasks,
+            callable_processor,
             retry_failed=retry_failed,
             policy=active_policy,
-            occupied_size_gb=0.0,
         )
-        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="batch-prefetch") as prefetch:
-            next_future: Future[_PreparedBatch] | None = None
-            for index, batch in enumerate(batches):
-                if index + 1 < len(batches) and active_policy.prefetch_batches == 1:
-                    started_event = threading.Event()
-                    next_future = prefetch.submit(
-                        self._stage_batch,
-                        job,
-                        batches[index + 1],
-                        retry_failed=retry_failed,
-                        policy=active_policy,
-                        occupied_size_gb=current.manifest.staged_size_gb,
-                        started_event=started_event,
-                    )
-                    started_event.wait()
-                outcomes.extend(
-                    self._process_batch(current, callable_processor, policy=active_policy)
-                )
-                if index + 1 >= len(batches):
-                    continue
-                if next_future is not None:
-                    current = next_future.result()
-                    next_future = None
-                else:
-                    current = self._stage_batch(
-                        job,
-                        batches[index + 1],
-                        retry_failed=retry_failed,
-                        policy=active_policy,
-                        occupied_size_gb=0.0,
-                    )
-        order = {task.task_id: index for index, task in enumerate(tasks)}
-        outcomes.sort(key=lambda outcome: order[outcome.task_id])
-        report = BuildReport(tuple(outcomes), job.job_id)
         self.workspace.sync_manifest(
             job, {task.task_id: self.state.get(task.task_id) for task in job.tasks}
         )
@@ -1850,11 +2327,14 @@ class DatasetBuilder:
         *,
         retry_failed: bool = False,
         processor_id: str | None = None,
+        threads_override: int | None = None,
     ) -> TaskOutcome:
         """Execute one *task_index* from internal *job* with *processor*.
 
         *retry_failed* enables a failed task and *processor_id* explicitly
         identifies dynamic callables when automatic identity is insufficient.
+        *threads_override* replaces the task's minimum with the CPUs assigned by
+        an external scheduler without changing its semantic fingerprint.
         """
 
         if task_index < 0 or task_index >= len(job.tasks):
@@ -1865,8 +2345,19 @@ class DatasetBuilder:
             raise ValueError(
                 f"Job {job.job_id} requires processor {job.processor_identity!r}, got {identity!r}"
             )
+        task = job.tasks[task_index]
+        if threads_override is not None:
+            if threads_override < task.resources.threads:
+                raise ValueError(
+                    f"threads_override={threads_override} is below the unit minimum "
+                    f"of {task.resources.threads}"
+                )
+            task = replace(
+                task,
+                resources=replace(task.resources, threads=threads_override),
+            )
         outcome = self._execute_task(
-            job.tasks[task_index],
+            task,
             callable_processor,
             job_id=job.job_id,
             retry_failed=retry_failed,
@@ -1932,16 +2423,35 @@ class DatasetBuilder:
         )
         active_policy = policy or self.config.pipeline_policy
         if options.mode == "distributed":
-            resource_specs = {task.resources for task in selected_tasks}
-            if len(resource_specs) != 1:
-                raise ValueError(
-                    "Distributed Slurm execution requires one ResourceSpec across selected tasks"
+            minimum_threads = min(task.resources.threads for task in selected_tasks)
+            largest_minimum = max(task.resources.threads for task in selected_tasks)
+            maximum_threads = (
+                active_policy.max_threads_per_unit
+                or options.cpus_per_node
+                or (options.total_cpu_quota or minimum_threads)
+            )
+            if options.cpus_per_node is not None:
+                maximum_threads = min(maximum_threads, options.cpus_per_node)
+            if options.total_cpu_quota is not None:
+                maximum_threads = min(
+                    maximum_threads,
+                    options.total_cpu_quota - options.coordinator_cpus,
                 )
-            per_unit_threads = max(task.resources.threads for task in selected_tasks)
-            workers = options.worker_parallelism(per_unit_threads)
+            if largest_minimum > maximum_threads:
+                raise ValueError(
+                    f"A unit minimum of {largest_minimum} CPUs exceeds the configured "
+                    f"per-unit ceiling of {maximum_threads} CPUs"
+                )
+            if options.cpus_per_node is not None and largest_minimum > options.cpus_per_node:
+                raise ValueError(
+                    f"A unit minimum of {largest_minimum} CPUs exceeds "
+                    f"cpus_per_node={options.cpus_per_node}"
+                )
+            workers = options.worker_parallelism(minimum_threads)
             self.progress.message(
-                f"Distributed Slurm quota permits {workers:,} concurrent units at "
-                f"{per_unit_threads:,} CPUs each"
+                f"Distributed Slurm quota permits up to {workers:,} concurrent units; "
+                f"adaptive allocations start at {minimum_threads:,} CPUs and are capped "
+                f"at {maximum_threads:,} CPUs per unit"
             )
             script = executor.create_dispatcher_script(
                 job_path=saved_job,
@@ -1953,6 +2463,11 @@ class DatasetBuilder:
                 prefetch_batches=active_policy.prefetch_batches,
                 max_staged_gb=active_policy.max_staged_gb,
                 minimum_free_gb=active_policy.minimum_free_gb,
+                processing_storage_multiplier=(
+                    active_policy.processing_storage_multiplier
+                ),
+                max_threads_per_unit=active_policy.max_threads_per_unit,
+                scheduler_poll_seconds=active_policy.scheduler_poll_seconds,
                 cleanup=active_policy.cleanup,
                 keep_failed_inputs=active_policy.keep_failed_inputs,
                 fsync_logs=active_policy.fsync_logs,
@@ -1987,6 +2502,9 @@ class DatasetBuilder:
             prefetch_batches=active_policy.prefetch_batches,
             max_staged_gb=active_policy.max_staged_gb,
             minimum_free_gb=active_policy.minimum_free_gb,
+            processing_storage_multiplier=active_policy.processing_storage_multiplier,
+            max_threads_per_unit=active_policy.max_threads_per_unit,
+            scheduler_poll_seconds=active_policy.scheduler_poll_seconds,
             cleanup=active_policy.cleanup,
             keep_failed_inputs=active_policy.keep_failed_inputs,
             fsync_logs=active_policy.fsync_logs,

@@ -30,6 +30,10 @@ from .util import (
     sha256_file,
 )
 
+_UNIT_LOCK_TIMEOUT_SECONDS = 7 * 24 * 60 * 60
+_UNIT_LOCK_STALE_SECONDS = 5 * 60
+_UNIT_LOCK_HEARTBEAT_SECONDS = 30
+
 
 class FastqProvider(Protocol):
     """Protocol for providers that materialize FASTQ files for processing units."""
@@ -200,13 +204,40 @@ class SraToolkitProvider:
         runner: CommandRunner | None = None,
         retries: int = 3,
         prefetch_max_size: str = "100G",
+        prefetch_reset_after_failures: int | None = None,
+        prefetch_retry_max_delay_seconds: float = 300.0,
         progress: ProgressReporter | None = None,
     ) -> None:
-        """Configure *runner*, *retries*, *prefetch_max_size*, and *progress*."""
+        """Configure SRA Toolkit execution and recovery behavior.
+
+        Args:
+            runner: External-command runner, or the default runner when omitted.
+            retries: Retry count for conversion commands and, by default, the
+                number of failed prefetch attempts before a clean staging reset.
+            prefetch_max_size: SRA Toolkit archive-size limit.
+            prefetch_reset_after_failures: Failed prefetch attempts allowed before
+                deleting the current run's incomplete staging data. The default is
+                ``retries + 1``.
+            prefetch_retry_max_delay_seconds: Maximum delay between the infinite
+                prefetch attempts.
+            progress: Optional progress reporter.
+        """
+
+        if retries < 0:
+            raise ValueError("retries cannot be negative")
+        reset_after = retries + 1 if prefetch_reset_after_failures is None else (
+            prefetch_reset_after_failures
+        )
+        if reset_after < 1:
+            raise ValueError("prefetch_reset_after_failures must be positive")
+        if prefetch_retry_max_delay_seconds < 0:
+            raise ValueError("prefetch_retry_max_delay_seconds cannot be negative")
 
         self.runner = runner or CommandRunner()
         self.retries = retries
         self.prefetch_max_size = prefetch_max_size
+        self.prefetch_reset_after_failures = reset_after
+        self.prefetch_retry_max_delay_seconds = prefetch_retry_max_delay_seconds
         self.progress = get_progress(progress)
 
     def _prefetch_limit_gb(self) -> float | None:
@@ -252,8 +283,64 @@ class SraToolkitProvider:
                 time.sleep(min(30.0, 2**attempt) + random.random())
         raise DownloadError(f"Command failed after retries: {list(command)!r}") from last_error
 
+    def _remove_prefetch_locks(self, native: Path, accession: str) -> tuple[Path, ...]:
+        """Delete SRA Toolkit lock files for *accession* below *native*.
+
+        This is called only after the launched ``prefetch`` process has returned
+        a nonzero exit code. Cleanup is restricted to the current accession's
+        temporary download tree.
+        """
+
+        if not native.is_dir():
+            return ()
+        removed: list[Path] = []
+        for lock in native.rglob("*.lock"):
+            if not lock.is_file() or accession not in lock.name:
+                continue
+            try:
+                lock.unlink()
+                removed.append(lock)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                self.progress.message(
+                    f"Could not remove prefetch lock {lock} for {accession}: {exc}; "
+                    "the clean-reset cycle will retry"
+                )
+        if removed:
+            self.progress.message(
+                f"Removed {len(removed)} prefetch lock file(s) for {accession} before retry"
+            )
+        return tuple(removed)
+
+    def _reset_prefetch_staging(self, run_dir: Path, accession: str) -> bool:
+        """Reset incomplete *run_dir* staging for *accession* and report success."""
+
+        try:
+            if run_dir.is_dir():
+                shutil.rmtree(run_dir)
+            elif run_dir.exists():
+                run_dir.unlink()
+            run_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.progress.message(
+                f"Could not fully reset SRA staging for {accession}: {exc}; will retry"
+            )
+            return False
+        self.progress.message(
+            f"Reset incomplete SRA staging for {accession}; next attempt starts from scratch"
+        )
+        return True
+
     def _download_run(self, accession: str, sra_root: Path) -> Path:
-        """Prefetch and validate SRA *accession* below unit-local *sra_root*."""
+        """Prefetch and validate SRA *accession* with self-healing retries.
+
+        *sra_root* receives accession-local raw staging.
+        The method retries indefinitely. A nonzero ``prefetch`` exit removes
+        accession-local SRA Toolkit locks before retrying. After
+        ``prefetch_reset_after_failures`` unsuccessful attempts, all incomplete
+        staging for this accession is deleted and the next attempt starts clean.
+        """
 
         run_dir = sra_root / accession
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -264,23 +351,29 @@ class SraToolkitProvider:
             return archive
         self.progress.message(f"Prefetch and validate SRA run {accession}")
         native = run_dir / "download"
-        last_error: BaseException | None = None
-        for attempt in range(self.retries + 1):
+        attempt = 0
+        while True:
+            attempt += 1
+            prefetch_failed = False
             try:
                 native.mkdir(parents=True, exist_ok=True)
                 self.progress.message(
-                    f"Run prefetch (attempt {attempt + 1}/{self.retries + 1})"
+                    f"Run prefetch for {accession} (attempt {attempt}; retries are unlimited)"
                 )
-                self.runner.run(
-                    [
-                        "prefetch",
-                        accession,
-                        "--output-directory",
-                        str(native),
-                        "--max-size",
-                        self.prefetch_max_size,
-                    ]
-                )
+                try:
+                    self.runner.run(
+                        [
+                            "prefetch",
+                            accession,
+                            "--output-directory",
+                            str(native),
+                            "--max-size",
+                            self.prefetch_max_size,
+                        ]
+                    )
+                except ExternalToolError:
+                    prefetch_failed = True
+                    raise
                 exact_sra = [
                     path
                     for path in native.rglob(f"{accession}.sra")
@@ -313,15 +406,23 @@ class SraToolkitProvider:
                 )
                 return archive
             except (ExternalToolError, DownloadError, OSError) as exc:
-                last_error = exc
-                if attempt == self.retries:
-                    break
-                self.progress.message(f"Retry prefetch for {accession}: {exc}")
-                time.sleep(min(30.0, 2**attempt) + random.random())
-        raise DownloadError(
-            f"Failed to prefetch {accession} after {self.retries + 1} attempts; "
-            f"prefetch_max_size={self.prefetch_max_size!r}. Last error: {last_error}"
-        ) from last_error
+                self.progress.message(
+                    f"Prefetch attempt {attempt} failed for {accession}: {exc}"
+                )
+                if prefetch_failed:
+                    self._remove_prefetch_locks(native, accession)
+                if attempt % self.prefetch_reset_after_failures == 0:
+                    self._reset_prefetch_staging(run_dir, accession)
+                delay = min(
+                    self.prefetch_retry_max_delay_seconds,
+                    float(2 ** min(attempt - 1, 8)),
+                )
+                if delay > 0:
+                    delay += random.random()
+                    self.progress.message(
+                        f"Retry prefetch for {accession} in {delay:.1f}s"
+                    )
+                    time.sleep(delay)
 
     def _compress(self, path: Path, threads: int) -> Path:
         """Compress FASTQ *path* with pigz or gzip using available *threads*."""
@@ -595,8 +696,9 @@ class SraToolkitProvider:
         ):
             with exclusive_file_lock(
                 unit_root / "locks" / f"{accession}.lock",
-                timeout_seconds=7 * 24 * 60 * 60,
-                stale_after_seconds=7 * 24 * 60 * 60,
+                timeout_seconds=_UNIT_LOCK_TIMEOUT_SECONDS,
+                stale_after_seconds=_UNIT_LOCK_STALE_SECONDS,
+                heartbeat_seconds=_UNIT_LOCK_HEARTBEAT_SECONDS,
             ):
                 if self._cached_run_fastq(accession, unit_root) is not None:
                     continue
@@ -630,8 +732,9 @@ class SraToolkitProvider:
         unit_root.mkdir(parents=True, exist_ok=True)
         with exclusive_file_lock(
             unit_root / "locks" / "fastq.lock",
-            timeout_seconds=7 * 24 * 60 * 60,
-            stale_after_seconds=7 * 24 * 60 * 60,
+            timeout_seconds=_UNIT_LOCK_TIMEOUT_SECONDS,
+            stale_after_seconds=_UNIT_LOCK_STALE_SECONDS,
+            heartbeat_seconds=_UNIT_LOCK_HEARTBEAT_SECONDS,
         ):
             cached = self._unit_cache(unit, manifest)
             if cached is not None:
@@ -673,8 +776,9 @@ class SraToolkitProvider:
         ):
             with exclusive_file_lock(
                 unit_root / "locks" / f"{accession}.lock",
-                timeout_seconds=7 * 24 * 60 * 60,
-                stale_after_seconds=7 * 24 * 60 * 60,
+                timeout_seconds=_UNIT_LOCK_TIMEOUT_SECONDS,
+                stale_after_seconds=_UNIT_LOCK_STALE_SECONDS,
+                heartbeat_seconds=_UNIT_LOCK_HEARTBEAT_SECONDS,
             ):
                 cached_run = self._cached_run_fastq(accession, unit_root)
                 staged_path = staged.metadata.get("sra_files", {}).get(accession)

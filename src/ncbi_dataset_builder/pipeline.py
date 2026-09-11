@@ -15,6 +15,7 @@ from .util import (
 
 BatchStatus = Literal[
     "pending",
+    "streaming",
     "staging",
     "ready",
     "processing",
@@ -80,17 +81,23 @@ def remove_owned_roots(paths: tuple[Path, ...], *, allowed_root: Path) -> tuple[
 
 @dataclass(frozen=True)
 class PipelinePolicy:
-    """Control bounded batch staging, storage checks, cleanup, and logs.
+    """Control unit-level streaming, storage checks, cleanup, and logs.
 
     Args:
-        prefetch_batches: Number of future batches staged while one is processed;
-            bounded execution currently accepts zero or one.
-        max_staged_gb: Optional maximum estimated size of current and prefetched inputs.
+        prefetch_batches: Number of raw-data windows allowed ahead of the
+            currently processing window.
+        max_staged_gb: Optional maximum estimated resident input and processing
+            storage in GB.
         minimum_free_gb: Free storage that must remain before staging a batch.
         cleanup: Whether successful unit inputs are deleted after verified processing.
         keep_failed_inputs: Preserve staged inputs for failed units.
         fsync_logs: Synchronize each unit log at the end of every phase.
-        download_workers: Maximum unit downloads within one staging batch.
+        download_workers: Maximum simultaneous unit downloads.
+        processing_storage_multiplier: Estimated peak processing storage divided
+            by raw SRA size. Four means four times total, not four extra copies.
+        max_threads_per_unit: Optional CPU ceiling for one adaptively allocated
+            unit. ``ResourceSpec.threads`` is its hard minimum.
+        scheduler_poll_seconds: Maximum wait between streaming scheduler checks.
     """
 
     prefetch_batches: int = 1
@@ -100,12 +107,15 @@ class PipelinePolicy:
     keep_failed_inputs: bool = True
     fsync_logs: bool = True
     download_workers: int = 2
+    processing_storage_multiplier: float = 1.0
+    max_threads_per_unit: int | None = None
+    scheduler_poll_seconds: float = 1.0
 
     def __post_init__(self) -> None:
         """Validate prefetch, storage, cleanup, and logging policy values."""
 
-        if self.prefetch_batches not in {0, 1}:
-            raise ValueError("prefetch_batches must be zero or one for bounded execution")
+        if self.prefetch_batches < 0:
+            raise ValueError("prefetch_batches cannot be negative")
         if self.max_staged_gb is not None and self.max_staged_gb <= 0:
             raise ValueError("max_staged_gb must be positive")
         if self.minimum_free_gb < 0:
@@ -114,6 +124,12 @@ class PipelinePolicy:
             raise ValueError(f"Unknown cleanup policy: {self.cleanup!r}")
         if self.download_workers < 1:
             raise ValueError("download_workers must be positive")
+        if self.processing_storage_multiplier < 1:
+            raise ValueError("processing_storage_multiplier must be at least one")
+        if self.max_threads_per_unit is not None and self.max_threads_per_unit < 1:
+            raise ValueError("max_threads_per_unit must be positive")
+        if self.scheduler_poll_seconds <= 0:
+            raise ValueError("scheduler_poll_seconds must be positive")
 
 
 @dataclass(frozen=True)

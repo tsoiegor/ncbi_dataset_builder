@@ -42,11 +42,16 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     job = builder.load_job(arguments.job)
+    allocated_threads_raw = os.environ.get("SLURM_CPUS_PER_TASK")
+    allocated_threads = (
+        int(allocated_threads_raw) if allocated_threads_raw is not None else None
+    )
     outcome = builder.run_task(
         job,
         arguments.task_index,
         arguments.processor,
         retry_failed=arguments.retry_failed,
+        threads_override=allocated_threads,
     )
     return 1 if outcome.status == "failed" else 0
 

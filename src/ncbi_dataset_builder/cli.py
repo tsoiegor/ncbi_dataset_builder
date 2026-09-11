@@ -163,7 +163,7 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--batch-id", type=int, action="append")
 
     submit = commands.add_parser(
-        "submit-slurm", help="Generate or submit one bounded-pipeline coordinator job"
+        "submit-slurm", help="Generate or submit one unit-streaming coordinator job"
     )
     submit.add_argument("--catalog", type=Path, required=True)
     submit.add_argument("--processor", required=True)
@@ -191,20 +191,39 @@ def build_parser() -> argparse.ArgumentParser:
             choices=("run", "experiment", "sra_sample", "biosample"),
             default="experiment",
         )
-        pipeline_command.add_argument("--threads", type=int, default=4)
+        pipeline_command.add_argument(
+            "--threads", type=int, default=4, help="Minimum CPUs required per unit"
+        )
         pipeline_command.add_argument("--memory-gb", type=int, default=16)
         pipeline_command.add_argument("--time-limit", default="24:00:00")
-        pipeline_command.add_argument("--max-batch-gb", type=float)
-        pipeline_command.add_argument("--max-batch-units", type=int)
+        pipeline_command.add_argument(
+            "--max-batch-gb", type=float, help="Raw-SRA GB allowed to process at once"
+        )
+        pipeline_command.add_argument(
+            "--max-batch-units", type=int, help="Maximum units processing at once"
+        )
         pipeline_command.add_argument(
             "--prefetch-max-size",
             default="u",
             help="SRA Toolkit archive limit such as 200G, or u for unlimited",
         )
-        pipeline_command.add_argument("--prefetch-batches", type=int, choices=(0, 1), default=1)
+        pipeline_command.add_argument(
+            "--prefetch-batches",
+            type=int,
+            default=1,
+            help="Number of extra raw-data windows kept downloading or ready",
+        )
         pipeline_command.add_argument("--download-workers", type=int, default=2)
         pipeline_command.add_argument("--max-staged-gb", type=float)
         pipeline_command.add_argument("--minimum-free-gb", type=float, default=0.0)
+        pipeline_command.add_argument(
+            "--processing-storage-multiplier",
+            type=float,
+            default=1.0,
+            help="Estimated peak processing storage divided by raw SRA size",
+        )
+        pipeline_command.add_argument("--max-threads-per-unit", type=int)
+        pipeline_command.add_argument("--scheduler-poll-seconds", type=float, default=1.0)
         pipeline_command.add_argument(
             "--cleanup", choices=("after_success", "never"), default="after_success"
         )
@@ -307,6 +326,9 @@ def main(argv: list[str] | None = None) -> int:
                 keep_failed_inputs=not arguments.discard_failed_inputs,
                 fsync_logs=not arguments.no_fsync_logs,
                 download_workers=arguments.download_workers,
+                processing_storage_multiplier=arguments.processing_storage_multiplier,
+                max_threads_per_unit=arguments.max_threads_per_unit,
+                scheduler_poll_seconds=arguments.scheduler_poll_seconds,
             )
             report = builder.build(
                 builder.load_runs(arguments.catalog),
@@ -368,6 +390,9 @@ def main(argv: list[str] | None = None) -> int:
                     keep_failed_inputs=not arguments.discard_failed_inputs,
                     fsync_logs=not arguments.no_fsync_logs,
                     download_workers=arguments.download_workers,
+                    processing_storage_multiplier=arguments.processing_storage_multiplier,
+                    max_threads_per_unit=arguments.max_threads_per_unit,
+                    scheduler_poll_seconds=arguments.scheduler_poll_seconds,
                 ),
             )
             print(

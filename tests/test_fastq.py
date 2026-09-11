@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from ncbi_dataset_builder.errors import DownloadError
+from ncbi_dataset_builder.errors import DownloadError, ExternalToolError
 from ncbi_dataset_builder.fastq import GeoFastqProvider, SraToolkitProvider
 from ncbi_dataset_builder.models import FastqLayout, ProcessingUnit
 
@@ -41,6 +41,38 @@ class FakeSraRunner:
             (output / f"{accession}_2.fastq").write_bytes(f"{accession}-R2\n".encode())
             if accession == "SRR1":
                 (output / f"{accession}.fastq").write_bytes(b"SRR1-orphan\n")
+
+
+class RecoveringPrefetchRunner(FakeSraRunner):
+    """Fail prefetch twice and verify that locks and partial data are recovered."""
+
+    def __init__(self):
+        super().__init__()
+        self.prefetch_attempts = 0
+
+    def run(self, command, **kwargs):
+        if command[0] != "prefetch":
+            return super().run(command, **kwargs)
+        del kwargs
+        self.commands.append(command)
+        self.prefetch_attempts += 1
+        accession = command[1]
+        output = Path(command[command.index("--output-directory") + 1])
+        accession_dir = output / accession
+        lock = accession_dir / f"{accession}.sra.lock"
+        partial = accession_dir / "incomplete.part"
+        if self.prefetch_attempts > 1:
+            assert not lock.exists()
+        if self.prefetch_attempts <= 2:
+            accession_dir.mkdir(parents=True, exist_ok=True)
+            lock.write_text("stale")
+            partial.write_text("partial")
+            raise ExternalToolError("prefetch exited with code 3: lock exists")
+        assert not lock.exists()
+        assert not partial.exists()
+        target = accession_dir / f"{accession}.sra"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"sra")
 
 
 def test_geo_provider_pairs_by_sample_key_and_preserves_single_reads(tmp_path):
@@ -135,6 +167,23 @@ def test_sra_staging_prefetches_without_materializing_and_reuses_raw_cache(tmp_p
 
     assert cached.read1 == result.read1
     assert not (unit_root / "sra").exists()
+
+
+def test_sra_prefetch_removes_locks_resets_staging_and_retries_forever(tmp_path):
+    runner = RecoveringPrefetchRunner()
+    provider = SraToolkitProvider(
+        runner=runner,
+        prefetch_reset_after_failures=2,
+        prefetch_retry_max_delay_seconds=0,
+    )
+
+    archive = provider._download_run("SRR1", tmp_path / "sra")
+
+    assert archive.read_bytes() == b"sra"
+    assert runner.prefetch_attempts == 3
+    assert not list(tmp_path.rglob("*.lock"))
+    assert not list(tmp_path.rglob("incomplete.part"))
+    assert (tmp_path / "sra" / "SRR1" / "sra.complete.json").is_file()
 
 
 def test_sra_provider_rejects_catalogued_run_above_configured_limit(tmp_path):
