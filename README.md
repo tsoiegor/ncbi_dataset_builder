@@ -27,7 +27,7 @@ conda install -c conda-forge -c bioconda \
   sra-tools fastp bowtie2 samtools deeptools -y
 git clone https://github.com/tsoiegor/ncbi_dataset_builder.git
 cd ncbi_dataset_builder
-python -m pip install -e ".[dev,progress]"`
+python -m pip install -e ".[dev,progress]"
 ```
 
 The `dev` extra installs pytest, pytest-cov, and Ruff; `progress` installs tqdm. A basic
