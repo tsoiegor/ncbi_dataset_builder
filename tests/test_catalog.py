@@ -3,7 +3,6 @@ import pytest
 
 from ncbi_dataset_builder.catalog import RunCatalog, validate_polars_runtime
 from ncbi_dataset_builder.errors import CatalogConflictError, DependencyError
-from ncbi_dataset_builder.models import ProcessingUnit
 
 
 def records():
@@ -60,35 +59,36 @@ def test_identical_duplicates_are_removed_but_conflicts_fail():
         RunCatalog.from_records([rows[0], conflicting]).deduplicate_runs()
 
 
+def test_transform_applies_polars_callable_and_records_audit():
+    catalog = RunCatalog.from_records(records())
+
+    transformed = catalog.transform(
+        lambda frame: frame.filter(pl.col("Run") == "SRR2").with_columns(
+            pl.lit("selected").alias("status")
+        ),
+        description="select SRR2",
+    )
+
+    assert transformed.frame.get_column("Run").to_list() == ["SRR2"]
+    assert transformed.frame.get_column("status").to_list() == ["selected"]
+    assert transformed.audit[-1] == "transform select SRR2: 2 -> 1 rows"
+
+
+def test_transform_requires_a_dataframe_with_run_column():
+    catalog = RunCatalog.from_records(records())
+
+    with pytest.raises(TypeError, match="Polars DataFrame"):
+        catalog.transform(lambda frame: frame.to_dicts())
+    with pytest.raises(ValueError, match="Run"):
+        catalog.transform(lambda frame: frame.drop("Run"))
+
+
 def test_polars_runtime_validation_reports_mixed_install(monkeypatch):
     import polars._reexport as polars_reexport
 
     monkeypatch.delattr(polars_reexport, "Expr")
     with pytest.raises(DependencyError, match="polars-lts-cpu"):
         validate_polars_runtime()
-
-
-def test_batching_terminates_and_keeps_oversized_unit():
-    units = [
-        ProcessingUnit("large", ("SRR1",), total_size_gb=0.2),
-        ProcessingUnit("small-a", ("SRR2",), total_size_gb=0.04),
-        ProcessingUnit("small-b", ("SRR3",), total_size_gb=0.05),
-    ]
-    batches = RunCatalog.batch_units(units, max_gb=0.1, max_units=2)
-    assert [[unit.unit_id for unit in batch] for batch in batches] == [
-        ["large"],
-        ["small-b", "small-a"],
-    ]
-
-
-def test_legacy_serialized_byte_size_is_loaded_but_rewritten_in_gb():
-    unit = ProcessingUnit.from_dict(
-        {"unit_id": "SRX1", "run_accessions": ["SRR1"], "total_bytes": 2_500_000_000}
-    )
-
-    assert unit.total_size_gb == 2.5
-    assert unit.to_dict()["total_size_gb"] == 2.5
-    assert "total_bytes" not in unit.to_dict()
 
 
 def test_a_processing_unit_cannot_span_species():

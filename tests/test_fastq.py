@@ -3,8 +3,8 @@ from pathlib import Path
 
 import pytest
 
+from ncbi_dataset_builder.acquisition.fastq import GeoFastqProvider, SraToolkitProvider
 from ncbi_dataset_builder.errors import DownloadError, ExternalToolError
-from ncbi_dataset_builder.fastq import GeoFastqProvider, SraToolkitProvider
 from ncbi_dataset_builder.models import FastqLayout, ProcessingUnit
 
 

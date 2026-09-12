@@ -1,15 +1,14 @@
 import json
 
-from ncbi_dataset_builder.http import HttpResponse
 from ncbi_dataset_builder.metadata import (
     BioSampleClient,
     EntrezClient,
     MetadataBundle,
     SraClient,
     fetch_metadata_for_accessions,
-    sanitize_legacy_metadata,
     sanitize_presentation_markup,
 )
+from ncbi_dataset_builder.metadata.http import HttpResponse
 
 SRA_XML = b"""<EXPERIMENT_PACKAGE_SET><EXPERIMENT_PACKAGE>
   <EXPERIMENT alias="GSM3756614" accession="SRX5809925">
@@ -115,7 +114,7 @@ def test_accessions_are_resolved_to_numeric_uids_before_efetch():
         resolver,
         "sra",
         ["SRS4739189", "123", "SRR9032674", "SRS4739189"],
-        batch_size=1,
+        request_chunk_size=1,
     )
     assert result == ["123", "7807635", "7807636"]
     assert resolver.queries == [
@@ -234,9 +233,7 @@ def test_combined_sample_description_and_persistence(tmp_path):
     assert MetadataBundle.load(tmp_path).to_dict() == bundle.to_dict()
 
 
-def test_legacy_markup_sanitizer_removes_tags_decodes_entities_and_preserves_unicode(
-    tmp_path,
-):
+def test_markup_sanitizer_removes_tags_decodes_entities_and_preserves_unicode():
     original = {
         "External Id": '<span class="highlight" style="background-color:">SAMEA6806937</span>',
         "disease": "Huntington’s Disease",
@@ -249,10 +246,3 @@ def test_legacy_markup_sanitizer_removes_tags_decodes_entities_and_preserves_uni
         "protocol": "CUT&Tag",
         "nested": ["A < B"],
     }
-
-    path = tmp_path / "legacy.json"
-    path.write_text(json.dumps(original), encoding="utf-8")
-    changed = sanitize_legacy_metadata([tmp_path])
-    assert changed == [path]
-    assert json.loads(path.read_text(encoding="utf-8"))["External Id"] == "SAMEA6806937"
-    assert sanitize_legacy_metadata([path]) == []

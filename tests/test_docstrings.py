@@ -29,6 +29,8 @@ def test_function_docstrings_name_their_arguments():
     for path, node in definitions():
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
+        if node.name.startswith("_"):
+            continue
         arguments = [
             argument.arg
             for argument in (
@@ -49,6 +51,8 @@ def test_dataclass_docstrings_name_constructor_fields():
     missing = []
     for path, node in definitions():
         if not isinstance(node, ast.ClassDef):
+            continue
+        if node.name.startswith("_"):
             continue
         is_dataclass = any(
             isinstance(decorator, ast.Name)

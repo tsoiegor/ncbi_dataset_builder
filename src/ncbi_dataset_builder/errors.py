@@ -29,8 +29,8 @@ class GenomeSelectionError(DatasetBuilderError):
     """No genome meets the configured policy."""
 
 
-class TaskAlreadyRunning(DatasetBuilderError):
-    """A non-stale worker already owns a task."""
+class UnitAlreadyRunning(DatasetBuilderError):
+    """A non-stale worker already owns a sample unit."""
 
 
 class ProcessingError(DatasetBuilderError):

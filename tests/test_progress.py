@@ -1,7 +1,7 @@
 import logging
 from io import StringIO
 
-from ncbi_dataset_builder.progress import ProgressReporter
+from ncbi_dataset_builder.support.progress import ProgressReporter
 
 
 def test_text_progress_reports_cache_counts_and_completion():
@@ -18,7 +18,7 @@ def test_text_progress_reports_cache_counts_and_completion():
 
     output = stream.getvalue()
     assert "12 samples loaded from cache; 3 samples require work" in output
-    assert "4 request batches loaded from raw cache; 2 request batches will be fetched" in output
+    assert "4 request chunks loaded from raw cache; 2 request chunks will be fetched" in output
     assert "Parse records: started (0/3 records" in output
     assert "Parse records: complete (3/3 records" in output
 

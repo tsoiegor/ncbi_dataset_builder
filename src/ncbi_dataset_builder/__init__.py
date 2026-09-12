@@ -1,87 +1,89 @@
-"""Public API for building reproducible datasets from NCBI resources."""
+"""Public API for workspace-centered NCBI dataset construction."""
 
-from .catalog import RunCatalog, validate_polars_runtime
-from .descriptions import DescriptionPolicy, training_fields_by_experiment
-from .execution import LocalExecutor, SlurmExecutor, SlurmOptions
-from .fastq import AtomicDownloader, GeoFastqProvider, SraToolkitProvider, StagedFastqProvider
-from .genomes import GenomeManager, GenomeSelectionPolicy
-from .geo import GeoClient, GeoSupplementaryFile
-from .metadata import (
-    BioSampleClient,
-    EntrezClient,
-    MetadataBundle,
-    SraClient,
-    sanitize_legacy_metadata,
-    sanitize_presentation_markup,
+from .acquisition.fastq import (
+    AtomicDownloader,
+    GeoFastqProvider,
+    SraToolkitProvider,
+    StagedFastqProvider,
 )
+from .acquisition.genomes import GenomeManager, GenomeSelectionPolicy
+from .acquisition.geo import GeoClient, GeoSupplementaryFile
+from .api import BuilderConfig, BuildReport, DatasetBuilder, UnitOutcome
+from .catalog import RunCatalog, validate_polars_runtime
+from .execution.config import (
+    FilesystemStorage,
+    LocalExecution,
+    QueuePolicy,
+    QuotaStorage,
+    SlurmDistributedExecution,
+    SlurmSingleNodeExecution,
+)
+from .metadata import BioSampleClient, EntrezClient, MetadataBundle, SraClient
+from .metadata.descriptions import DescriptionPolicy, training_fields_by_experiment
 from .models import (
-    DatasetTask,
     FastqLayout,
     FastqSet,
     GenomeRef,
     ProcessingResult,
     ProcessingUnit,
-    ResourceSpec,
     StagedFastq,
-    WorkspaceJob,
 )
-from .pipeline import BatchManifest, BatchStateStore, PipelinePolicy
-from .processing import AtacSeqConfig, AtacSeqProcessor, Processor, process_atac
-from .progress import ProgressReporter, ProgressTask
-from .publishing import DatasetExport, DatasetPublisher, PublishMode
-from .unit_logging import current_unit_log_handle, current_unit_log_path
-from .workflow import BuilderConfig, DatasetBuilder
+from .processing import (
+    AtacIntermediateFiles,
+    AtacSeqConfig,
+    AtacSeqProcessor,
+    Processor,
+    process_atac,
+)
+from .support.progress import ProgressReporter, ProgressTask
 from .workspace import WorkspaceConfig, WorkspaceStore
+from .workspace.publishing import DatasetExport, DatasetPublisher, PublishMode
 
 __all__ = [
+    "AtacIntermediateFiles",
     "AtacSeqConfig",
     "AtacSeqProcessor",
     "AtomicDownloader",
-    "BatchManifest",
-    "BatchStateStore",
     "BioSampleClient",
+    "BuildReport",
     "BuilderConfig",
     "DatasetBuilder",
     "DatasetExport",
     "DatasetPublisher",
-    "DatasetTask",
     "DescriptionPolicy",
     "EntrezClient",
     "FastqLayout",
     "FastqSet",
+    "FilesystemStorage",
     "GenomeManager",
     "GenomeRef",
     "GenomeSelectionPolicy",
     "GeoClient",
     "GeoFastqProvider",
     "GeoSupplementaryFile",
-    "LocalExecutor",
+    "LocalExecution",
     "MetadataBundle",
-    "PipelinePolicy",
     "ProcessingResult",
     "ProcessingUnit",
     "Processor",
     "ProgressReporter",
     "ProgressTask",
     "PublishMode",
-    "ResourceSpec",
+    "QueuePolicy",
+    "QuotaStorage",
     "RunCatalog",
-    "SlurmExecutor",
-    "SlurmOptions",
+    "SlurmDistributedExecution",
+    "SlurmSingleNodeExecution",
     "SraClient",
     "SraToolkitProvider",
     "StagedFastq",
     "StagedFastqProvider",
+    "UnitOutcome",
     "WorkspaceConfig",
-    "WorkspaceJob",
     "WorkspaceStore",
-    "current_unit_log_handle",
-    "current_unit_log_path",
     "process_atac",
-    "sanitize_legacy_metadata",
-    "sanitize_presentation_markup",
     "training_fields_by_experiment",
     "validate_polars_runtime",
 ]
 
-__version__ = "0.5.1"
+__version__ = "0.1.0"

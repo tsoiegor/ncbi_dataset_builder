@@ -2,8 +2,14 @@ import json
 from pathlib import Path
 from typing import ClassVar
 
+import pytest
+
 from ncbi_dataset_builder.models import FastqLayout, FastqSet, GenomeRef
-from ncbi_dataset_builder.processing.atac import AtacSeqConfig, AtacSeqProcessor
+from ncbi_dataset_builder.processing.atac import (
+    AtacIntermediateFiles,
+    AtacSeqConfig,
+    AtacSeqProcessor,
+)
 
 
 class FakeRunner:
@@ -41,6 +47,18 @@ class LightweightAtacProcessor(AtacSeqProcessor):
         return output
 
 
+class IndexingAtacProcessor(LightweightAtacProcessor):
+    def _ensure_index(self, genome, threads):
+        del threads
+        index_dir = genome.fasta.parent / "indexes" / genome.accession
+        index_dir.mkdir(parents=True, exist_ok=True)
+        (index_dir / f"{genome.accession}.fna").write_text(">chr1\nACGT\n")
+        prefix = index_dir / genome.accession
+        for suffix in (".1", ".2", ".3", ".4", ".rev.1", ".rev.2"):
+            Path(str(prefix) + suffix + ".bt2").write_bytes(b"index")
+        return prefix
+
+
 def test_default_atac_coverage_is_unstranded_and_outputs_are_validated(tmp_path):
     reads = tmp_path / "reads.fastq.gz"
     reads.write_bytes(b"reads")
@@ -59,6 +77,109 @@ def test_default_atac_coverage_is_unstranded_and_outputs_are_validated(tmp_path)
     assert result.success
     assert (tmp_path / "output" / "SRX1.coverage.bw") in result.outputs
     assert not any("forward" in path.name or "reverse" in path.name for path in result.outputs)
+    assert not (tmp_path / "work" / "processing" / "atac" / "single.clean.fastq.gz").exists()
+    assert not (tmp_path / "work" / "processing" / "atac" / "single.sorted.bam").exists()
+
+
+def test_atac_intermediate_policy_can_retain_unit_work_files(tmp_path):
+    reads = tmp_path / "reads.fastq.gz"
+    reads.write_bytes(b"reads")
+    second_reads = tmp_path / "reads-2.fastq.gz"
+    second_reads.write_bytes(b"more reads")
+    fasta = tmp_path / "genome.fna"
+    fasta.write_text(">chr1\nACGT\n", encoding="utf-8")
+    fastq = FastqSet(
+        "SRX1",
+        FastqLayout.SINGLE,
+        ("SRR1",),
+        single=(reads, second_reads),
+        work_dir=tmp_path / "work",
+        output_dir=tmp_path / "output",
+    )
+    genome = GenomeRef(9606, "Homo sapiens", "GCF_TEST", fasta, "not-used")
+    config = AtacSeqConfig(
+        intermediates=AtacIntermediateFiles(
+            keep_staged_fastq=True,
+            keep_cleaned_fastq=True,
+            keep_fastp_json=True,
+            keep_fastp_html=True,
+            keep_component_bams=True,
+        )
+    )
+
+    result = LightweightAtacProcessor(config=config, runner=FakeRunner())(fastq, genome, 2)
+    work = tmp_path / "work" / "processing" / "atac"
+
+    assert (work / "single.clean.fastq.gz").is_file()
+    assert (work / "single.sorted.bam").is_file()
+    assert (work / "input.single.fastq.gz").is_file()
+    assert (work / "single.fastp.json") in result.outputs
+    assert (work / "single.fastp.html") in result.outputs
+
+
+def test_atac_policy_can_publish_bigwig_without_bam_or_reports(tmp_path):
+    reads = tmp_path / "reads.fastq.gz"
+    reads.write_bytes(b"reads")
+    fasta = tmp_path / "genome.fna"
+    fasta.write_text(">chr1\nACGT\n", encoding="utf-8")
+    fastq = FastqSet(
+        "SRX1",
+        FastqLayout.SINGLE,
+        ("SRR1",),
+        single=(reads,),
+        work_dir=tmp_path / "work",
+        output_dir=tmp_path / "output",
+    )
+    genome = GenomeRef(9606, "Homo sapiens", "GCF_TEST", fasta, "not-used")
+    config = AtacSeqConfig(
+        intermediates=AtacIntermediateFiles(
+            keep_fastp_json=False,
+            keep_fastp_html=False,
+            keep_final_bam=False,
+            keep_final_bam_index=False,
+        )
+    )
+
+    result = LightweightAtacProcessor(config=config, runner=FakeRunner())(fastq, genome, 2)
+
+    assert [path.suffix for path in result.outputs] == [".bw"]
+    assert not (tmp_path / "output" / "SRX1.bam").exists()
+    assert not (tmp_path / "output" / "SRX1.bam.csi").exists()
+    assert not (tmp_path / "work" / "processing" / "atac" / "single.fastp.json").exists()
+    assert not (tmp_path / "work" / "processing" / "atac" / "single.fastp.html").exists()
+
+
+def test_atac_policy_can_remove_cached_index_and_materialized_genome(tmp_path):
+    reads = tmp_path / "reads.fastq.gz"
+    reads.write_bytes(b"reads")
+    fasta = tmp_path / "genome.fna"
+    fasta.write_text(">chr1\nACGT\n", encoding="utf-8")
+    fastq = FastqSet(
+        "SRX1",
+        FastqLayout.SINGLE,
+        ("SRR1",),
+        single=(reads,),
+        work_dir=tmp_path / "work",
+        output_dir=tmp_path / "output",
+    )
+    genome = GenomeRef(9606, "Homo sapiens", "GCF_TEST", fasta, "not-used")
+    config = AtacSeqConfig(
+        intermediates=AtacIntermediateFiles(
+            keep_bowtie2_index=False,
+            keep_uncompressed_genome=False,
+        )
+    )
+
+    IndexingAtacProcessor(config=config, runner=FakeRunner())(fastq, genome, 2)
+    index_dir = tmp_path / "indexes" / "GCF_TEST"
+
+    assert not (index_dir / "GCF_TEST.fna").exists()
+    assert not list(index_dir.glob("*.bt2"))
+
+
+def test_atac_policy_rejects_index_without_bam():
+    with pytest.raises(ValueError, match="requires keep_final_bam"):
+        AtacIntermediateFiles(keep_final_bam=False, keep_final_bam_index=True)
 
 
 def _write_fastp_report(

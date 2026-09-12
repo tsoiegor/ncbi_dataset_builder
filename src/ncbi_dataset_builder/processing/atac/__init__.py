@@ -1,18 +1,17 @@
-from .atac import (
+"""ATAC-seq processor and explicit intermediate-retention policy."""
+
+from .processor import (
     AtacIntermediateFiles,
     AtacSeqConfig,
     AtacSeqProcessor,
     default_atac_processor,
     process_atac,
 )
-from .base import Processor, load_processor
 
 __all__ = [
     "AtacIntermediateFiles",
     "AtacSeqConfig",
     "AtacSeqProcessor",
-    "Processor",
     "default_atac_processor",
-    "load_processor",
     "process_atac",
 ]

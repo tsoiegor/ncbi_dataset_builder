@@ -6,10 +6,14 @@ from io import StringIO
 
 import pytest
 
+from ncbi_dataset_builder.acquisition.genomes import (
+    GenomeCandidate,
+    GenomeManager,
+    GenomeSelectionPolicy,
+)
 from ncbi_dataset_builder.errors import GenomeSelectionError
-from ncbi_dataset_builder.genomes import GenomeCandidate, GenomeManager, GenomeSelectionPolicy
 from ncbi_dataset_builder.models import GenomeRef
-from ncbi_dataset_builder.progress import ProgressReporter
+from ncbi_dataset_builder.support.progress import ProgressReporter
 
 
 class FakeDatasetsRunner:

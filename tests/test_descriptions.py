@@ -5,7 +5,6 @@ import pytest
 from test_metadata import BIOSAMPLE_XML, SRA_XML, FakeEntrez
 
 from ncbi_dataset_builder import DescriptionPolicy, RunCatalog
-from ncbi_dataset_builder.descriptions import missing_legacy_values
 from ncbi_dataset_builder.metadata import (
     BioSampleClient,
     MetadataBundle,
@@ -72,32 +71,6 @@ def test_biology_aliases_placeholders_and_administrative_attributes():
         policy=DescriptionPolicy(extra_attributes={"unknown mechanism": "Mechanism"})
     )["SRS4739189"]
     assert custom["Mechanism"] == "novel state"
-
-
-def test_all_legacy_values_survive_even_nonbiological_fields():
-    bundle = example_bundle()
-    legacy = {
-        "ID": "SRS4739189",
-        "Class": "Actinopteri",
-        "Tissue": "[tissue] whole embryo",
-        "EO Accession": "GSM3756614",
-        "Abstract": "Historic abstract &amp; text",
-        "library preparation date": "2020-01-01 YYYY-MM-DD",
-        "Custom metadata": "Do not discard",
-        "old missing field": "not collected",
-    }
-    description = bundle.descriptions_by_sample(legacy_descriptions={"SRS4739189": legacy})[
-        "SRS4739189"
-    ]
-    assert missing_legacy_values(legacy, description) == []
-    assert description["Abstract"] == ["Historic abstract & text", "Text & design"]
-    assert "[tissue] whole embryo" in description["Tissue"]
-    assert "whole embryo" not in description["Tissue"]
-    assert description["GEO Accession"] == "GSM3756614"
-    assert "EO Accession" not in description
-    assert description["old missing field"] == "not collected"
-    with pytest.raises(ValueError, match="Legacy ID"):
-        bundle.descriptions_by_sample(legacy_descriptions={"SRS4739189": {"ID": "SRS000"}})
 
 
 def test_units_in_sra_xml_are_retained_in_compact_preparation_values():
