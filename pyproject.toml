@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ncbi-dataset-builder"
-version = "0.5.1"
-description = "Reproducible, resumable dataset construction from NCBI SRA, GEO, and Genome data"
+version = "0.1.0"
+description = "Workspace-first, sample-streaming dataset construction from NCBI data"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -27,7 +27,13 @@ ncbi-dataset = "ncbi_dataset_builder.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-packages = ["ncbi_dataset_builder", "ncbi_dataset_builder.processing"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["ncbi_dataset_builder*"]
+
+[tool.setuptools.package-data]
+ncbi_dataset_builder = ["README.md", "**/README.md"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
@@ -36,8 +42,3 @@ testpaths = ["tests"]
 [tool.ruff]
 target-version = "py310"
 line-length = 100
-exclude = [
-  "data",
-  "src/bam2bw.py",
-  "src/multispeciesATACseq_processing",
-]
