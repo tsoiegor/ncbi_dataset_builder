@@ -4,20 +4,20 @@ from __future__ import annotations
 
 import hashlib
 
-from ncbi_dataset_builder import FastqSet, GenomeRef, ProcessingResult
+from ncbi_dataset_builder import FastqSet, GenomeRef, ProcessingContext, ProcessingResult
 
 
 def process_sample(
     fastq: FastqSet,
     genome: GenomeRef,
-    threads: int,
+    context: ProcessingContext,
 ) -> ProcessingResult:
     """Hash sample input and write a reproducible text result.
 
     Args:
-        fastq: Validated local FASTQ paths and workspace directories.
+        fastq: Validated local FASTQ paths and acquisition provenance.
         genome: Selected local genome reference.
-        threads: CPUs assigned to this invocation.
+        context: Pipeline identity, directories, log, and assigned CPUs.
 
     Returns:
         A successful result declaring the non-empty text output.
@@ -31,18 +31,17 @@ def process_sample(
         with path.open("rb") as handle:
             while chunk := handle.read(1024 * 1024):
                 digest.update(chunk)
-    fastq.output_dir.mkdir(parents=True, exist_ok=True)
-    output = fastq.output_dir / f"{fastq.unit_id}.txt"
+    context.output_dir.mkdir(parents=True, exist_ok=True)
+    output = context.output_dir / f"{context.unit_id}.txt"
     output.write_text(
-        f"sample={fastq.unit_id}\n"
+        f"sample={context.unit_id}\n"
         f"assembly={genome.accession}\n"
-        f"threads={threads}\n"
+        f"threads={context.threads}\n"
         f"fastq_sha256={digest.hexdigest()}\n",
         encoding="utf-8",
     )
     return ProcessingResult(
         success=True,
-        outputs=(output,),
-        metrics={"input_files": len(inputs), "threads": threads},
+        outputs={"summary": output},
+        metrics={"input_files": len(inputs), "threads": context.threads},
     )
-

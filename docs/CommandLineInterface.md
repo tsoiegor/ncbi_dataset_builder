@@ -261,17 +261,27 @@ ncbi-dataset status \
 ncbi-dataset status \
   --workspace /data/ncbi-workspace \
   --execution-id execution-20260913T120000Z-abc123
+
+# Machine-readable form for scripts.
+ncbi-dataset status \
+  --workspace /data/ncbi-workspace \
+  --json
 ```
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--execution-id ID` | Latest written execution | Select exact execution snapshot |
+| `--json` | False | Print the complete structured report as JSON |
 
-Output is a Python mapping containing:
+The default output is a compact report containing:
 
-- `counts` for pending/submitted/running/succeeded/failed;
-- `units` with persisted state records; and
-- `execution_id`.
+- overall progress and counts for every state;
+- one row per experiment with phase, species, run count, genome, named outputs,
+  and attempt count;
+- downloaded-genome and cached-metadata totals; and
+- concise failure messages and log locations when attention is required.
+
+Use `--json` for the complete report, including persisted unit records.
 
 The command exits `0` after printing. It does not wait for running Slurm jobs.
 

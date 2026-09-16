@@ -61,13 +61,13 @@ class WorkspaceStore:
         "catalogs": "cached and selected run catalogs",
         "metadata": "normalized NCBI metadata",
         "metadata_cache": "reusable NCBI response cache",
-        "fastq": "bounded provider-owned sample inputs",
+        "fastq": "bounded provider-owned processing-unit inputs",
         "work": "processor and download intermediates",
-        "outputs": "processor outputs by sample",
-        "state": "durable per-sample state",
+        "outputs": "processor outputs by processing unit",
+        "state": "durable per-unit state",
         "executions": "automatic execution snapshots",
         "slurm": "generated scheduler scripts",
-        "logs": "sample and scheduler logs",
+        "logs": "processing-unit and scheduler logs",
     }
 
     def __init__(self, root: Path) -> None:
@@ -186,6 +186,7 @@ class WorkspaceStore:
         atomic_write_json(
             self.manifest_path,
             {
+                "schema_version": 2,
                 "updated_at": utc_timestamp(),
                 "latest_execution_id": execution.execution_id,
                 "group_by": execution.group_by,

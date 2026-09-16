@@ -8,6 +8,8 @@ from ncbi_dataset_builder import (
     QueuePolicy,
     RunCatalog,
 )
+from ncbi_dataset_builder.cli.main import _print_status
+from ncbi_dataset_builder.metadata import MetadataBundle
 from ncbi_dataset_builder.models import FastqLayout, FastqSet, GenomeRef, ProcessingResult
 
 
@@ -18,13 +20,10 @@ class FakeFastqProvider:
         read = root / "reads.fastq.gz"
         read.write_bytes(b"reads")
         return FastqSet(
-            unit_id=unit.unit_id,
             layout=FastqLayout.SINGLE,
             run_accessions=unit.run_accessions,
             single=(read,),
-            work_dir=root,
-            output_dir=destination.parent / "outputs" / unit.unit_id,
-            metadata={"download_threads": threads},
+            provider_metadata={"download_threads": threads},
         )
 
 
@@ -39,11 +38,15 @@ class FakeGenomeManager:
         return GenomeRef(taxid, scientific_name or "unknown", pin or "GCF_TEST", fasta, "sha")
 
 
-def processor(fastq, genome, cpus):
-    fastq.output_dir.mkdir(parents=True, exist_ok=True)
-    output = fastq.output_dir / f"{fastq.unit_id}.bw"
-    output.write_bytes(f"{genome.accession}:{cpus}".encode())
-    return ProcessingResult(True, outputs=(output,), metrics={"cpus": cpus})
+def processor(fastq, genome, context):
+    context.output_dir.mkdir(parents=True, exist_ok=True)
+    output = context.output_dir / f"{context.unit_id}.bw"
+    output.write_bytes(f"{genome.accession}:{context.threads}".encode())
+    return ProcessingResult(
+        True,
+        outputs={"coverage": output},
+        metrics={"cpus": context.threads},
+    )
 
 
 def catalog(*experiment_ids):
@@ -85,9 +88,18 @@ def test_local_sample_queue_builds_and_resumes(tmp_path):
     assert first.succeeded == 2
     assert first.failed == 0
     assert not (tmp_path / "fastq" / "SRX1").exists()
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 2
+    result = manifest["units"]["SRX1"]["state"]["result"]
+    assert set(result["processing"]["outputs"]) == {"coverage"}
+    assert result["output_files"]["coverage"]["path"].endswith("SRX1.bw")
     second = instance.build(catalog("SRX1", "SRX2"), processor, execution=execution, queue=queue)
     assert second.skipped == 2
     assert instance.status()["counts"]["succeeded"] == 2
+    assert [item["experiment_id"] for item in instance.status()["experiments"]] == [
+        "SRX1",
+        "SRX2",
+    ]
     assert list((tmp_path / "executions").glob("execution-*.json"))
 
 
@@ -128,3 +140,75 @@ def test_fetch_runs_uses_ncbi_client_and_catalog_cache(tmp_path):
     manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8")) if (tmp_path / "manifest.json").exists() else None
     assert manifest is None
 
+
+def test_enrich_metadata_fetches_only_missing_experiments(tmp_path):
+    class IncrementalSra:
+        def __init__(self):
+            self.calls = []
+
+        def fetch_packages(self, accessions, **kwargs):
+            self.calls.append((list(accessions), kwargs))
+            result = MetadataBundle()
+            for accession in accessions:
+                suffix = accession.removeprefix("SRX")
+                sample = f"SRS{suffix}"
+                biosample = f"SAMN{suffix}"
+                result.packages.append(
+                    {
+                        "accession": accession,
+                        "experiment_accession": accession,
+                        "sra_sample_accession": sample,
+                        "run_accessions": [f"SRR{suffix}"],
+                    }
+                )
+                result.experiments.append(
+                    {"accession": accession, "library": {"strategy": "ATAC-seq"}}
+                )
+                result.sra_samples.append(
+                    {
+                        "accession": sample,
+                        "biosample": biosample,
+                        "organism": "Homo sapiens",
+                    }
+                )
+                result.runs.append({"accession": f"SRR{suffix}"})
+            return result
+
+    class IncrementalBioSample:
+        def __init__(self):
+            self.calls = []
+
+        def fetch(self, accessions, **kwargs):
+            self.calls.append((list(accessions), kwargs))
+            return [{"accession": accession} for accession in accessions]
+
+    instance = builder(tmp_path)
+    instance.sra = IncrementalSra()
+    instance.biosample = IncrementalBioSample()
+
+    instance.enrich_metadata(catalog("SRX1"))
+    scoped = instance.enrich_metadata(
+        catalog("SRX1", "SRX2"), description_profile="full"
+    )
+
+    assert [call[0] for call in instance.sra.calls] == [["SRX1"], ["SRX2"]]
+    assert [row["accession"] for row in scoped.experiments] == ["SRX1", "SRX2"]
+    index = json.loads(
+        (tmp_path / "metadata" / "metadata_index.json").read_text(encoding="utf-8")
+    )
+    assert set(index["experiments"]) == {"SRX1", "SRX2"}
+    assert (tmp_path / "metadata" / "experiment_descriptions" / "SRX1.json").is_file()
+    assert (tmp_path / "metadata" / "experiment_descriptions" / "SRX2.json").is_file()
+
+
+def test_status_formatter_lists_every_experiment_and_inventory(tmp_path, capsys):
+    instance = builder(tmp_path)
+    instance.build(catalog("SRX1", "SRX2"), processor)
+
+    _print_status(instance.status())
+
+    output = capsys.readouterr().out
+    assert "Experiments: succeeded=2" in output
+    assert "All experiments" in output
+    assert "SRX1" in output and "SRX2" in output
+    assert "Metadata" in output and "Genomes" in output

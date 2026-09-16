@@ -13,7 +13,7 @@ class Provider:
         root.mkdir(parents=True, exist_ok=True)
         read = root / "reads.fastq.gz"
         read.write_bytes(b"reads")
-        return FastqSet(unit.unit_id, FastqLayout.SINGLE, unit.run_accessions, single=(read,))
+        return FastqSet(FastqLayout.SINGLE, unit.run_accessions, single=(read,))
 
 
 class Genomes:
@@ -27,11 +27,11 @@ class Genomes:
         return GenomeRef(taxid, scientific_name, pin or "GCF_TEST", fasta, "sha")
 
 
-def bigwig_processor(fastq, genome, cpus):
-    fastq.output_dir.mkdir(parents=True, exist_ok=True)
-    output = fastq.output_dir / f"{fastq.unit_id}.bw"
+def bigwig_processor(fastq, genome, context):
+    context.output_dir.mkdir(parents=True, exist_ok=True)
+    output = context.output_dir / f"{context.unit_id}.bw"
     output.write_bytes(b"bigwig")
-    return ProcessingResult(True, outputs=(output,))
+    return ProcessingResult(True, outputs={"coverage": output})
 
 
 def test_publish_completed_experiment_dataset(tmp_path):
@@ -68,4 +68,6 @@ def test_publish_completed_experiment_dataset(tmp_path):
     )
     assert description["Experiment ID"] == "SRX5809925"
     assert manifest["execution_id"] == report.execution_id
-
+    assert manifest["experiments"]["SRX5809925"]["outputs"]["coverage"] == (
+        "bigWig/SRX5809925.bw"
+    )

@@ -213,13 +213,13 @@ Require all five configured executables. Return version strings for fastp,
 Bowtie2, samtools, and bamCoverage. `bowtie2-build` is required but does not
 receive a separate version entry.
 
-## `__call__(fastq, genome, threads) -> ProcessingResult`
+## `__call__(fastq, genome, context) -> ProcessingResult`
 
 | Argument | Meaning |
 | --- | --- |
-| `fastq: FastqSet` | Validated inputs and unit-specific work/output paths. |
+| `fastq: FastqSet` | Validated FASTQ inputs and provider provenance. |
 | `genome: GenomeRef` | Selected reference FASTA and assembly identity. |
-| `threads: int` | Runtime CPU allocation forwarded to tools, with the fastp cap described above. |
+| `context: ProcessingContext` | Unit ID, CPU allocation, work/output directories, log path, and execution ID. |
 
 The method raises on invalid input, missing tools, command failures, or
 missing/empty produced files. `DatasetBuilder` converts such exceptions to
@@ -353,7 +353,7 @@ Then pass
 
 `default_atac_processor = AtacSeqProcessor()` is the shared default instance.
 
-`process_atac(fastq, genome, threads)` delegates to that instance. Its stable
+`process_atac(fastq, genome, context)` delegates to that instance. Its stable
 import path is:
 
 ```text

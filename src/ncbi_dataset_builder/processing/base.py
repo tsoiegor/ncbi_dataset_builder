@@ -3,14 +3,19 @@ from __future__ import annotations
 import importlib
 from typing import Protocol
 
-from ..models import FastqSet, GenomeRef, ProcessingResult
+from ..models import FastqSet, GenomeRef, ProcessingContext, ProcessingResult
 
 
 class Processor(Protocol):
-    """Protocol for assay processors that consume FASTQ, genome, and thread count."""
+    """Protocol for assay processors that consume biological inputs and pipeline context."""
 
-    def __call__(self, fastq: FastqSet, genome: GenomeRef, threads: int) -> ProcessingResult:
-        """Process *fastq* against *genome* using at most *threads* threads."""
+    def __call__(
+        self,
+        fastq: FastqSet,
+        genome: GenomeRef,
+        context: ProcessingContext,
+    ) -> ProcessingResult:
+        """Process *fastq* against *genome* within *context*."""
 
         ...
 

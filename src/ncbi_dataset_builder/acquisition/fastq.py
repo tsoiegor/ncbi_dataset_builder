@@ -817,17 +817,14 @@ class SraToolkitProvider:
             raise DownloadError(f"No usable FASTQ files for {unit.unit_id}")
         files = tuple(path for path in (read1, read2, single) if path is not None)
         result = FastqSet(
-            unit_id=unit.unit_id,
             layout=layout,
             run_accessions=unit.run_accessions,
             read1=(read1,) if read1 else (),
             read2=(read2,) if read2 else (),
             single=(single,) if single else (),
             source="sra",
-            work_dir=unit_root,
-            output_dir=destination.parent / "outputs" / safe_id,
             checksums={str(path): sha256_file(path, progress=self.progress) for path in files},
-            metadata={
+            provider_metadata={
                 "per_run_layout": {run: sorted(value) for run, value in by_run.items()}
             },
         )
@@ -965,15 +962,12 @@ class GeoFastqProvider:
             else FastqLayout.SINGLE
         )
         result = FastqSet(
-            unit_id=unit.unit_id,
             layout=layout,
             run_accessions=unit.run_accessions,
             read1=tuple(read1),
             read2=tuple(read2),
             single=tuple(sorted(single)),
             source="geo",
-            work_dir=root,
-            output_dir=destination.parent / "outputs" / safe_id,
             checksums={
                 str(path): sha256_file(path, progress=self.progress)
                 for path in (*read1, *read2, *single)

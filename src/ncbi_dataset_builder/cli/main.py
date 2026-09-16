@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 
@@ -120,9 +121,10 @@ def _parser() -> argparse.ArgumentParser:
     distributed.add_argument("--coordinator-memory-gb", type=float, default=4.0)
     distributed.add_argument("--coordinator-time-limit", default="7-00:00:00")
 
-    status = commands.add_parser("status", help="Show workspace sample status")
+    status = commands.add_parser("status", help="Show workspace experiment status")
     _add_builder_arguments(status)
     status.add_argument("--execution-id")
+    status.add_argument("--json", action="store_true", help="Print the structured status as JSON")
 
     publish = commands.add_parser("publish", help="Publish verified experiment outputs")
     _add_builder_arguments(publish)
@@ -175,6 +177,83 @@ def _quota(arguments: argparse.Namespace) -> QuotaStorage:
         reserve_gb=arguments.quota_reserve_gb,
         usage_root=arguments.quota_usage_root,
     )
+
+
+def _status_table(rows: list[list[str]], headers: list[str]) -> str:
+    """Return a compact, aligned plain-text table."""
+
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for index, value in enumerate(row):
+            widths[index] = min(36, max(widths[index], len(value)))
+
+    def render(row: list[str]) -> str:
+        """Align and truncate one table *row*."""
+
+        values = [value if len(value) <= widths[index] else value[: widths[index] - 1] + "…" for index, value in enumerate(row)]
+        return "  ".join(value.ljust(widths[index]) for index, value in enumerate(values)).rstrip()
+
+    return "\n".join((render(headers), render(["-" * width for width in widths]), *(render(row) for row in rows)))
+
+
+def _print_status(report: dict) -> None:
+    """Print a readable overview followed by every experiment in *report*."""
+
+    execution = report["execution"]
+    counts = report["counts"]
+    total = int(execution["total_experiments"])
+    finished = int(counts.get("succeeded", 0)) + int(counts.get("failed", 0))
+    percent = 100.0 if total == 0 else 100.0 * finished / total
+    print("NCBI dataset workspace status")
+    print(f"Execution : {report['execution_id']}")
+    print(f"Created   : {execution['created_at']}")
+    print(f"Mode      : {execution['type']} / grouped by {execution['group_by']}")
+    print(f"Progress  : {finished}/{total} finished ({percent:.1f}%)")
+    print(
+        "Experiments: "
+        + ", ".join(
+            f"{name}={counts.get(name, 0)}"
+            for name in ("succeeded", "running", "submitted", "pending", "failed")
+        )
+    )
+    genomes = report["genomes"]
+    print(
+        f"Genomes   : {genomes['downloaded']}/{genomes['registered']} downloaded and available"
+    )
+    print(f"Metadata  : {report['metadata']['cached_experiments']} experiments cached locally")
+
+    rows = []
+    for experiment in report["experiments"]:
+        genome = experiment["genome_accession"] or "-"
+        if genome != "-" and not experiment["genome_available"]:
+            genome += " (missing)"
+        rows.append(
+            [
+                str(experiment["experiment_id"]),
+                str(experiment["status"]),
+                str(experiment["phase"]),
+                str(experiment["species"] or "-"),
+                str(len(experiment["runs"])),
+                genome,
+                ", ".join(experiment["outputs"]) or "-",
+                str(experiment["attempts"]),
+            ]
+        )
+    print("\nAll experiments")
+    print(
+        _status_table(
+            rows,
+            ["EXPERIMENT", "STATUS", "PHASE", "SPECIES", "RUNS", "GENOME", "OUTPUTS", "TRIES"],
+        )
+    )
+
+    failed = [experiment for experiment in report["experiments"] if experiment["error"]]
+    if failed:
+        print("\nFailures")
+        for experiment in failed:
+            print(f"- {experiment['experiment_id']}: {experiment['error']}")
+            if experiment["log_path"]:
+                print(f"  log: {experiment['log_path']}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -247,7 +326,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     if arguments.command == "status":
-        print(builder.status(arguments.execution_id))
+        report = builder.status(arguments.execution_id)
+        if arguments.json:
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        else:
+            _print_status(report)
         return 0
     export = builder.publish_dataset(
         arguments.destination,

@@ -55,7 +55,7 @@ NCBI query or RunInfo CSV
 | `workspace.json` | Workspace | Stable grouping, description profile, genome policy, schema, and directory roles | No |
 | `manifest.json` | Workspace | Latest execution/unit summary and publication manifest | No |
 | `catalogs/` | Builder | Cached RunInfo query CSVs | No |
-| `metadata/` | Metadata layer | Normalized records and sample descriptions | No |
+| `metadata/` | Metadata layer | Normalized records, cache index, and experiment descriptions | No |
 | `metadata_cache/` | Entrez clients | Reusable raw NCBI responses | No |
 | `fastq/` | FASTQ provider | SRA archives, converted/merged FASTQs, and provider manifests | Yes, only declared unit roots |
 | `work/genome_cache/` | Genome manager | Downloaded genomes, lockfile, and indexes | No |
@@ -236,7 +236,7 @@ terminal unit state, the coordinator marks that unit failed.
 | Each experiment links exactly one SRA Sample | Description identity must be unambiguous |
 | Unit state is successful | Failed or pending data is not publishable |
 | Exactly one BigWig is declared | Compact manifest expects one coverage track per experiment |
-| Normalized metadata and sample description exist | Required for published descriptions |
+| Normalized metadata and experiment description exist | Required for published descriptions |
 | Genome taxonomy matches the unit | Prevents cross-species publication |
 
 Publication can use hard links or copies. `auto` attempts a hard link and

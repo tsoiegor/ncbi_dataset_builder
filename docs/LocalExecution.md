@@ -207,7 +207,7 @@ See [Storage](Storage.md#queuepolicy) for exact formulas and cleanup matrix.
 | Parameter | Required | Meaning | How to choose |
 | --- | --- | --- | --- |
 | `catalog` | Yes | Runs that will be deduplicated and grouped | Start with a small representative catalog |
-| `processor` | Yes | Direct callable or import string accepting `(fastq, genome, threads)` | Use the built-in ATAC callable or your tested processor |
+| `processor` | Yes | Direct callable or import string accepting `(fastq, genome, context)` | Use the built-in ATAC callable or your tested processor |
 | `execution` | No | Local resource policy | Pass explicitly; default is one-job `LocalExecution()` |
 | `queue` | No | Streaming and cleanup policy | Pass explicitly for a production run |
 | `group_by` | No | Per-call grouping override | Usually leave `None` and set `BuilderConfig.group_by` |

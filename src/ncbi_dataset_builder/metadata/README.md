@@ -168,12 +168,12 @@ package record. Unknown selections simply contribute no linked records.
 
 | Method | Arguments and result |
 | --- | --- |
-| `descriptions_by_sample(*, profile="training", policy=None, progress=None)` | Build description dictionaries keyed by SRA Sample accession. |
-| `save_sample_descriptions(directory, *, profile="training", policy=None, progress=None)` | Atomically write one `<sample>.json` file per description. |
-| `save(directory, *, description_profile="training", policy=None, progress=None)` | Write `metadata.json`, collection NDJSON files, and `sample_descriptions/`. |
+| `descriptions_by_experiment(*, profile="training", policy=None, progress=None)` | Build description dictionaries keyed by Experiment accession. |
+| `save_experiment_descriptions(directory, *, profile="training", policy=None, progress=None)` | Atomically write one `<experiment>.json` file per description. |
+| `save(directory, *, description_profile="training", policy=None, progress=None)` | Write `metadata.json`, collection NDJSON files, and `experiment_descriptions/`. |
 
 `profile="training"` uses the compact biological projection.
-`profile="full"` retains the normalized relationship-rich sample
+`profile="full"` retains the normalized relationship-rich Experiment
 description. Other values raise.
 
 ### `attach_to_runs(catalog) -> RunCatalog`
@@ -234,15 +234,15 @@ Return compact library, assay, and study fields keyed by Experiment accession.
 Repeated package relations must describe each experiment consistently or the
 function raises `ValueError`.
 
-The publisher uses this mapping when a sample-level description contains
-multiple experiment entries.
+The training description builder uses this mapping directly; publishing reads
+the already materialized Experiment JSON without reconstructing it.
 
 ### `training_descriptions(bundle, *, policy=None, progress=None) -> dict`
 
-Module-level implementation function that builds compact descriptions by SRA
-Sample. Identical repeated experiments collapse; fields shared across
-experiments appear once at sample level; varying fields remain under
-`Experiments`.
+Compatibility alias for experiment-keyed compact descriptions. The primary
+implementation is `training_descriptions_by_experiment(...)`; each result has
+an Experiment `ID`, `Experiment ID`, `SRA Sample ID`, and optional
+`BioSample ID`.
 
 # Composition functions
 
@@ -277,6 +277,14 @@ fetch_metadata_for_catalog(
 
 Fetch package metadata for accessions present in a `RunCatalog`, attach
 linked BioSamples, and scope the result to catalog experiments.
+
+`DatasetBuilder.enrich_metadata()` adds a durable entity-level layer around
+this function. It loads `metadata/metadata.json`, consults
+`metadata/metadata_index.json`, fetches only missing Experiments and linked
+BioSamples, merges them into the cumulative local bundle, and regenerates
+Experiment descriptions locally. Changing the description profile or policy
+does not require another NCBI request. `refresh=True` refetches every requested
+Experiment.
 
 ## Other public helpers
 

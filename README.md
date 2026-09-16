@@ -188,7 +188,7 @@ examples, configuration tables, and selection advice—is in
    or BioSample.
 4. The builder creates an immutable execution snapshot.
 5. The queue resolves a genome and stages SRA/GEO input for each unit.
-6. A processor receives `FastqSet`, `GenomeRef`, and the assigned CPU count.
+6. A processor receives `FastqSet`, `GenomeRef`, and a `ProcessingContext`.
 7. The processor returns a validated `ProcessingResult`.
 8. Unit state stores output paths, hashes, file metadata, genome provenance,
    FASTQ provenance, and the unit log path.
@@ -202,7 +202,7 @@ ncbi-workspace/
 ├── workspace.json       # Stable grouping and genome-selection semantics.
 ├── manifest.json        # Latest unit state and optional published dataset.
 ├── catalogs/            # Cached RunInfo query results.
-├── metadata/            # Normalized records and sample descriptions.
+├── metadata/            # Normalized records and experiment descriptions.
 ├── metadata_cache/      # Reusable raw NCBI responses.
 ├── genomes/             # Optional in-place published genome FASTAs.
 ├── fastq/               # Provider-owned staged inputs; cleanup may remove these.

@@ -4,7 +4,7 @@ from typing import ClassVar
 
 import pytest
 
-from ncbi_dataset_builder.models import FastqLayout, FastqSet, GenomeRef
+from ncbi_dataset_builder.models import FastqLayout, FastqSet, GenomeRef, ProcessingContext
 from ncbi_dataset_builder.processing.atac import (
     AtacIntermediateFiles,
     AtacSeqConfig,
@@ -59,24 +59,32 @@ class IndexingAtacProcessor(LightweightAtacProcessor):
         return prefix
 
 
+def context(tmp_path, unit_id="SRX1", threads=2):
+    return ProcessingContext(
+        unit_id=unit_id,
+        threads=threads,
+        work_dir=tmp_path / "work",
+        output_dir=tmp_path / "output",
+        log_path=tmp_path / "unit.log",
+        execution_id="execution-test",
+    )
+
+
 def test_default_atac_coverage_is_unstranded_and_outputs_are_validated(tmp_path):
     reads = tmp_path / "reads.fastq.gz"
     reads.write_bytes(b"reads")
     fasta = tmp_path / "genome.fna"
     fasta.write_text(">chr1\nACGT\n", encoding="utf-8")
     fastq = FastqSet(
-        "SRX1",
         FastqLayout.SINGLE,
         ("SRR1",),
         single=(reads,),
-        work_dir=tmp_path / "work",
-        output_dir=tmp_path / "output",
     )
     genome = GenomeRef(9606, "Homo sapiens", "GCF_TEST", fasta, "not-used")
-    result = LightweightAtacProcessor(runner=FakeRunner())(fastq, genome, 2)
+    result = LightweightAtacProcessor(runner=FakeRunner())(fastq, genome, context(tmp_path))
     assert result.success
-    assert (tmp_path / "output" / "SRX1.coverage.bw") in result.outputs
-    assert not any("forward" in path.name or "reverse" in path.name for path in result.outputs)
+    assert result.outputs["coverage"] == tmp_path / "output" / "SRX1.coverage.bw"
+    assert not any("forward" in role or "reverse" in role for role in result.outputs)
     assert not (tmp_path / "work" / "processing" / "atac" / "single.clean.fastq.gz").exists()
     assert not (tmp_path / "work" / "processing" / "atac" / "single.sorted.bam").exists()
 
@@ -89,12 +97,9 @@ def test_atac_intermediate_policy_can_retain_unit_work_files(tmp_path):
     fasta = tmp_path / "genome.fna"
     fasta.write_text(">chr1\nACGT\n", encoding="utf-8")
     fastq = FastqSet(
-        "SRX1",
         FastqLayout.SINGLE,
         ("SRR1",),
         single=(reads, second_reads),
-        work_dir=tmp_path / "work",
-        output_dir=tmp_path / "output",
     )
     genome = GenomeRef(9606, "Homo sapiens", "GCF_TEST", fasta, "not-used")
     config = AtacSeqConfig(
@@ -107,14 +112,16 @@ def test_atac_intermediate_policy_can_retain_unit_work_files(tmp_path):
         )
     )
 
-    result = LightweightAtacProcessor(config=config, runner=FakeRunner())(fastq, genome, 2)
+    result = LightweightAtacProcessor(config=config, runner=FakeRunner())(
+        fastq, genome, context(tmp_path)
+    )
     work = tmp_path / "work" / "processing" / "atac"
 
     assert (work / "single.clean.fastq.gz").is_file()
     assert (work / "single.sorted.bam").is_file()
     assert (work / "input.single.fastq.gz").is_file()
-    assert (work / "single.fastp.json") in result.outputs
-    assert (work / "single.fastp.html") in result.outputs
+    assert result.outputs["fastp_single_json"] == work / "single.fastp.json"
+    assert result.outputs["fastp_single_html"] == work / "single.fastp.html"
 
 
 def test_atac_policy_can_publish_bigwig_without_bam_or_reports(tmp_path):
@@ -123,12 +130,9 @@ def test_atac_policy_can_publish_bigwig_without_bam_or_reports(tmp_path):
     fasta = tmp_path / "genome.fna"
     fasta.write_text(">chr1\nACGT\n", encoding="utf-8")
     fastq = FastqSet(
-        "SRX1",
         FastqLayout.SINGLE,
         ("SRR1",),
         single=(reads,),
-        work_dir=tmp_path / "work",
-        output_dir=tmp_path / "output",
     )
     genome = GenomeRef(9606, "Homo sapiens", "GCF_TEST", fasta, "not-used")
     config = AtacSeqConfig(
@@ -140,9 +144,11 @@ def test_atac_policy_can_publish_bigwig_without_bam_or_reports(tmp_path):
         )
     )
 
-    result = LightweightAtacProcessor(config=config, runner=FakeRunner())(fastq, genome, 2)
+    result = LightweightAtacProcessor(config=config, runner=FakeRunner())(
+        fastq, genome, context(tmp_path)
+    )
 
-    assert [path.suffix for path in result.outputs] == [".bw"]
+    assert result.outputs == {"coverage": tmp_path / "output" / "SRX1.coverage.bw"}
     assert not (tmp_path / "output" / "SRX1.bam").exists()
     assert not (tmp_path / "output" / "SRX1.bam.csi").exists()
     assert not (tmp_path / "work" / "processing" / "atac" / "single.fastp.json").exists()
@@ -155,12 +161,9 @@ def test_atac_policy_can_remove_cached_index_and_materialized_genome(tmp_path):
     fasta = tmp_path / "genome.fna"
     fasta.write_text(">chr1\nACGT\n", encoding="utf-8")
     fastq = FastqSet(
-        "SRX1",
         FastqLayout.SINGLE,
         ("SRR1",),
         single=(reads,),
-        work_dir=tmp_path / "work",
-        output_dir=tmp_path / "output",
     )
     genome = GenomeRef(9606, "Homo sapiens", "GCF_TEST", fasta, "not-used")
     config = AtacSeqConfig(
@@ -170,7 +173,9 @@ def test_atac_policy_can_remove_cached_index_and_materialized_genome(tmp_path):
         )
     )
 
-    IndexingAtacProcessor(config=config, runner=FakeRunner())(fastq, genome, 2)
+    IndexingAtacProcessor(config=config, runner=FakeRunner())(
+        fastq, genome, context(tmp_path)
+    )
     index_dir = tmp_path / "indexes" / "GCF_TEST"
 
     assert not (index_dir / "GCF_TEST.fna").exists()
@@ -285,19 +290,16 @@ def test_strict_mixed_layout_aligns_only_paired_reads(tmp_path):
     fasta = tmp_path / "genome.fna"
     fasta.write_text(">chr1\nACGT\n", encoding="utf-8")
     fastq = FastqSet(
-        "SRX34494525",
         FastqLayout.MIXED,
         ("SRR1", "SRR2"),
         read1=(read1,),
         read2=(read2,),
         single=(single,),
-        work_dir=tmp_path / "work",
-        output_dir=tmp_path / "output",
     )
     genome = GenomeRef(9606, "Homo sapiens", "GCF_TEST", fasta, "not-used")
     processor = MixedAtacProcessor()
 
-    result = processor(fastq, genome, 2)
+    result = processor(fastq, genome, context(tmp_path, unit_id="SRX34494525"))
 
     assert processor.aligned == ["paired"]
     assert result.metrics["mixed_layout_defense"]["action"] == "excluded_single_end"

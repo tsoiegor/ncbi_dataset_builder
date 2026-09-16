@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from ...errors import ExternalToolError, ProcessingError
-from ...models import FastqLayout, FastqSet, GenomeRef, ProcessingResult
+from ...models import FastqLayout, FastqSet, GenomeRef, ProcessingContext, ProcessingResult
 from ...support.commands import CommandRunner
 from ...support.progress import ProgressReporter
 from ...support.unit_logging import current_unit_log_handle
@@ -578,18 +578,24 @@ class AtacSeqProcessor:
         os.replace(partial, output)
         return output
 
-    def __call__(self, fastq: FastqSet, genome: GenomeRef, threads: int) -> ProcessingResult:
-        """Process *fastq* against *genome* with *threads* and return validated outputs."""
+    def __call__(
+        self,
+        fastq: FastqSet,
+        genome: GenomeRef,
+        context: ProcessingContext,
+    ) -> ProcessingResult:
+        """Process *fastq* against *genome* within *context*."""
 
         fastq.validate()
         genome.validate()
-        self.progress.message(f"ATAC processing started: {fastq.unit_id}")
+        threads = context.threads
+        self.progress.message(f"ATAC processing started: {context.unit_id}")
         versions = self.preflight()
-        output_dir = fastq.output_dir
-        work = fastq.work_dir / "processing" / "atac"
+        output_dir = context.output_dir
+        work = context.work_dir / "processing" / "atac"
         output_dir.mkdir(parents=True, exist_ok=True)
         work.mkdir(parents=True, exist_ok=True)
-        safe_id = sanitize_identifier(fastq.unit_id)
+        safe_id = sanitize_identifier(context.unit_id)
         self.progress.message("Stage FASTQ inputs")
         staged1 = self._merge_inputs(fastq.read1, work / "input.R1.fastq.gz")
         staged2 = self._merge_inputs(fastq.read2, work / "input.R2.fastq.gz")
@@ -744,30 +750,39 @@ class AtacSeqProcessor:
         if not retention.keep_uncompressed_genome:
             self._remove_files((index_fasta,))
 
-        outputs: list[Path] = list(coverage_outputs)
+        outputs: dict[str, Path] = {}
         if retention.keep_final_bam:
-            outputs.insert(0, final_bam)
+            outputs["alignment_bam"] = final_bam
         if retention.keep_final_bam_index:
-            outputs.insert(1, final_index)
-        if retention.keep_fastp_json:
-            outputs.extend(json_reports)
-        if retention.keep_fastp_html:
-            outputs.extend(html_reports)
+            outputs["alignment_index"] = final_index
+        for strand, path in zip(coverage_modes, coverage_outputs, strict=True):
+            outputs["coverage" if strand is None else f"coverage_{strand}"] = path
+        for report in reports:
+            if report.suffix == ".json" and not retention.keep_fastp_json:
+                continue
+            if report.suffix == ".html" and not retention.keep_fastp_html:
+                continue
+            kind = report.name.split(".", 1)[0]
+            outputs[f"fastp_{kind}_{report.suffix.removeprefix('.')}"] = report
         result = ProcessingResult(
             success=True,
-            outputs=tuple(outputs),
+            outputs=outputs,
             metrics=metrics,
             tool_versions=versions,
         )
         result.validate()
-        self.progress.message(f"ATAC processing complete: {fastq.unit_id}")
+        self.progress.message(f"ATAC processing complete: {context.unit_id}")
         return result
 
 
 default_atac_processor = AtacSeqProcessor()
 
 
-def process_atac(fastq: FastqSet, genome: GenomeRef, threads: int) -> ProcessingResult:
-    """Run the default ATAC processor on *fastq* and *genome* with *threads*."""
+def process_atac(
+    fastq: FastqSet,
+    genome: GenomeRef,
+    context: ProcessingContext,
+) -> ProcessingResult:
+    """Run the default ATAC processor on *fastq* and *genome* within *context*."""
 
-    return default_atac_processor(fastq, genome, threads)
+    return default_atac_processor(fastq, genome, context)

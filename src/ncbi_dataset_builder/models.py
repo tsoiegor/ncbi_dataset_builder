@@ -66,33 +66,27 @@ class ProcessingUnit:
 
 @dataclass(frozen=True)
 class FastqSet:
-    """Hold local FASTQ files and provenance for one sample.
+    """Hold local FASTQ files and their acquisition provenance.
 
     Args:
-        unit_id: Processing-unit identifier.
         layout: Single, paired, or mixed read layout.
         run_accessions: Source SRA runs in merge order.
         read1: First-mate FASTQ paths.
         read2: Second-mate FASTQ paths matching :attr:`read1`.
         single: Single-end or orphan FASTQ paths.
         source: Provider label such as ``sra`` or ``geo``.
-        work_dir: Directory for processor intermediates.
-        output_dir: Directory for final processor outputs.
         checksums: SHA-256 values keyed by file path.
-        metadata: Provider-specific provenance.
+        provider_metadata: Provider-specific FASTQ provenance.
     """
 
-    unit_id: str
     layout: FastqLayout
     run_accessions: tuple[str, ...]
     read1: tuple[Path, ...] = ()
     read2: tuple[Path, ...] = ()
     single: tuple[Path, ...] = ()
     source: str = "sra"
-    work_dir: Path = Path(".")
-    output_dir: Path = Path(".")
     checksums: dict[str, str] = field(default_factory=dict)
-    metadata: dict[str, Any] = field(default_factory=dict)
+    provider_metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
         """Validate layout-specific file counts and require non-empty FASTQs."""
@@ -118,8 +112,6 @@ class FastqSet:
             "read1": [str(path) for path in self.read1],
             "read2": [str(path) for path in self.read2],
             "single": [str(path) for path in self.single],
-            "work_dir": str(self.work_dir),
-            "output_dir": str(self.output_dir),
         }
 
     @classmethod
@@ -127,17 +119,16 @@ class FastqSet:
         """Restore a FASTQ set from serialized mapping *value*."""
 
         return cls(
-            unit_id=value["unit_id"],
             layout=FastqLayout(value["layout"]),
             run_accessions=tuple(value.get("run_accessions", ())),
             read1=tuple(Path(item) for item in value.get("read1", ())),
             read2=tuple(Path(item) for item in value.get("read2", ())),
             single=tuple(Path(item) for item in value.get("single", ())),
             source=value.get("source", "sra"),
-            work_dir=Path(value.get("work_dir", ".")),
-            output_dir=Path(value.get("output_dir", ".")),
             checksums=dict(value.get("checksums", {})),
-            metadata=dict(value.get("metadata", {})),
+            provider_metadata=dict(
+                value.get("provider_metadata", value.get("metadata", {}))
+            ),
         )
 
 
@@ -230,19 +221,60 @@ class GenomeRef:
 
 
 @dataclass(frozen=True)
+class ProcessingContext:
+    """Describe the pipeline-owned environment for one processor invocation.
+
+    Args:
+        unit_id: Stable processing-unit identifier.
+        threads: Maximum CPUs assigned to the processor.
+        work_dir: Directory for recoverable processor intermediates.
+        output_dir: Directory for final processor artifacts.
+        log_path: Permanent unit log path.
+        execution_id: Execution snapshot that requested this invocation.
+    """
+
+    unit_id: str
+    threads: int
+    work_dir: Path
+    output_dir: Path
+    log_path: Path
+    execution_id: str
+
+    def __post_init__(self) -> None:
+        """Validate required identity and resource values."""
+
+        if not self.unit_id:
+            raise ValueError("Processing context requires a unit ID")
+        if self.threads < 1:
+            raise ValueError("Processing context threads must be positive")
+        if not self.execution_id:
+            raise ValueError("Processing context requires an execution ID")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize this processing context, converting paths to strings."""
+
+        return {
+            **asdict(self),
+            "work_dir": str(self.work_dir),
+            "output_dir": str(self.output_dir),
+            "log_path": str(self.log_path),
+        }
+
+
+@dataclass(frozen=True)
 class ProcessingResult:
     """Report the result of one processor call.
 
     Args:
         success: Whether processing completed successfully.
-        outputs: Declared final output paths.
+        outputs: Declared final output paths keyed by stable artifact role.
         metrics: Processor-defined quality or summary metrics.
         tool_versions: External tool versions used.
         message: Optional status or failure explanation.
     """
 
     success: bool
-    outputs: tuple[Path, ...] = ()
+    outputs: dict[str, Path] = field(default_factory=dict)
     metrics: dict[str, Any] = field(default_factory=dict)
     tool_versions: dict[str, str] = field(default_factory=dict)
     message: str | None = None
@@ -254,11 +286,21 @@ class ProcessingResult:
             raise ValueError(self.message or "Processor reported failure")
         if not self.outputs:
             raise ValueError("Processor reported success without outputs")
-        for path in self.outputs:
+        if any(not isinstance(role, str) or not role.strip() for role in self.outputs):
+            raise ValueError("Processor output roles must be non-empty strings")
+        paths = list(self.outputs.values())
+        if len({str(path) for path in paths}) != len(paths):
+            raise ValueError("Processor output paths must be unique")
+        for role, path in self.outputs.items():
+            if not isinstance(path, Path):
+                raise TypeError(f"Processor output {role!r} must be a pathlib.Path")
             if not path.is_file() or path.stat().st_size == 0:
-                raise ValueError(f"Processor output is missing or empty: {path}")
+                raise ValueError(f"Processor output {role!r} is missing or empty: {path}")
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize this processing result, converting paths to strings."""
 
-        return {**asdict(self), "outputs": [str(path) for path in self.outputs]}
+        return {
+            **asdict(self),
+            "outputs": {role: str(path) for role, path in self.outputs.items()},
+        }

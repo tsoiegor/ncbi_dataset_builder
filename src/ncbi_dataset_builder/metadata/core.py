@@ -20,7 +20,7 @@ from ..catalog import RunCatalog
 from ..errors import MetadataError
 from ..support.progress import ProgressReporter, get_progress
 from ..support.util import atomic_write_bytes, atomic_write_json, atomic_write_text, read_json
-from .descriptions import DescriptionPolicy, training_descriptions
+from .descriptions import DescriptionPolicy, training_descriptions_by_experiment
 from .http import HttpClient
 
 EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
@@ -598,16 +598,74 @@ class MetadataBundle:
             ],
         )
 
-    def descriptions_by_sample(
+    def complete_experiment_accessions(self, *, include_raw: bool = False) -> set[str]:
+        """Return complete Experiments, requiring raw records when *include_raw*."""
+
+        experiments = {row.get("accession"): row for row in self.experiments}
+        samples = {row.get("accession"): row for row in self.sra_samples}
+        biosamples = {row.get("accession"): row for row in self.biosamples}
+        complete: set[str] = set()
+        for relation in self.packages:
+            experiment_accession = relation.get("experiment_accession")
+            sample_accession = relation.get("sra_sample_accession")
+            experiment = experiments.get(experiment_accession)
+            sample = samples.get(sample_accession)
+            if not experiment_accession or experiment is None or sample is None:
+                continue
+            biosample_accession = sample.get("biosample")
+            biosample = biosamples.get(biosample_accession) if biosample_accession else None
+            if biosample_accession and biosample is None:
+                continue
+            if include_raw and (
+                "raw" not in experiment
+                or "raw" not in sample
+                or (biosample is not None and "raw" not in biosample)
+            ):
+                continue
+            complete.add(str(experiment_accession))
+        return complete
+
+    def merge_from(self, source: MetadataBundle) -> None:
+        """Upsert accession-keyed records from *source* into this bundle."""
+
+        for name in (
+            "packages",
+            "runs",
+            "experiments",
+            "sra_samples",
+            "studies",
+            "submissions",
+            "biosamples",
+        ):
+            records = getattr(self, name)
+            positions = {record.get("accession"): index for index, record in enumerate(records)}
+            for record in getattr(source, name):
+                accession = record.get("accession")
+                if accession in positions:
+                    records[positions[accession]] = record
+                else:
+                    positions[accession] = len(records)
+                    records.append(record)
+        seen_raw = {
+            json.dumps(record, ensure_ascii=False, sort_keys=True)
+            for record in self.raw_sra_packages
+        }
+        for record in source.raw_sra_packages:
+            serialized = json.dumps(record, ensure_ascii=False, sort_keys=True)
+            if serialized not in seen_raw:
+                seen_raw.add(serialized)
+                self.raw_sra_packages.append(record)
+
+    def descriptions_by_experiment(
         self,
         *,
         profile: str = "training",
         policy: DescriptionPolicy | None = None,
         progress: ProgressReporter | None = None,
     ) -> dict[str, dict[str, Any]]:
-        """Build per-sample descriptions using *profile*, *policy*, and *progress*."""
+        """Build per-Experiment descriptions using *profile*, *policy*, and *progress*."""
         if profile == "training":
-            return training_descriptions(
+            return training_descriptions_by_experiment(
                 self,
                 policy=policy,
                 progress=progress,
@@ -617,54 +675,48 @@ class MetadataBundle:
 
         descriptions: dict[str, dict[str, Any]] = {}
         reporter = get_progress(progress)
-        for sample in reporter.track(
-            self.sra_samples, "Build full sample descriptions", unit="samples"
+        indexes = {
+            name: {row.get("accession"): row for row in getattr(self, name)}
+            for name in (
+                "experiments",
+                "sra_samples",
+                "studies",
+                "submissions",
+                "runs",
+                "biosamples",
+            )
+        }
+        for relation in reporter.track(
+            self.packages, "Build full experiment descriptions", unit="experiments"
         ):
-            accession = sample.get("accession")
-            if not accession:
+            experiment_accession = relation.get("experiment_accession")
+            sample_accession = relation.get("sra_sample_accession")
+            if not experiment_accession or not sample_accession:
                 continue
-            relations = [
-                package
-                for package in self.packages
-                if package.get("sra_sample_accession") == accession
-            ]
-            experiments = self._selected(
-                self.experiments,
-                (relation.get("experiment_accession") for relation in relations),
-            )
-            studies = self._selected(
-                self.studies,
-                (relation.get("study_accession") for relation in relations),
-            )
-            submissions = self._selected(
-                self.submissions,
-                (relation.get("submission_accession") for relation in relations),
-            )
-            runs = self._selected(
-                self.runs,
-                (
-                    run_accession
-                    for relation in relations
-                    for run_accession in relation.get("run_accessions", [])
-                ),
-            )
-            linked_biosample = next(
-                (
-                    record
-                    for record in self.biosamples
-                    if record.get("accession") == sample.get("biosample")
-                ),
-                None,
-            )
-            descriptions[str(accession)] = {
+            sample = indexes["sra_samples"].get(sample_accession)
+            if sample is None:
+                raise ValueError(
+                    f"Experiment {experiment_accession} links missing SRA Sample {sample_accession}"
+                )
+            description = {
                 "schema_version": "1.0",
+                "ID": experiment_accession,
+                "experiment_id": experiment_accession,
+                "sra_sample_id": sample_accession,
+                "biosample_id": sample.get("biosample"),
+                "experiment": indexes["experiments"].get(experiment_accession),
                 "sra_sample": sample,
-                "biosample": linked_biosample,
-                "experiments": experiments,
-                "studies": studies,
-                "submissions": submissions,
-                "runs": runs,
-                "package_relations": relations,
+                "biosample": indexes["biosamples"].get(sample.get("biosample")),
+                "study": indexes["studies"].get(relation.get("study_accession")),
+                "submission": indexes["submissions"].get(
+                    relation.get("submission_accession")
+                ),
+                "runs": [
+                    indexes["runs"][accession]
+                    for accession in relation.get("run_accessions", [])
+                    if accession in indexes["runs"]
+                ],
+                "package_relation": relation,
                 "provenance": {
                     "sources": [
                         "NCBI SRA Experiment Package XML",
@@ -673,9 +725,13 @@ class MetadataBundle:
                     "presentation_html_parsed": False,
                 },
             }
+            previous = descriptions.get(experiment_accession)
+            if previous is not None and previous != description:
+                raise ValueError(f"Conflicting metadata for Experiment {experiment_accession}")
+            descriptions[experiment_accession] = description
         return descriptions
 
-    def save_sample_descriptions(
+    def save_experiment_descriptions(
         self,
         directory: Path,
         *,
@@ -683,11 +739,11 @@ class MetadataBundle:
         policy: DescriptionPolicy | None = None,
         progress: ProgressReporter | None = None,
     ) -> None:
-        """Write descriptions below *directory* using *profile*, *policy*, and *progress*."""
+        """Write Experiment JSON to *directory* using *profile*, *policy*, and *progress*."""
 
         directory.mkdir(parents=True, exist_ok=True)
         reporter = get_progress(progress)
-        descriptions = self.descriptions_by_sample(
+        descriptions = self.descriptions_by_experiment(
             profile=profile,
             policy=policy,
             progress=reporter,
@@ -695,13 +751,15 @@ class MetadataBundle:
         written = 0
         unchanged = 0
         for accession, description in reporter.track(
-            descriptions.items(), "Save sample descriptions", unit="samples"
+            descriptions.items(), "Save experiment descriptions", unit="experiments"
         ):
             if atomic_write_json(directory / f"{accession}.json", description):
                 written += 1
             else:
                 unchanged += 1
-        reporter.message(f"Sample description files: {unchanged:,} unchanged; {written:,} written")
+        reporter.message(
+            f"Experiment description files: {unchanged:,} unchanged; {written:,} written"
+        )
 
     def save(
         self,
@@ -711,7 +769,7 @@ class MetadataBundle:
         policy: DescriptionPolicy | None = None,
         progress: ProgressReporter | None = None,
     ) -> None:
-        """Persist complete metadata and selected per-sample descriptions.
+        """Persist complete metadata and selected per-Experiment descriptions.
 
         *directory* receives normalized JSON/NDJSON. *description_profile* and
         *policy* control compact files, and *progress* reports writes.
@@ -739,8 +797,8 @@ class MetadataBundle:
                     json.dumps(row, ensure_ascii=False, sort_keys=True) for row in rows
                 )
                 atomic_write_text(directory / f"{name}.ndjson", text + "\n")
-        self.save_sample_descriptions(
-            directory / "sample_descriptions",
+        self.save_experiment_descriptions(
+            directory / "experiment_descriptions",
             profile=description_profile,
             policy=policy,
             progress=reporter,

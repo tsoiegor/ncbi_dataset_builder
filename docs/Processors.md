@@ -21,20 +21,20 @@ outputs, metrics, and tool versions.
 from pathlib import Path
 import subprocess
 
-from ncbi_dataset_builder import FastqSet, GenomeRef, ProcessingResult
+from ncbi_dataset_builder import FastqSet, GenomeRef, ProcessingContext, ProcessingResult
 
 
 def process_sample(
     fastq: FastqSet,
     genome: GenomeRef,
-    threads: int,
+    context: ProcessingContext,
 ) -> ProcessingResult:
     """Process one prepared unit.
 
     Args:
-        fastq: Validated local input paths plus package-owned work/output roots.
+        fastq: Validated local FASTQ paths and acquisition provenance.
         genome: Selected local reference and its provenance.
-        threads: CPU budget selected for this invocation.
+        context: Unit identity, directories, log, execution, and CPU budget.
     """
 
     # Fail before expensive commands if inputs are missing or inconsistent.
@@ -42,12 +42,12 @@ def process_sample(
     genome.validate()
 
     # Recoverable intermediates belong below work_dir.
-    work = fastq.work_dir / "my_processor"
+    work = context.work_dir / "my_processor"
     work.mkdir(parents=True, exist_ok=True)
 
     # Final reusable artifacts belong below output_dir.
-    fastq.output_dir.mkdir(parents=True, exist_ok=True)
-    output = fastq.output_dir / f"{fastq.unit_id}.result.txt"
+    context.output_dir.mkdir(parents=True, exist_ok=True)
+    output = context.output_dir / f"{context.unit_id}.result.txt"
     partial = output.with_name(output.name + ".part")
 
     # Pass the assigned CPU budget to tools that support it.
@@ -55,7 +55,7 @@ def process_sample(
         [
             "my-tool",
             "--threads",
-            str(threads),
+            str(context.threads),
             "--genome",
             str(genome.fasta),
             "--output",
@@ -70,7 +70,7 @@ def process_sample(
 
     result = ProcessingResult(
         success=True,
-        outputs=(output,),
+        outputs={"result": output},
         metrics={"input_layout": fastq.layout.value},
         tool_versions={"my-tool": "1.0"},
     )
@@ -82,25 +82,22 @@ def process_sample(
 
 | Argument | Meaning | Processor responsibility |
 | --- | --- | --- |
-| `fastq: FastqSet` | Local input paths, layout, provenance, and unit-specific directories | Validate and obey layout/path ownership |
+| `fastq: FastqSet` | Local input paths, layout, and acquisition provenance | Validate and obey layout |
 | `genome: GenomeRef` | Selected FASTA, accession, taxonomy, checksum, and rationale | Validate; build/reuse indexes safely |
-| `threads: int` | CPUs allocated at this launch | Treat as an upper budget and pass to tools deliberately |
+| `context: ProcessingContext` | Unit identity, work/output paths, log, execution ID, and CPUs | Use owned paths and treat `threads` as an upper budget |
 
 ## `FastqSet` fields
 
 | Field | Meaning |
 | --- | --- |
-| `unit_id` | Stable processing-unit identifier |
 | `layout` | `FastqLayout.SINGLE`, `PAIRED`, or `MIXED` |
 | `run_accessions` | Source runs in merge order |
 | `read1` | First-mate paths |
 | `read2` | Matching second-mate paths |
 | `single` | Single-end or orphan paths |
 | `source` | Provider label such as `sra` or `geo` |
-| `work_dir` | Package-owned unit work root |
-| `output_dir` | Package-owned unit final-output root |
 | `checksums` | Provider checksums keyed by path where available |
-| `metadata` | Provider provenance, including unit log path |
+| `provider_metadata` | FASTQ-provider provenance |
 
 ### Layout restrictions
 
@@ -134,7 +131,7 @@ example.
 | Parameter | Default | Meaning | Restriction |
 | --- | --- | --- | --- |
 | `success: bool` | Required | Whether scientific processing succeeded | Must be `True` for builder success |
-| `outputs: tuple[Path, ...]` | Empty | Final files required for reuse | At least one; every path must exist and be non-empty |
+| `outputs: dict[str, Path]` | Empty | Final files keyed by stable artifact role | Non-empty unique roles and paths; every path must exist and be non-empty |
 | `metrics: dict` | Empty | Compact structured QC/summary values | Must be JSON-serializable for state |
 | `tool_versions: dict[str, str]` | Empty | Executable/software versions | Prefer actual reported versions |
 | `message: str \| None` | `None` | Failure/status explanation | Used when `success=False` |
@@ -146,8 +143,8 @@ for every declared output.
 
 | Location | Put here | Restart behavior |
 | --- | --- | --- |
-| `fastq.work_dir` | Intermediates that can be recreated | May be reset before rebuilt processing |
-| `fastq.output_dir` | Final processor outputs | May be reset when the unit must rebuild |
+| `context.work_dir` | Intermediates that can be recreated | May be reset before rebuilt processing |
+| `context.output_dir` | Final processor outputs | May be reset when the unit must rebuild |
 | Original `fastq.read*` paths | Provider-owned input | Do not delete from processor |
 | Genome cache/index area | Shared reference artifacts | Use locks and complete-file validation |
 | Arbitrary external path | Avoid | Builder cannot safely manage/reuse it |
@@ -157,7 +154,7 @@ that appears complete.
 
 ## CPU behavior by execution mode
 
-| Mode | How `threads` is chosen |
+| Mode | How `context.threads` is chosen |
 | --- | --- |
 | Local | Dynamic launch allocation between configured minimum/maximum |
 | Single-node Slurm | Same dynamic allocation inside one Slurm CPU pool |

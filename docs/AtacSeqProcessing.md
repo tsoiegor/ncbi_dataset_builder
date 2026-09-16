@@ -110,10 +110,10 @@ fastp, Bowtie2, samtools, and bamCoverage.
 
 ### Coverage/publication restriction
 
-`coverage_strands=("forward", "reverse")` creates two BigWigs. Compact
-`publish_dataset()` requires exactly one BigWig per experiment and will reject
-that result. Keep `coverage_strands=()` for one unstranded publication track,
-or publish/manage multi-track outputs outside that compact publisher.
+`coverage_strands=("forward", "reverse")` creates two named coverage outputs.
+Compact `publish_dataset()` requires the single `coverage` role and rejects
+strand-specific coverage roles. Keep `coverage_strands=()` for one unstranded
+publication track, or manage multi-track outputs outside that publisher.
 
 ## Commands and fixed options
 
@@ -235,8 +235,9 @@ BigWigs are always retained and declared.
 | Paired reports | `paired.fastp.json`, `paired.fastp.html` |
 | Single reports | `single.fastp.json`, `single.fastp.html` |
 
-With default retention, `ProcessingResult.outputs` contains final BAM, CSI,
-every BigWig, and fastp JSON/HTML reports.
+With default retention, `ProcessingResult.outputs` maps stable roles such as
+`alignment_bam`, `alignment_index`, and `coverage` to the corresponding files,
+along with named fastp JSON/HTML report roles.
 
 ## Metrics
 

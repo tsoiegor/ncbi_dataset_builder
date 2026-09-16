@@ -27,15 +27,15 @@ callable implements:
 __call__(
     fastq: FastqSet,
     genome: GenomeRef,
-    threads: int,
+    context: ProcessingContext,
 ) -> ProcessingResult
 ```
 
 | Argument | Meaning |
 | --- | --- |
-| `fastq` | Validated single, paired, or mixed local inputs plus unit-specific work and output directories. |
+| `fastq` | Validated single, paired, or mixed local FASTQ inputs and provenance. |
 | `genome` | Checksum-validated local reference selected for the unit’s taxonomy ID. |
-| `threads` | CPUs assigned at launch. Respect this value; it can differ between units. |
+| `context` | Unit identity, execution-owned paths, log, execution ID, and CPUs assigned at launch. |
 | Return | A `ProcessingResult` whose declared output files exist and are non-empty. |
 
 Runtime inheritance from `Processor` is unnecessary. Functions, callable
@@ -46,9 +46,9 @@ instances, and importable callable objects all work.
 1. Call `fastq.validate()` and `genome.validate()` before expensive work.
 2. Read inputs from `fastq.read1`, `read2`, and `single` according to
    `fastq.layout`.
-3. Put recoverable intermediates below `fastq.work_dir`.
-4. Put final artifacts below `fastq.output_dir`.
-5. Use `threads` as the processor’s CPU budget.
+3. Put recoverable intermediates below `context.work_dir`.
+4. Put final artifacts below `context.output_dir`.
+5. Use `context.threads` as the processor’s CPU budget.
 6. Publish files atomically when possible; a partial file must not look final.
 7. Return success only after validating the artifacts.
 8. Declare every artifact required for reuse in `ProcessingResult.outputs`.
@@ -79,13 +79,13 @@ the object on a compute node.
 ```python
 from pathlib import Path
 
-from ncbi_dataset_builder import FastqSet, GenomeRef, ProcessingResult
+from ncbi_dataset_builder import FastqSet, GenomeRef, ProcessingContext, ProcessingResult
 
 
 def process_sample(
     fastq: FastqSet,
     genome: GenomeRef,
-    threads: int,
+    context: ProcessingContext,
 ) -> ProcessingResult:
     """Write one small final artifact for a processing unit."""
 
@@ -94,21 +94,21 @@ def process_sample(
     genome.validate()
 
     # The builder owns this unit-specific output path.
-    fastq.output_dir.mkdir(parents=True, exist_ok=True)
-    output: Path = fastq.output_dir / f"{fastq.unit_id}.summary.txt"
+    context.output_dir.mkdir(parents=True, exist_ok=True)
+    output: Path = context.output_dir / f"{context.unit_id}.summary.txt"
 
-    # A real processor would pass `threads` to its external commands.
+    # A real processor would pass `context.threads` to its external commands.
     output.write_text(
-        f"unit={fastq.unit_id}\n"
+        f"unit={context.unit_id}\n"
         f"assembly={genome.accession}\n"
-        f"cpus={threads}\n",
+        f"cpus={context.threads}\n",
         encoding="utf-8",
     )
 
     # Declared outputs define a reusable success.
     return ProcessingResult(
         success=True,
-        outputs=(output,),
+        outputs={"summary": output},
         metrics={
             "input_fastq_files": (
                 len(fastq.read1) + len(fastq.read2) + len(fastq.single)

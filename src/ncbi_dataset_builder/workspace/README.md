@@ -28,7 +28,7 @@ temporary directory. The same layout is used by all three
 | `descriptions/` | In-place published experiment descriptions |
 | `genomes/` | Genome FASTAs, assembly lockfile, reusable indexes, and in-place published genomes |
 | `catalogs/` | Cached and selected RunInfo tables |
-| `metadata/` | Normalized metadata and sample descriptions |
+| `metadata/` | Normalized metadata, cache index, and experiment descriptions |
 | `metadata_cache/` | Raw reusable NCBI responses |
 | `fastq/` | Provider-owned bounded input; queue cleanup is allowed only below this boundary |
 | `work/` | Processor/download intermediates and publication staging |
@@ -189,14 +189,14 @@ Publication validates all of these before finalizing:
 2. each unit represents exactly one experiment matching its unit ID;
 3. each experiment links exactly one SRA Sample;
 4. unit state is `"succeeded"`;
-5. declared processing outputs contain exactly one BigWig;
-6. normalized metadata and the sample description exist;
+5. declared processing outputs contain the `coverage` role;
+6. normalized metadata and the experiment description exist;
 7. persisted genome taxonomy matches the processing unit;
 8. species filename collisions do not refer to different assemblies; and
 9. published genome gzip data is readable and begins with a FASTA header.
 
-The publisher derives experiment-specific description fields when a sample
-description originally contained several experiment entries.
+The publisher reads the experiment-keyed description written during metadata
+enrichment; publication does not reshape sample-level metadata.
 
 ## Published layout
 

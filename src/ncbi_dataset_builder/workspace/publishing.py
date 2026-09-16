@@ -8,8 +8,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from ..metadata.descriptions import training_fields_by_experiment
-from ..metadata import MetadataBundle
 from ..support.progress import ProgressReporter, get_progress
 from ..execution.records import ExecutionRecord
 from ..execution.state import UnitStateStore
@@ -56,9 +54,6 @@ class DatasetPublisher:
         self.workspace = Path(workspace)
         self.progress = get_progress(progress)
         self.state = UnitStateStore(self.workspace / "state" / "units")
-        self._metadata: MetadataBundle | None = None
-        self._generated_training: dict[str, dict[str, Any]] | None = None
-        self._experiment_fields: dict[str, dict[str, Any]] | None = None
 
     @staticmethod
     def _remove_path(path: Path) -> None:
@@ -114,10 +109,24 @@ class DatasetPublisher:
 
     @staticmethod
     def _processing_bigwig(state: dict[str, Any], experiment_id: str) -> Path:
-        """Return the unique BigWig output in *state* for *experiment_id*."""
+        """Return the named coverage output in *state* for *experiment_id*."""
 
         outputs = state.get("result", {}).get("processing", {}).get("outputs", [])
-        bigwigs = [Path(item) for item in outputs if str(item).lower().endswith((".bw", ".bigwig"))]
+        if isinstance(outputs, dict):
+            candidates = {
+                role: Path(str(value.get("path") if isinstance(value, dict) else value))
+                for role, value in outputs.items()
+                if role == "coverage" or role.startswith("coverage_")
+            }
+            if "coverage" in candidates:
+                return candidates["coverage"]
+            bigwigs = list(candidates.values())
+        else:
+            bigwigs = [
+                Path(item)
+                for item in outputs
+                if str(item).lower().endswith((".bw", ".bigwig"))
+            ]
         if len(bigwigs) != 1:
             raise ValueError(
                 f"Experiment {experiment_id} must have exactly one BigWig output; "
@@ -125,54 +134,25 @@ class DatasetPublisher:
             )
         return bigwigs[0]
 
-    def _load_metadata(self) -> MetadataBundle:
-        """Load and process-cache the workspace's normalized metadata bundle."""
+    def _description(self, experiment_id: str) -> dict[str, Any]:
+        """Load the description already materialized for *experiment_id*."""
 
-        if self._metadata is None:
-            metadata_path = self.workspace / "metadata" / "metadata.json"
-            if not metadata_path.is_file():
-                raise FileNotFoundError(
-                    f"Experiment-specific publishing requires normalized metadata: {metadata_path}"
-                )
-            self._metadata = MetadataBundle.load(metadata_path, progress=self.progress)
-        return self._metadata
-
-    def _description(self, sample_id: str, experiment_id: str) -> dict[str, Any]:
-        """Load *sample_id* training metadata and bind it to *experiment_id*."""
-
-        source = self.workspace / "metadata" / "sample_descriptions" / f"{sample_id}.json"
+        source = (
+            self.workspace
+            / "metadata"
+            / "experiment_descriptions"
+            / f"{experiment_id}.json"
+        )
         if not source.is_file():
-            raise FileNotFoundError(f"Sample description is missing: {source}")
+            raise FileNotFoundError(f"Experiment description is missing: {source}")
         description = read_json(source)
         if not isinstance(description, dict):
-            raise TypeError(f"Sample description is not a JSON object: {source}")
-        if "sra_sample" in description and "package_relations" in description:
-            if self._generated_training is None:
-                self._generated_training = self._load_metadata().descriptions_by_sample(
-                    profile="training",
-                    progress=self.progress,
-                )
-            generated = self._generated_training.get(sample_id)
-            if generated is None:
-                raise ValueError(f"Normalized metadata has no SRA Sample {sample_id}")
-            description = dict(generated)
+            raise TypeError(f"Experiment description is not a JSON object: {source}")
         existing_id = description.get("ID")
-        if existing_id not in (None, sample_id):
+        if existing_id != experiment_id:
             raise ValueError(
-                f"Description {source} has ID {existing_id!r}, expected {sample_id!r}"
+                f"Description {source} has ID {existing_id!r}, expected {experiment_id!r}"
             )
-        if "Experiments" in description:
-            if self._experiment_fields is None:
-                self._experiment_fields = training_fields_by_experiment(self._load_metadata())
-            fields = self._experiment_fields.get(experiment_id)
-            if fields is None:
-                raise ValueError(
-                    f"Normalized metadata has no package relationship for {experiment_id}"
-                )
-            description.pop("Experiments")
-            description.update(fields)
-        description["ID"] = sample_id
-        description["Experiment ID"] = experiment_id
         return description
 
     def publish(
@@ -232,7 +212,7 @@ class DatasetPublisher:
 
                 sample_id = samples[0]
                 description_target = staging / "descriptions" / f"{experiment_id}.json"
-                atomic_write_json(description_target, self._description(sample_id, experiment_id))
+                atomic_write_json(description_target, self._description(experiment_id))
 
                 genome = state.get("result", {}).get("genome")
                 if not isinstance(genome, dict):
@@ -278,9 +258,11 @@ class DatasetPublisher:
                     "species": species,
                     "taxid": item.unit.taxid,
                     "assembly_accession": genome.get("accession"),
-                    "bigwig": f"bigWig/{bigwig_target.name}",
-                    "description": f"descriptions/{description_target.name}",
-                    "genome": f"genomes/{species_filename}",
+                    "outputs": {
+                        "coverage": f"bigWig/{bigwig_target.name}",
+                        "description": f"descriptions/{description_target.name}",
+                        "genome": f"genomes/{species_filename}",
+                    },
                     "bigwig_sha256": sha256_file(bigwig_target, progress=self.progress),
                     "description_sha256": sha256_file(
                         description_target, progress=self.progress
@@ -290,7 +272,7 @@ class DatasetPublisher:
                     "publish_method": bigwig_method,
                 }
             manifest = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "execution_id": execution.execution_id,
                 "group_by": execution.group_by,
                 "experiments": records,

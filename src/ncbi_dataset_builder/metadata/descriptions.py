@@ -286,18 +286,13 @@ def training_fields_by_experiment(
     return descriptions
 
 
-def training_descriptions(
+def training_descriptions_by_experiment(
     bundle: MetadataBundle,
     *,
     policy: DescriptionPolicy | None = None,
     progress: ProgressReporter | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Build compact descriptions from *bundle* using *policy* and *progress*.
-
-    Repeated experiments with identical retained descriptions collapse. Shared
-    fields appear once at sample level; varying fields stay in Experiments so
-    strategy, library protocol and study relationships cannot be mixed.
-    """
+    """Build descriptions from *bundle* using *policy* and *progress*, keyed by Experiment."""
 
     from ..support.progress import get_progress
 
@@ -307,44 +302,38 @@ def training_descriptions(
         name: {row["accession"]: row for row in getattr(bundle, name)}
         for name in ("experiments", "studies", "submissions", "biosamples")
     }
-    relations: dict[str, list[dict[str, Any]]] = {}
-    for package in bundle.packages:
-        relations.setdefault(package.get("sra_sample_accession"), []).append(package)
-    descriptions = {}
-    for sample in reporter.track(bundle.sra_samples, "Build training descriptions", unit="samples"):
-        accession = sample["accession"]
-        output: dict[str, Any] = {"ID": accession}
+    samples = {row["accession"]: row for row in bundle.sra_samples}
+    descriptions: dict[str, dict[str, Any]] = {}
+    for relation in reporter.track(
+        bundle.packages,
+        "Build training descriptions",
+        unit="experiments",
+    ):
+        experiment_accession = relation.get("experiment_accession")
+        sample_accession = relation.get("sra_sample_accession")
+        if not experiment_accession or not sample_accession:
+            continue
+        sample = samples.get(sample_accession, {})
+        output: dict[str, Any] = {
+            "ID": experiment_accession,
+            "Experiment ID": experiment_accession,
+            "SRA Sample ID": sample_accession,
+        }
         _add(output, "Species", sample.get("organism"))
         biosample = indexes["biosamples"].get(sample.get("biosample"), {})
+        if sample.get("biosample"):
+            output["BioSample ID"] = sample["biosample"]
         _sample_attributes(biosample, output, policy)
         _sample_attributes(sample, output, policy)
         _add(output, "Sample description", biosample.get("comment"))
-
-        experiment_rows = []
-        for relation in relations.get(accession, []):
-            experiment = indexes["experiments"].get(relation.get("experiment_accession"), {})
-            study = indexes["studies"].get(relation.get("study_accession"), {})
-            submission = indexes["submissions"].get(relation.get("submission_accession"), {})
-            row = _experiment_description(experiment, study, submission, policy)
-            if row not in experiment_rows:
-                experiment_rows.append(row)
-        if experiment_rows:
-            shared = {
-                key: value
-                for key, value in experiment_rows[0].items()
-                if all(
-                    key in row and _comparison(row[key]) == _comparison(value)
-                    for row in experiment_rows[1:]
-                )
-            }
-            for key, value in shared.items():
-                _add(output, key, value, keep_missing=True)
-            variants = [
-                {key: value for key, value in row.items() if key not in shared}
-                for row in experiment_rows
-            ]
-            if len(variants) > 1:
-                output["Experiments"] = variants
+        output.update(
+            _experiment_description(
+                indexes["experiments"].get(experiment_accession, {}),
+                indexes["studies"].get(relation.get("study_accession"), {}),
+                indexes["submissions"].get(relation.get("submission_accession"), {}),
+                policy,
+            )
+        )
 
         # Remove a redundant source label already represented by Tissue.
         source = output.get("Source name")
@@ -360,5 +349,21 @@ def training_descriptions(
             )
         ):
             del output["Source name"]
-        descriptions[accession] = output
+        previous = descriptions.get(experiment_accession)
+        if previous is not None and previous != output:
+            raise ValueError(
+                f"Conflicting compact metadata for Experiment {experiment_accession}"
+            )
+        descriptions[experiment_accession] = output
     return descriptions
+
+
+def training_descriptions(
+    bundle: MetadataBundle,
+    *,
+    policy: DescriptionPolicy | None = None,
+    progress: ProgressReporter | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Return experiment descriptions for *bundle* using *policy* and *progress*."""
+
+    return training_descriptions_by_experiment(bundle, policy=policy, progress=progress)

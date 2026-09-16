@@ -205,7 +205,7 @@ an ordinary server; the default execution is `LocalExecution()`.
 | Argument | Meaning |
 | --- | --- |
 | `catalog: RunCatalog` | Source runs. The builder deduplicates and groups them. |
-| `processor: Processor | str` | Callable or importable `"package.module:object"` accepting `(fastq, genome, cpus)`. |
+| `processor: Processor | str` | Callable or importable `"package.module:object"` accepting `(fastq, genome, context)`. |
 | `execution: LocalExecution | None` | CPU, concurrency, and local free-space settings. |
 | `queue: QueuePolicy | None` | Download concurrency, in-flight storage, cleanup, and log durability. |
 | `group_by` | Optional override of the builder’s grouping level for this execution. |
@@ -256,7 +256,7 @@ visibility and resource differences.
 
 | Method | Arguments and result |
 | --- | --- |
-| `status(execution_id=None)` | Load the named or latest execution and return its ID, status counts, and per-unit state. |
+| `status(execution_id=None)` | Return execution metadata, status counts, every experiment, genome inventory, metadata-cache count, and raw unit state. |
 | `publish_dataset(destination=None, *, execution_id=None, mode="auto", overwrite=False)` | Publish verified experiment BigWigs, descriptions, and genomes; return `DatasetExport`. See the [workspace API](workspace/README.md). |
 
 ## `UnitOutcome`
@@ -374,32 +374,26 @@ StagedFastq(
 
 ```python
 FastqSet(
-    unit_id,
     layout,
     run_accessions,
     read1=(),
     read2=(),
     single=(),
     source="sra",
-    work_dir=Path("."),
-    output_dir=Path("."),
     checksums={},
-    metadata={},
+    provider_metadata={},
 )
 ```
 
 | Argument | Meaning |
 | --- | --- |
-| `unit_id` | Unit being processed. |
 | `layout: FastqLayout` | Single, paired, or mixed structure. |
 | `run_accessions` | Source runs in merge order. |
 | `read1`, `read2` | Ordered mate files; counts must match. |
 | `single` | Single-end or orphan files. |
 | `source` | Provider label. |
-| `work_dir` | Processor-owned intermediate root assigned by the builder. |
-| `output_dir` | Processor final-output root assigned by the builder. |
 | `checksums` | SHA-256 values keyed by file path. |
-| `metadata` | Provider provenance plus the unit log path. |
+| `provider_metadata` | FASTQ-provider provenance. |
 
 | Method | Behavior |
 | --- | --- |
@@ -408,6 +402,12 @@ FastqSet(
 | `from_dict(value)` | Reconstruct paths and `FastqLayout`. |
 
 Processors should call `validate()` before expensive work.
+
+## `ProcessingContext`
+
+`ProcessingContext(unit_id, threads, work_dir, output_dir, log_path, execution_id)`
+contains pipeline-owned identity, resources, and paths for one processor call.
+This keeps execution state out of `FastqSet` and `GenomeRef`.
 
 ## `GenomeRef`
 
@@ -445,7 +445,7 @@ GenomeRef(
 ```python
 ProcessingResult(
     success,
-    outputs=(),
+    outputs={},
     metrics={},
     tool_versions={},
     message=None,
@@ -455,14 +455,14 @@ ProcessingResult(
 | Argument | Meaning |
 | --- | --- |
 | `success: bool` | Whether the processor considers the unit complete. |
-| `outputs: tuple[Path, ...]` | Every final artifact that defines successful reusable work. |
+| `outputs: dict[str, Path]` | Every final artifact keyed by a stable semantic role such as `coverage` or `alignment_bam`. |
 | `metrics: dict` | JSON-compatible QC or scientific summary data. |
 | `tool_versions: dict[str, str]` | External software provenance. |
 | `message: str | None` | Optional status/failure explanation. |
 
-`validate()` requires `success=True`, at least one output, and every output
-to exist as a non-empty file. The builder calls it, computes output SHA-256
-values, and stores `to_dict()` in state.
+`validate()` requires `success=True`, non-empty unique artifact roles and paths,
+and every output to exist as a non-empty file. The builder stores each role,
+path, SHA-256, size, and modification time together in state.
 
 # Exceptions
 

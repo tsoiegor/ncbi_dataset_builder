@@ -205,7 +205,7 @@ def test_biosample_xml_keeps_identifiers_dates_owner_and_repeated_attributes():
     assert "raw" in record
 
 
-def test_combined_sample_description_and_persistence(tmp_path):
+def test_experiment_description_and_persistence(tmp_path):
     entrez = FakeEntrez()
     bundle = fetch_metadata_for_accessions(
         ["SRS4739189"],
@@ -213,9 +213,9 @@ def test_combined_sample_description_and_persistence(tmp_path):
         biosample=BioSampleClient(entrez),
         include_raw=True,
     )
-    description = bundle.descriptions_by_sample(profile="full")["SRS4739189"]
-    assert description["experiments"][0]["library"]["strategy"] == "ATAC-seq"
-    assert description["studies"][0]["accession"] == "SRP197260"
+    description = bundle.descriptions_by_experiment(profile="full")["SRX5809925"]
+    assert description["experiment"]["library"]["strategy"] == "ATAC-seq"
+    assert description["study"]["accession"] == "SRP197260"
     assert description["biosample"]["accession"] == "SAMN11608754"
     assert [run["accession"] for run in description["runs"]] == [
         "SRR9032674",
@@ -224,9 +224,11 @@ def test_combined_sample_description_and_persistence(tmp_path):
 
     bundle.save(tmp_path, description_profile="full")
     saved = json.loads(
-        (tmp_path / "sample_descriptions" / "SRS4739189.json").read_text(encoding="utf-8")
+        (tmp_path / "experiment_descriptions" / "SRX5809925.json").read_text(
+            encoding="utf-8"
+        )
     )
-    assert saved["submissions"][0]["accession"] == "SRA884593"
+    assert saved["submission"]["accession"] == "SRA884593"
     assert (tmp_path / "packages.ndjson").stat().st_size > 0
     assert (tmp_path / "experiments.ndjson").stat().st_size > 0
     assert (tmp_path / "biosamples.ndjson").stat().st_size > 0

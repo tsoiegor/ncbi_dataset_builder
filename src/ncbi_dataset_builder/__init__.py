@@ -19,11 +19,16 @@ from .execution.config import (
     SlurmSingleNodeExecution,
 )
 from .metadata import BioSampleClient, EntrezClient, MetadataBundle, SraClient
-from .metadata.descriptions import DescriptionPolicy, training_fields_by_experiment
+from .metadata.descriptions import (
+    DescriptionPolicy,
+    training_descriptions_by_experiment,
+    training_fields_by_experiment,
+)
 from .models import (
     FastqLayout,
     FastqSet,
     GenomeRef,
+    ProcessingContext,
     ProcessingResult,
     ProcessingUnit,
     StagedFastq,
@@ -63,6 +68,7 @@ __all__ = [
     "GeoSupplementaryFile",
     "LocalExecution",
     "MetadataBundle",
+    "ProcessingContext",
     "ProcessingResult",
     "ProcessingUnit",
     "Processor",
@@ -82,6 +88,7 @@ __all__ = [
     "WorkspaceConfig",
     "WorkspaceStore",
     "process_atac",
+    "training_descriptions_by_experiment",
     "training_fields_by_experiment",
     "validate_polars_runtime",
 ]

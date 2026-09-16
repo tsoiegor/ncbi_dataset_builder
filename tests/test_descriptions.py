@@ -19,15 +19,16 @@ def example_bundle():
     return bundle
 
 
-def test_default_export_is_compact_with_original_sample_id_and_full_text(tmp_path):
+def test_default_export_is_compact_and_keyed_by_experiment(tmp_path):
     bundle = example_bundle()
     text = "Protocol: " + "step with exact concentration 2.5 mM; " * 300
     bundle.experiments[0]["library"]["construction_protocol"] = text
     bundle.save(tmp_path)
     description = json.loads(
-        (tmp_path / "sample_descriptions/SRS4739189.json").read_text(encoding="utf-8")
+        (tmp_path / "experiment_descriptions/SRX5809925.json").read_text(encoding="utf-8")
     )
-    assert description["ID"] == "SRS4739189"
+    assert description["ID"] == "SRX5809925"
+    assert description["SRA Sample ID"] == "SRS4739189"
     assert description["Strategy"] == "ATAC-seq"
     assert description["Study"] == "A study"
     assert description["Abstract"] == "Text & design"
@@ -58,7 +59,7 @@ def test_biology_aliases_placeholders_and_administrative_attributes():
             ("unknown mechanism", "novel state"),
         ]
     ]
-    description = bundle.descriptions_by_sample()["SRS4739189"]
+    description = bundle.descriptions_by_experiment()["SRX5809925"]
     assert description["Cell type"] == "CD8+ T cell"
     assert description["Developmental stage"] == "embryo"
     assert description["Genotype"] == "WT"
@@ -67,9 +68,9 @@ def test_biology_aliases_placeholders_and_administrative_attributes():
     assert "Phenotype" not in description
     assert "External Id" not in description
     assert "collection_date" not in description
-    custom = bundle.descriptions_by_sample(
+    custom = bundle.descriptions_by_experiment(
         policy=DescriptionPolicy(extra_attributes={"unknown mechanism": "Mechanism"})
-    )["SRS4739189"]
+    )["SRX5809925"]
     assert custom["Mechanism"] == "novel state"
 
 
@@ -80,7 +81,7 @@ def test_units_in_sra_xml_are_retained_in_compact_preparation_values():
     )
     bundle = SraClient.parse_packages(xml)
     assert (
-        bundle.descriptions_by_sample()["SRS4739189"]["sampling to preparation interval"]
+        bundle.descriptions_by_experiment()["SRX5809925"]["sampling to preparation interval"]
         == "4.0 months"
     )
 
@@ -104,19 +105,16 @@ def two_assay_bundle():
 
 def test_multiple_assays_preserve_protocol_relationship_and_shared_values_once():
     bundle = two_assay_bundle()
-    description = bundle.descriptions_by_sample()["SRS4739189"]
-    assert description["Study"] == "A study"
-    assert "Strategy" not in description
-    assert [
-        (row["Strategy"], row["Construction protocol"]) for row in description["Experiments"]
-    ] == [
-        ("ATAC-seq", "ATAC protocol & cleanup"),
-        ("RNA-Seq", "RNA protocol"),
-    ]
+    descriptions = bundle.descriptions_by_experiment()
+    assert descriptions["SRX5809925"]["Study"] == "A study"
+    assert descriptions["SRX5809925"]["Strategy"] == "ATAC-seq"
+    assert descriptions["SRX5809925"]["Construction protocol"] == "ATAC protocol & cleanup"
+    assert descriptions["SRX2"]["Strategy"] == "RNA-Seq"
+    assert descriptions["SRX2"]["Construction protocol"] == "RNA protocol"
+    assert descriptions["SRX2"]["SRA Sample ID"] == "SRS4739189"
     scoped = bundle.subset_experiments(["SRX5809925"])
-    compact = scoped.descriptions_by_sample()["SRS4739189"]
+    compact = scoped.descriptions_by_experiment()["SRX5809925"]
     assert compact["Strategy"] == "ATAC-seq"
-    assert "Experiments" not in compact
     assert len(scoped.runs) == 2
 
 
@@ -130,10 +128,10 @@ def test_catalog_enrichment_does_not_pull_in_other_assays():
         catalog, sra=FakeSra(), biosample=BioSampleClient(FakeEntrez())
     )
     assert [row["accession"] for row in bundle.experiments] == ["SRX5809925"]
-    assert bundle.descriptions_by_sample()["SRS4739189"]["Strategy"] == "ATAC-seq"
+    assert bundle.descriptions_by_experiment()["SRX5809925"]["Strategy"] == "ATAC-seq"
 
 
 def test_unknown_profile_and_empty_bundle():
-    assert MetadataBundle().descriptions_by_sample() == {}
+    assert MetadataBundle().descriptions_by_experiment() == {}
     with pytest.raises(ValueError, match="profile"):
-        MetadataBundle().descriptions_by_sample(profile="typo")
+        MetadataBundle().descriptions_by_experiment(profile="typo")

@@ -42,11 +42,24 @@ from .metadata import (
     fetch_metadata_for_catalog,
 )
 from .metadata.descriptions import DescriptionPolicy
-from .models import FastqSet, GenomeRef, ProcessingResult, ProcessingUnit, StagedFastq
+from .models import (
+    FastqSet,
+    GenomeRef,
+    ProcessingContext,
+    ProcessingResult,
+    ProcessingUnit,
+    StagedFastq,
+)
 from .processing.base import Processor, load_processor
 from .support.progress import ProgressReporter
 from .support.unit_logging import install_unit_logging, unit_log
-from .support.util import exclusive_file_lock, sanitize_identifier, sha256_file, utc_timestamp
+from .support.util import (
+    atomic_write_json,
+    exclusive_file_lock,
+    sanitize_identifier,
+    sha256_file,
+    utc_timestamp,
+)
 from .workspace import WorkspaceStore
 from .workspace.publishing import DatasetExport, DatasetPublisher, PublishMode
 
@@ -310,20 +323,100 @@ class DatasetBuilder:
 
         if self.sra is None or self.biosample is None:
             raise ValueError("enrich_metadata requires an email in BuilderConfig")
-        bundle = fetch_metadata_for_catalog(
-            catalog,
-            sra=self.sra,
-            biosample=self.biosample,
-            include_raw=include_raw,
-            refresh=refresh,
-        )
-        bundle.save(
-            destination or self.config.workspace / "metadata",
-            description_profile=description_profile or self.config.description_profile,
-            policy=description_policy,
-            progress=self.progress,
-        )
-        return bundle
+        target = destination or self.config.workspace / "metadata"
+        target.mkdir(parents=True, exist_ok=True)
+        with exclusive_file_lock(target / ".metadata.lock", timeout_seconds=120):
+            metadata_path = target / "metadata.json"
+            index_path = target / "metadata_index.json"
+            cumulative = (
+                MetadataBundle.load(metadata_path, progress=self.progress)
+                if metadata_path.is_file()
+                else MetadataBundle()
+            )
+            indexed_complete: set[str] | None = None
+            if index_path.is_file():
+                try:
+                    index_value = json.loads(index_path.read_text(encoding="utf-8"))
+                    indexed_complete = {
+                        str(accession)
+                        for accession, entry in index_value.get("experiments", {}).items()
+                        if isinstance(entry, dict)
+                        and entry.get("complete") is True
+                        and (not include_raw or entry.get("raw_available") is True)
+                    }
+                except (OSError, json.JSONDecodeError, AttributeError):
+                    indexed_complete = None
+            if "Experiment" in catalog.frame.columns:
+                requested = sorted(
+                    str(value)
+                    for value in catalog.frame.get_column("Experiment")
+                    .drop_nulls()
+                    .unique()
+                    .to_list()
+                    if str(value)
+                )
+            else:
+                requested = []
+            if requested:
+                complete = cumulative.complete_experiment_accessions(include_raw=include_raw)
+                if indexed_complete is not None:
+                    # A stale index must never hide records absent from metadata.json.
+                    complete &= indexed_complete
+                missing = requested if refresh else sorted(set(requested) - complete)
+                if missing:
+                    fetched = fetch_metadata_for_accessions(
+                        missing,
+                        sra=self.sra,
+                        biosample=self.biosample,
+                        include_raw=include_raw,
+                        refresh=refresh,
+                    )
+                    cumulative.merge_from(fetched)
+                scoped = cumulative.subset_experiments(requested)
+            else:
+                scoped = fetch_metadata_for_catalog(
+                    catalog,
+                    sra=self.sra,
+                    biosample=self.biosample,
+                    include_raw=include_raw,
+                    refresh=refresh,
+                )
+                cumulative.merge_from(scoped)
+            cumulative.save(
+                target,
+                description_profile=description_profile or self.config.description_profile,
+                policy=description_policy,
+                progress=self.progress,
+            )
+            sample_by_accession = {
+                row.get("accession"): row for row in cumulative.sra_samples
+            }
+            normalized_complete = cumulative.complete_experiment_accessions(
+                include_raw=False
+            )
+            raw_complete = cumulative.complete_experiment_accessions(include_raw=True)
+            index = {}
+            for relation in cumulative.packages:
+                experiment = relation.get("experiment_accession")
+                sample = relation.get("sra_sample_accession")
+                if not experiment or not sample:
+                    continue
+                sample_record = sample_by_accession.get(sample, {})
+                index[str(experiment)] = {
+                    "sra_sample": sample,
+                    "biosample": sample_record.get("biosample"),
+                    "complete": experiment in normalized_complete,
+                    "raw_available": experiment in raw_complete,
+                }
+            atomic_write_json(
+                index_path,
+                {
+                    "schema_version": 1,
+                    "updated_at": utc_timestamp(),
+                    "experiments": index,
+                },
+            )
+            return scoped
 
     @staticmethod
     def _processor_identity(
@@ -510,20 +603,33 @@ class DatasetBuilder:
         processing = result.get("processing") if isinstance(result, dict) else None
         if not isinstance(processing, dict):
             return False
-        outputs = [Path(str(value)) for value in processing.get("outputs", ())]
-        if not outputs or any(not path.is_file() or path.stat().st_size == 0 for path in outputs):
+        serialized_outputs = processing.get("outputs", {})
+        if isinstance(serialized_outputs, dict):
+            outputs = {
+                str(role): Path(str(value.get("path") if isinstance(value, dict) else value))
+                for role, value in serialized_outputs.items()
+            }
+        elif isinstance(serialized_outputs, list):
+            outputs = {str(path): Path(str(path)) for path in serialized_outputs}
+        else:
+            return False
+        if not outputs or any(
+            not path.is_file() or path.stat().st_size == 0 for path in outputs.values()
+        ):
             return False
         expected = result.get("output_sha256", {})
         facts = result.get("output_files", {})
-        for path in outputs:
-            fact = facts.get(str(path), {}) if isinstance(facts, dict) else {}
+        for role, path in outputs.items():
+            fact = facts.get(role, facts.get(str(path), {})) if isinstance(facts, dict) else {}
             if (
                 isinstance(fact, dict)
                 and fact.get("size") == path.stat().st_size
                 and fact.get("modified_ns") == path.stat().st_mtime_ns
             ):
                 continue
-            checksum = expected.get(str(path)) if isinstance(expected, dict) else None
+            checksum = fact.get("sha256") if isinstance(fact, dict) else None
+            if not checksum and isinstance(expected, dict):
+                checksum = expected.get(role, expected.get(str(path)))
             if not checksum or sha256_file(path, progress=self.progress) != checksum:
                 return False
         genome = result.get("genome")
@@ -546,11 +652,12 @@ class DatasetBuilder:
         if callable(stage):
             return stage(item.unit, destination, threads=item.resources.cpus)
         ready = self.fastq_provider.fetch(item.unit, destination, threads=item.resources.cpus)
+        unit_root = destination / sanitize_identifier(item.unit.unit_id)
         return StagedFastq(
             unit_id=item.unit.unit_id,
             source=ready.source,
-            size_gb=paths_size_gb([ready.work_dir]),
-            cleanup_roots=(ready.work_dir,),
+            size_gb=paths_size_gb([unit_root]),
+            cleanup_roots=(unit_root,),
             ready_fastq=ready,
             metadata={"provider_mode": "fetch_during_staging"},
         )
@@ -711,13 +818,16 @@ class DatasetBuilder:
                             shutil.rmtree(owned)
                         elif owned.exists():
                             owned.unlink()
-                fastq = replace(
-                    fastq,
+                current_state = self.state.get(item.item_id) or {}
+                context = ProcessingContext(
+                    unit_id=item.item_id,
+                    threads=cpus,
                     work_dir=work_root,
                     output_dir=output_root,
-                    metadata={**fastq.metadata, "unit_log_path": str(prepared.log_path)},
+                    log_path=prepared.log_path,
+                    execution_id=str(current_state.get("execution_id") or "unknown"),
                 )
-                result = processor(fastq, prepared.genome, cpus)
+                result = processor(fastq, prepared.genome, context)
                 if not isinstance(result, ProcessingResult):
                     raise TypeError(
                         "Processor must return ProcessingResult, got "
@@ -726,19 +836,18 @@ class DatasetBuilder:
                 result.validate()
                 payload = {
                     "processing": result.to_dict(),
-                    "output_sha256": {
-                        str(path): sha256_file(path, progress=self.progress)
-                        for path in result.outputs
-                    },
                     "output_files": {
-                        str(path): {
+                        role: {
+                            "path": str(path),
+                            "sha256": sha256_file(path, progress=self.progress),
                             "size": path.stat().st_size,
                             "modified_ns": path.stat().st_mtime_ns,
                         }
-                        for path in result.outputs
+                        for role, path in result.outputs.items()
                     },
                     "genome": prepared.genome.to_dict(),
                     "fastq": fastq.to_dict(),
+                    "context": context.to_dict(),
                     "log_path": str(prepared.log_path),
                 }
                 self.state.succeed(item.item_id, payload)
@@ -1030,7 +1139,7 @@ class DatasetBuilder:
         Args:
             catalog: Catalog loaded from CSV or fetched from NCBI.
             processor: Callable or ``module:object`` reference accepting
-                ``(fastq, genome, cpus)``.
+                ``(fastq, genome, context)``.
             execution: Local CPU, concurrency, and free-storage settings.
             queue: Download and in-flight storage behavior.
             group_by: Optional override for the configured catalog grouping.
@@ -1142,7 +1251,7 @@ class DatasetBuilder:
         return script, executor.submit(script) if submit else None
 
     def status(self, execution_id: str | None = None) -> dict[str, Any]:
-        """Return per-sample status for optional *execution_id*."""
+        """Return a rich status report for optional *execution_id*."""
 
         record = (
             self.workspace.load_execution(execution_id)
@@ -1150,8 +1259,110 @@ class DatasetBuilder:
             else self.workspace.latest_execution()
         )
         summary = self.state.summary([item.item_id for item in record.items])
-        summary["execution_id"] = record.execution_id
-        return summary
+        states = {state.get("unit_id"): state for state in summary["units"]}
+        experiments = []
+        execution_genomes: dict[str, dict[str, Any]] = {}
+        for item in record.items:
+            state = states.get(item.item_id) or {}
+            result = state.get("result") if isinstance(state.get("result"), dict) else {}
+            processing = (
+                result.get("processing") if isinstance(result.get("processing"), dict) else {}
+            )
+            serialized_outputs = processing.get("outputs", {})
+            if isinstance(serialized_outputs, dict):
+                output_roles = list(serialized_outputs)
+            elif isinstance(serialized_outputs, list):
+                output_roles = [Path(str(path)).name for path in serialized_outputs]
+            else:
+                output_roles = []
+            genome = result.get("genome") if isinstance(result.get("genome"), dict) else {}
+            if genome.get("accession"):
+                execution_genomes[str(genome["accession"])] = genome
+            error_lines = [line.strip() for line in str(state.get("error") or "").splitlines() if line.strip()]
+            experiments.append(
+                {
+                    "experiment_id": item.unit.unit_id,
+                    "status": state.get("status", "pending"),
+                    "phase": state.get("phase", "waiting"),
+                    "species": item.unit.scientific_name,
+                    "taxid": item.unit.taxid,
+                    "runs": list(item.unit.run_accessions),
+                    "genome_accession": genome.get("accession"),
+                    "genome_available": bool(
+                        genome.get("fasta")
+                        and Path(str(genome["fasta"])).is_file()
+                        and Path(str(genome["fasta"])).stat().st_size > 0
+                    ),
+                    "outputs": output_roles,
+                    "attempts": int(state.get("attempts", 0)),
+                    "allocated_cpus": state.get("allocated_cpus"),
+                    "slurm_job_id": state.get("slurm_job_id"),
+                    "started_at": state.get("started_at"),
+                    "finished_at": state.get("finished_at"),
+                    "log_path": state.get("log_path"),
+                    "error": error_lines[-1] if error_lines else None,
+                }
+            )
+
+        genome_inventory: dict[str, dict[str, Any]] = {}
+        lockfile = getattr(self.genomes, "lockfile", None)
+        if isinstance(lockfile, Path) and lockfile.is_file():
+            try:
+                inventory = json.loads(lockfile.read_text(encoding="utf-8")).get("genomes", {})
+            except (OSError, json.JSONDecodeError):
+                inventory = {}
+            for taxid, genome in sorted(inventory.items()):
+                fasta = Path(str(genome.get("fasta", "")))
+                accession = str(genome.get("accession") or f"taxid:{taxid}")
+                genome_inventory[accession] = {
+                    "taxid": int(taxid),
+                    "scientific_name": genome.get("scientific_name"),
+                    "accession": genome.get("accession"),
+                    "available": fasta.is_file() and fasta.stat().st_size > 0,
+                    "fasta": str(fasta),
+                }
+        for accession, genome in execution_genomes.items():
+            fasta = Path(str(genome.get("fasta", "")))
+            genome_inventory.setdefault(
+                accession,
+                {
+                    "taxid": genome.get("taxid"),
+                    "scientific_name": genome.get("scientific_name"),
+                    "accession": accession,
+                    "available": fasta.is_file() and fasta.stat().st_size > 0,
+                    "fasta": str(fasta),
+                },
+            )
+        genomes = list(genome_inventory.values())
+
+        metadata_index = self.config.workspace / "metadata" / "metadata_index.json"
+        cached_experiments = 0
+        if metadata_index.is_file():
+            try:
+                metadata_value = json.loads(metadata_index.read_text(encoding="utf-8"))
+                cached_experiments = len(metadata_value.get("experiments", {}))
+            except (OSError, json.JSONDecodeError):
+                pass
+        return {
+            "execution_id": record.execution_id,
+            "execution": {
+                "created_at": record.created_at,
+                "type": record.execution_type,
+                "group_by": record.group_by,
+                "processor": record.processor_identity,
+                "query": record.query,
+                "total_experiments": len(record.items),
+            },
+            "counts": summary["counts"],
+            "experiments": experiments,
+            "genomes": {
+                "registered": len(genomes),
+                "downloaded": sum(genome["available"] for genome in genomes),
+                "items": genomes,
+            },
+            "metadata": {"cached_experiments": cached_experiments},
+            "units": summary["units"],
+        }
 
     def publish_dataset(
         self,

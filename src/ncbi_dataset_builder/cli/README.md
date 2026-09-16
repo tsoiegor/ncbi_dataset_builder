@@ -25,7 +25,7 @@ this page explains exact argument-to-object mapping.
 | `build-local` | `builder.build(..., LocalExecution(...))` | 1 when any unit failed, otherwise 0 |
 | `submit-single-node` | `builder.submit_slurm(..., SlurmSingleNodeExecution(...))` | 0 after script creation/submission |
 | `submit-distributed` | `builder.submit_slurm(..., SlurmDistributedExecution(...))` | 0 after coordinator script creation/submission |
-| `status` | `builder.status()` | Prints a Python mapping |
+| `status` | `builder.status()` | Prints an experiment summary; `--json` prints structured data |
 | `publish` | `builder.publish_dataset()` | Prints manifest path |
 
 ## Stable builder arguments
@@ -146,10 +146,15 @@ ncbi-dataset status --workspace /data/ncbi-workspace
 
 # One explicit immutable execution snapshot.
 ncbi-dataset status +  --workspace /data/ncbi-workspace +  --execution-id execution-20260912-abc123
+
+# Complete machine-readable report.
+ncbi-dataset status --workspace /data/ncbi-workspace --json
 ```
 
 Stable builder arguments are accepted because the same builder initializes the
-workspace, but status reads saved execution and unit state.
+workspace, but status reads saved execution and unit state. The default view
+shows overall progress, all experiment states, phases, species, runs, genomes,
+named outputs, attempts, metadata-cache coverage, and actionable failures.
 
 ## `publish`
 
