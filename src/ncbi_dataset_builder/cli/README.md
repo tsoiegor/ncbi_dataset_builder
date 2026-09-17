@@ -154,7 +154,10 @@ ncbi-dataset status --workspace /data/ncbi-workspace --json
 Stable builder arguments are accepted because the same builder initializes the
 workspace, but status reads saved execution and unit state. The default view
 shows overall progress, all experiment states, phases, species, runs, genomes,
-named outputs, attempts, metadata-cache coverage, and actionable failures.
+Slurm job IDs, allocated CPUs, named outputs, attempts, metadata-cache coverage,
+and actionable failures. Downloading units are explicit: SRA Toolkit staging is
+shown as `downloading / downloading-sra`, while downloaded units waiting for CPU
+capacity are `ready / ready`.
 
 # Python entry point
 

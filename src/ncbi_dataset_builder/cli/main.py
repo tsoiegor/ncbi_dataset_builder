@@ -216,7 +216,15 @@ def _print_status(report: dict) -> None:
         f"{entity_label}: "
         + ", ".join(
             f"{name}={counts.get(name, 0)}"
-            for name in ("succeeded", "running", "submitted", "pending", "failed")
+            for name in (
+                "succeeded",
+                "running",
+                "submitted",
+                "ready",
+                "downloading",
+                "pending",
+                "failed",
+            )
         )
     )
     genomes = report["genomes"]
@@ -238,6 +246,8 @@ def _print_status(report: dict) -> None:
                 str(experiment["species"] or "-"),
                 str(len(experiment["runs"])),
                 genome,
+                str(experiment["slurm_job_id"] or "-"),
+                str(experiment["allocated_cpus"] or "-"),
                 ", ".join(experiment["outputs"]) or "-",
                 str(experiment["attempts"]),
             ]
@@ -253,6 +263,8 @@ def _print_status(report: dict) -> None:
                 "SPECIES",
                 "RUNS",
                 "GENOME",
+                "SLURM JOB",
+                "CPUS",
                 "OUTPUTS",
                 "TRIES",
             ],

@@ -28,15 +28,17 @@ submission process
 └── sbatch coordinator script
     └── coordinator Slurm job
         ├── inspect execution and unit state
-        ├── check CPU quota, job count, and storage
+        ├── resolve genomes and stage provider input
+        ├── persist downloaded-ready units
+        ├── check CPU quota, ready cohort, job count, and storage
         ├── create held sample job
         ├── persist job ID and resources
         ├── release sample job
         └── monitor jobs with squeue
 
-sample job 0 ── stage genome/input ── processor ── state/cleanup
-sample job 1 ── stage genome/input ── processor ── state/cleanup
-sample job 2 ── stage genome/input ── processor ── state/cleanup
+sample job 0 ── materialize FASTQ ── processor ── state/cleanup
+sample job 1 ── materialize FASTQ ── processor ── state/cleanup
+sample job 2 ── materialize FASTQ ── processor ── state/cleanup
 ```
 
 Every worker reads and writes the same workspace. It reconstructs the saved
@@ -115,9 +117,8 @@ execution = SlurmDistributedExecution(
 )
 
 queue = QueuePolicy(
-    # Distributed workers stage their own data; this field does not create
-    # a separate coordinator-side download pool in the current implementation.
-    download_workers=1,
+    # Coordinator-side genome/input staging concurrency.
+    download_workers=2,
     max_inflight_gb=2_000,
     processing_storage_multiplier=2.5,
     cleanup="after_success",
@@ -180,8 +181,8 @@ construction deliberately.
 | `memory_gb_per_job: float` | Required | Hard Slurm `--mem` for every worker, rounded up to whole GB | Peak RSS plus safety margin | Positive; same for every worker |
 | `worker_time_limit: str` | Required | Slurm `--time` for every worker | Worst representative sample duration plus margin | Digits/colon/hyphen and site-valid |
 | `storage: QuotaStorage` | Required | Shared quota admission | Real quota, reserve, and usage root | Must be `QuotaStorage` |
-| `coordinator_cpus: int` | `1` | Coordinator `--cpus-per-task`, included in total quota | Usually `1`; coordinator is lightweight | Positive and below total quota |
-| `coordinator_memory_gb: float` | `4.0` | Hard coordinator `--mem`, rounded up | Enough for catalog/state bookkeeping | Positive |
+| `coordinator_cpus: int` | `1` | Coordinator staging/scheduler CPU allocation, included in total quota | At least the useful aggregate CPU demand of the staging pool | Positive and below total quota |
+| `coordinator_memory_gb: float` | `4.0` | Hard coordinator `--mem`, rounded up | Enough for concurrent acquisition plus scheduler bookkeeping | Positive |
 | `coordinator_time_limit: str` | `"7-00:00:00"` | Coordinator wall time for the whole campaign | Longer than expected last worker completion | Digits/colon/hyphen and site-valid |
 | `partition: str \| None` | `None` | Comma-separated partitions applied to coordinator and every worker | Partitions accepting both resource shapes | Safe identifier characters only |
 | `account: str \| None` | `None` | Slurm account for all generated jobs | Site account | Safe identifier characters only |
@@ -215,8 +216,8 @@ The optional value must lie between the configured minimum and maximum.
 
 ### Launch-time fair share
 
-Before submitting a worker, the coordinator computes a fair share from the
-running plus pending cohort, then chooses:
+Before submitting a worker, the coordinator computes a fair share from active
+workers plus downloaded-ready units, then chooses:
 
 ```text
 min(
@@ -233,6 +234,9 @@ The selected integer becomes:
 - the processor’s `threads` argument.
 
 It cannot change after `sbatch`. Later workers may receive different values.
+Pending and still-downloading units do not reduce the allocation. Consequently,
+the first ready unit can receive the full currently available budget up to
+`max_cpus_per_job`.
 
 ### Worked example
 
@@ -266,8 +270,6 @@ sample jobs.
 
 `worker_time_limit` applies separately to each sample job and includes:
 
-- genome resolution/download when uncached;
-- SRA staging and validation;
 - FASTQ materialization;
 - processor execution;
 - output validation/checksums; and
@@ -275,11 +277,14 @@ sample jobs.
 
 ### Coordinator resources
 
-The coordinator does not process samples. It reads state, scans quota usage,
-writes scripts, runs scheduler commands, and waits for terminal state. Its time
-limit must cover the entire campaign. If it exits early, workers already
-released may continue, but no process remains to admit later units or finalize
-the complete summary.
+The coordinator resolves/downloads genomes and stages provider input in a
+thread pool before submitting processor jobs. Each stage receives at least one
+thread from the coordinator allocation; choose `coordinator_cpus` and
+`download_workers` together to avoid oversubscription. The coordinator also
+reads state, scans quota usage, writes scripts, runs scheduler commands, and
+waits for terminal state. Its time limit must cover the entire campaign. If it
+exits early, released workers may continue, but no process remains to stage or
+admit later units.
 
 ## `QuotaStorage` parameters
 
@@ -296,27 +301,30 @@ does not model inode limits. See [Storage](Storage.md#quotastorage).
 
 | Parameter | Current distributed behavior | Starting choice |
 | --- | --- | --- |
-| `download_workers` | Serialized but does not limit a separate download pool; every admitted worker stages its own unit | Leave `1`; control simultaneous stages with `max_running_jobs` |
-| `max_inflight_gb` | Limits estimated peak size of active workers | Enough for one or two large workers initially |
-| `processing_storage_multiplier` | Multiplies raw size for every active/candidate worker | Measured peak ratio |
+| `download_workers` | Maximum simultaneous coordinator-side genome/input stages | Start with `1`; raise only when coordinator CPUs, NCBI, and storage tolerate it |
+| `max_inflight_gb` | Limits staging + ready raw estimates and active processing estimates | Enough for one or two large units initially |
+| `processing_storage_multiplier` | Multiplies raw size only while a processor worker is active | Measured peak ratio |
 | `cleanup` | Each worker removes provider-owned input after success when configured | `"after_success"` if reacquisition is acceptable |
 | `keep_failed_inputs` | Each worker preserves failed provider input by default | Keep `True` during validation |
 | `fsync_logs` | Worker unit logs synchronize at phase boundaries | Keep `True` |
 | `scheduler_poll_seconds` | Coordinator sleep between checks, capped at 60 seconds | `5`–`30` may reduce scheduler chatter; must be positive |
 
-The current coordinator counts active worker estimates, not a separate ready or
-download queue. Full storage details are in [Storage](Storage.md).
+The coordinator maintains distinct staging, ready, and active-worker queues.
+Full storage details are in [Storage](Storage.md).
 
 ## Submission protocol
 
-For each admitted processing unit:
+For each processing unit:
 
-1. create `workspace/runtime/slurm/<execution-id>/<unit-id>.sbatch`;
-2. call `sbatch --parsable --hold`;
-3. parse the scheduler job ID;
-4. atomically persist job ID, CPUs, memory, fingerprint, item, and log path;
-5. call `scontrol release <job-id>`;
-6. if persistence/release setup fails after submission, call `scancel`.
+1. claim and stage its genome/provider input in the coordinator;
+2. persist the serialized prepared input with phase `ready`;
+3. calculate CPUs only after the unit is ready;
+4. create `workspace/runtime/slurm/<execution-id>/<unit-id>.sbatch`;
+5. call `sbatch --parsable --hold`;
+6. parse the scheduler job ID;
+7. atomically attach job ID, CPUs, and memory to the existing ready claim;
+8. call `scontrol release <job-id>`; and
+9. if persistence/release setup fails after submission, call `scancel`.
 
 Holding the job prevents it from starting before durable ownership is written.
 
@@ -355,20 +363,22 @@ coordinator/worker partitions are not currently configurable.
 | Execution JSON and generated scripts | Shared through workspace |
 | Submitting Python executable | Coordinator and every worker |
 | Package and processor module | Coordinator and every worker |
-| SRA/genome/processor external tools | Every worker |
+| SRA/genome acquisition tools | Coordinator |
+| FASTQ materialization and processor tools | Every worker |
 | `sbatch`, `scontrol`, `scancel`, `squeue` | Coordinator |
 | Quota `usage_root` | Coordinator and shared filesystem |
-| `NCBI_API_KEY` when used | Worker batch environment |
+| `NCBI_API_KEY` when used | Coordinator batch environment |
 
 ## Monitoring behavior
 
-The coordinator calls `squeue` for running job IDs:
+The coordinator reads the active `squeue` listing and filters it to recorded job IDs:
 
 - if `squeue` fails, it prints a warning and pauses new admissions;
 - if a job remains in `squeue`, it is treated as active;
 - if it disappears, the coordinator checks unit state;
 - a succeeded/failed unit is removed from the running set; and
-- if no terminal state appears within 30 seconds, the unit is marked failed.
+- if no terminal state appears within 30 seconds, the abandoned claim is
+  invalidated and the unit is moved to the front of the queue.
 
 The code does not use `sacct` to reconstruct historical completion.
 
@@ -383,23 +393,21 @@ workspace/runtime/state/units/<unit-id>.json
 
 ## Restart and coordinator-loss procedure
 
-Do not immediately launch a second coordinator while the first coordinator or
-its sample jobs are still active.
-
-The current coordinator initializes its in-memory running set from new
-admissions; it does not reattach existing `submitted`/`running` worker jobs
-after restart. A second coordinator can therefore submit duplicate work while
-old workers still exist.
+Do not launch a second coordinator while the first coordinator is still active.
+On restart, the coordinator compares every active-looking state with the live
+Slurm queue. Live submitted/running workers are reattached. Missing workers and
+interrupted coordinator-side downloads are reclaimed ahead of untouched units.
+Downloaded-ready input is reused directly; incomplete SRA staging resumes from
+the provider cache. The replacement claim prevents the old worker from later
+committing over the retry.
 
 Use this safe sequence:
 
-1. inspect `squeue` for the original coordinator and sample job IDs recorded in
-   unit state;
-2. allow active workers to finish, or cancel the explicitly identified old
-   jobs;
-3. verify terminal state and logs;
-4. resubmit the same semantic execution request;
-5. valid successes are reused;
+1. confirm the original coordinator is no longer running;
+2. leave recorded sample jobs active unless they are known to be invalid;
+3. restart the same saved execution/coordinator command;
+4. verify that ready units and active job IDs are reconstructed in status/logs;
+5. valid successes are reused; and
 6. set `retry_failed=True` only for diagnosed matching failures.
 
 ## Tuning sequence
@@ -423,9 +431,10 @@ Use this safe sequence:
 | Workers remain pending in Slurm | Site capacity/QoS/partition, not package admission | Inspect `squeue` reason and site policy |
 | Coordinator admits no new work | CPU/job/storage limit or failed `squeue` | Read coordinator log and quota usage |
 | Worker import fails | Embedded interpreter cannot import package/processor | Test exact Python path on compute node |
-| Job vanishes and unit becomes failed | No terminal state within 30 seconds after `squeue` disappearance | Inspect worker log and scheduler accounting |
-| Too many simultaneous downloads | Each worker stages independently | Lower `max_running_jobs`; `download_workers` is not the control here |
-| Duplicate work after restart | Second coordinator started while old workers remained | Reconcile/cancel existing jobs before resubmission |
+| Job vanishes and unit is requeued | No terminal state within 30 seconds after `squeue` disappearance | Inspect worker log and scheduler accounting; the retry is prioritized automatically |
+| Too many simultaneous downloads | Coordinator staging concurrency is too high | Lower `download_workers` |
+| Coordinator staging is CPU-bound | Too many stages for its allocation | Raise `coordinator_cpus` or lower `download_workers` |
+| Duplicate work after restart | Two coordinators are active simultaneously | Stop the duplicate coordinator; keep one owner of admission |
 
 ## Hard restrictions
 
@@ -434,12 +443,11 @@ Use this safe sequence:
 - Worker CPU allocation is fixed after submission.
 - All workers share one memory value and one worker time limit.
 - Coordinator and workers share partition/account/QoS settings.
-- `download_workers` does not independently limit distributed staging.
+- `download_workers` limits coordinator-side distributed staging.
 - Custom provider and genome-manager objects are not serialized.
 - The coordinator uses `squeue`, not scheduler history, for active-state
   monitoring.
-- Automatic reattachment to pre-existing submitted/running workers is not
-  implemented.
+- A submitted worker keeps its fixed CPU request; allocations are not resized.
 
 ## Related pages
 

@@ -63,7 +63,7 @@ All three processing commands accept:
 
 | Option | Default | Python mapping | Meaning/restriction |
 | --- | --- | --- | --- |
-| `--download-workers N` | `2` | `QueuePolicy.download_workers` | Positive local/single-node staging-pool size; not a separate pool in distributed mode |
+| `--download-workers N` | `2` | `QueuePolicy.download_workers` | Positive staging-pool size; distributed staging uses coordinator resources |
 | `--max-inflight-gb GB` | Unset | `max_inflight_gb` | Positive estimated workload window |
 | `--processing-storage-multiplier X` | `1.0` | `processing_storage_multiplier` | Total peak processing footprint / raw size; at least 1 |
 | `--keep-inputs` | False | `cleanup="never"` when present | Preserve provider-owned input after all outcomes |
@@ -238,10 +238,9 @@ ncbi-dataset submit-distributed \
 | `--coordinator-memory-gb GB` | `4.0` | `coordinator_memory_gb` | Positive coordinator `--mem` |
 | `--coordinator-time-limit TIME` | `7-00:00:00` | `coordinator_time_limit` | Whole campaign coordinator time |
 
-`--download-workers` is accepted because the queue object is shared, but the
-current distributed coordinator does not create a separate download pool.
-Each admitted worker stages its own input; use `--max-running-jobs` and storage
-limits to control simultaneous staging.
+`--download-workers` controls the distributed coordinator's staging pool.
+Only units whose genome and provider input are ready receive sample jobs;
+`--max-running-jobs` independently limits active processor jobs.
 
 Remove `--no-submit` after inspection. The command exits `0` after successful
 coordinator submission, not after the distributed dataset finishes.
@@ -335,7 +334,7 @@ Use the Python API when you need:
 | Live query says email required | No flag/environment email | Set `--email` or `NCBI_EMAIL` |
 | Local CLI cannot find processor | Reference not importable | Use `module:callable` and install module |
 | `--no-submit` seems silent | CLI does not print tuple | Look below `workspace/runtime/slurm/` or set `--script-path` |
-| Distributed downloads exceed expectation | `--download-workers` is not distributed staging concurrency | Lower `--max-running-jobs` |
+| Distributed downloads exceed expectation | Coordinator staging concurrency is too high | Lower `--download-workers` |
 | Slurm command exits 0 but job later fails | CLI only submitted | Inspect logs and run `status` |
 | Existing inputs remain despite discard flag | `--keep-inputs` sets cleanup to never | Remove `--keep-inputs` |
 

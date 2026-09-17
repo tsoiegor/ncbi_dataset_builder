@@ -82,6 +82,25 @@ def _processor(fastq, genome, context):
     raise AssertionError("Processor must not run in the coordinator test")
 
 
+def test_slurm_states_ignores_purged_job_ids(monkeypatch):
+    observed = {}
+
+    def fake_run(command, **kwargs):
+        observed["command"] = command
+        return distributed_worker.subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="111|RUNNING\n222|PENDING\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(distributed_worker.shutil, "which", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(distributed_worker.subprocess, "run", fake_run)
+
+    assert distributed_worker._slurm_states({"111", "1582667"}) == {"111": "RUNNING"}
+    assert "-j" not in observed["command"]
+
+
 def test_distributed_scheduler_stages_before_allocating_worker_cpus(tmp_path, monkeypatch):
     second_gate = Event()
     provider = TrackingFastqProvider(second_gate)
@@ -136,13 +155,17 @@ def test_distributed_scheduler_stages_before_allocating_worker_cpus(tmp_path, mo
             submission = submissions[-1]
             item = record.items[submission["index"]]
             state = builder.state.get(item.item_id) or {}
-            assert state["status"] == "running"
+            assert state["status"] == "ready"
             assert state["phase"] == "ready"
             assert state["allocated_cpus"] is None
             assert isinstance(state.get("prepared"), dict)
             if submission["index"] == 0:
                 assert provider.second_started.wait(timeout=2)
                 assert not second_gate.is_set()
+                downloading = builder.state.get("SRX2") or {}
+                assert downloading["status"] == "downloading"
+                assert downloading["phase"] == "downloading-input"
+                assert downloading["genome"]["accession"] == "GCF_TEST"
                 second_gate.set()
             return f"job-{submission['index']}"
 
@@ -188,6 +211,142 @@ def test_distributed_scheduler_stages_before_allocating_worker_cpus(tmp_path, mo
     assert result == 0
     assert sorted(provider.stage_threads) == [("SRX1", 1), ("SRX2", 1)]
     assert [(item["index"], item["cpus"]) for item in submissions] == [(0, 8), (1, 8)]
+
+
+def test_distributed_resume_reclaims_cancelled_processing_job_first(tmp_path, monkeypatch):
+    provider = TrackingFastqProvider()
+    builder = DatasetBuilder(
+        BuilderConfig(tmp_path, show_progress=False),
+        fastq_provider=provider,
+        genome_manager=TrackingGenomeManager(tmp_path / "genome-cache"),
+    )
+    queue = QueuePolicy(download_workers=1, scheduler_poll_seconds=0.01)
+    initial = builder._create_execution(
+        _catalog(),
+        _processor,
+        execution=LocalExecution(
+            total_cpus=2,
+            storage=FilesystemStorage(reserve_free_gb=0),
+        ),
+        queue=queue,
+        group_by=None,
+        genome_pins=None,
+        query=None,
+        processor_id="processor-v1",
+    )
+    execution = SlurmDistributedExecution(
+        total_cpu_quota=10,
+        coordinator_cpus=2,
+        max_running_jobs=2,
+        cpus_per_node=8,
+        min_cpus_per_job=2,
+        max_cpus_per_job=8,
+        memory_gb_per_job=4,
+        worker_time_limit="01:00:00",
+        storage=QuotaStorage(quota_gb=100),
+    )
+    record = replace(
+        initial,
+        execution_type=execution.__class__.__name__,
+        execution_config=execution_to_dict(execution),
+        queue_config=queue_policy_to_dict(queue),
+    )
+    builder.workspace.save_execution(record)
+
+    interrupted_item = record.items[1]
+    prepared = builder._claim_and_stage(
+        interrupted_item,
+        execution_id="old-execution",
+        retry_failed=False,
+        queue=queue,
+        reclaim_running=False,
+        stage_threads=1,
+    )
+    assert prepared.claim_id is not None
+    experiment_status = next(
+        experiment
+        for experiment in builder.status(record.execution_id)["experiments"]
+        if experiment["experiment_id"] == "SRX2"
+    )
+    assert experiment_status["status"] == "ready"
+    assert experiment_status["genome_accession"] == "GCF_TEST"
+    assert experiment_status["genome_available"] is True
+    builder.state.record_ready_submission(
+        interrupted_item.item_id,
+        slurm_job_id="1582667",
+        cpus=8,
+        memory_gb=4,
+        claim_id=prepared.claim_id,
+    )
+    builder.state.activate_ready_submission(
+        interrupted_item.item_id,
+        claim_id=prepared.claim_id,
+    )
+    builder.state.set_phase(
+        interrupted_item.item_id,
+        "processing",
+        claim_id=prepared.claim_id,
+    )
+
+    submissions = []
+
+    class FakeExecutor:
+        def create_sample_script(self, *, item_index, cpus, output_path, **kwargs):
+            del kwargs
+            submissions.append((item_index, cpus))
+            return output_path
+
+        def submit(self, script, *, hold=False):
+            del script
+            assert hold
+            return f"job-{submissions[-1][0]}"
+
+        def release(self, job_id):
+            state = next(
+                state
+                for item in record.items
+                if (state := builder.state.get(item.item_id))
+                and state.get("slurm_job_id") == job_id
+            )
+            builder.state.succeed(
+                str(state["unit_id"]),
+                {},
+                claim_id=str(state["claim_id"]),
+            )
+
+        def cancel(self, job_id):
+            raise AssertionError(f"Unexpected cancellation: {job_id}")
+
+    monkeypatch.setattr(
+        distributed_worker.DatasetBuilder,
+        "from_execution_record",
+        classmethod(lambda cls, **kwargs: builder),
+    )
+    monkeypatch.setattr(
+        distributed_worker,
+        "SlurmExecutor",
+        lambda **kwargs: FakeExecutor(),
+    )
+    monkeypatch.setattr(distributed_worker, "_slurm_states", lambda job_ids: {})
+
+    result = distributed_worker.main(
+        [
+            "--execution",
+            str(builder.workspace.executions / f"{record.execution_id}.json"),
+            "--processor",
+            "tests.fake:processor",
+            "--workspace",
+            str(tmp_path),
+        ]
+    )
+
+    assert result == 0
+    assert [index for index, _ in submissions] == [1, 0]
+    assert provider.stage_threads == [("SRX2", 1), ("SRX1", 2)]
+    recovered = builder.state.get("SRX2") or {}
+    assert recovered["attempts"] == 2
+    assert recovered["previous_slurm_job_id"] == "1582667"
+    assert "no longer active" in recovered["interruption_reason"]
 
 
 def test_distributed_sample_worker_reuses_persisted_ready_input(tmp_path, monkeypatch):

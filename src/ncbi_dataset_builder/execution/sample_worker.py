@@ -49,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
     if (
         saved.get("fingerprint") == item.fingerprint
         and saved.get("execution_id") == record.execution_id
-        and saved.get("phase") == "ready"
+        and saved.get("phase") in {"ready", "queued"}
         and isinstance(saved.get("prepared"), dict)
     ):
         claim_id = saved.get("claim_id")

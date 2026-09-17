@@ -19,6 +19,7 @@ from .config import (
     execution_from_dict,
     queue_policy_from_dict,
 )
+from .records import QueueItem
 from .slurm import SlurmExecutor
 
 
@@ -42,8 +43,12 @@ def _slurm_states(job_ids: set[str]) -> dict[str, str] | None:
     executable = shutil.which("squeue")
     if executable is None:
         raise RuntimeError("Required executable is not available: squeue")
+    command = [executable, "-h"]
+    if username := os.environ.get("USER"):
+        command.extend(("-u", username))
+    command.extend(("-o", "%A|%T"))
     completed = subprocess.run(
-        [executable, "-h", "-j", ",".join(sorted(job_ids)), "-o", "%A|%T"],
+        command,
         capture_output=True,
         text=True,
         check=False,
@@ -59,9 +64,53 @@ def _slurm_states(job_ids: set[str]) -> dict[str, str] | None:
     states: dict[str, str] = {}
     for line in completed.stdout.splitlines():
         job_id, separator, state = line.strip().partition("|")
-        if separator and job_id:
+        if separator and job_id in job_ids:
             states[job_id] = state
     return states
+
+
+def _reclaim_interrupted(
+    builder: DatasetBuilder,
+    item: QueueItem,
+    *,
+    execution_id: str,
+    state: dict,
+    reason: str,
+) -> _PreparedUnit | None:
+    """Invalidate abandoned ownership and reuse staged input when possible."""
+
+    serialized = state.get("prepared")
+    reusable_prepared = bool(
+        isinstance(serialized, dict)
+        and isinstance(serialized.get("genome"), dict)
+        and isinstance(serialized.get("staged"), dict)
+    )
+    old_phase = state.get("phase")
+    old_job_id = state.get("slurm_job_id")
+    builder.state.requeue_interrupted(
+        item.item_id,
+        reason=reason,
+        expected_job_id=old_job_id if isinstance(old_job_id, str) else None,
+    )
+    if not reusable_prepared:
+        return None
+
+    claim_id = builder.state.start(
+        item.item_id,
+        fingerprint=item.fingerprint,
+        execution_id=execution_id,
+        item=item.to_dict(),
+        log_path=builder._unit_log_path(item),
+        retry_failed=True,
+        reclaim_running=True,
+    )
+    if not isinstance(claim_id, str):
+        raise TypeError(f"Could not reclaim interrupted sample: {item.item_id}")
+    restored = dict(serialized)
+    if old_phase == "processing":
+        restored["reset_outputs"] = True
+    builder.state.set_ready(item.item_id, restored, claim_id=claim_id)
+    return builder._prepared_from_state(item, builder.state.get(item.item_id) or {})
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -90,8 +139,11 @@ def main(argv: list[str] | None = None) -> int:
     executor = SlurmExecutor(progress=builder.progress)
     record_path = workspace.executions / f"{record.execution_id}.json"
     pending: list[int] = []
+    ordinary_pending: list[int] = []
     ready: dict[int, _PreparedUnit] = {}
     running: dict[int, _RunningSample] = {}
+    interrupted_priority: set[int] = set()
+    active_candidates: list[tuple[int, dict, str | None, str | None]] = []
     for index, item in enumerate(record.items):
         state = builder.state.get(item.item_id) or {}
         same_work = state.get("fingerprint") == item.fingerprint
@@ -105,20 +157,27 @@ def main(argv: list[str] | None = None) -> int:
         )
         if reusable or (failed and not arguments.retry_failed):
             continue
-        active = state.get("status") in {"running", "submitted"}
+        active = state.get("status") in {"downloading", "ready", "running", "submitted"}
         slurm_job_id = state.get("slurm_job_id")
         claim_id = state.get("claim_id")
-        coordinator_ready = bool(
-            same_work
-            and state.get("status") == "running"
-            and state.get("phase") == "ready"
-            and isinstance(state.get("prepared"), dict)
-            and not state.get("worker_activated_at")
-        )
-        if coordinator_ready:
-            ready[index] = builder._prepared_from_state(item, state)
-        elif same_work and active and isinstance(slurm_job_id, str) and slurm_job_id:
-            if not isinstance(claim_id, str):
+        if same_work and active:
+            active_candidates.append(
+                (
+                    index,
+                    state,
+                    slurm_job_id if isinstance(slurm_job_id, str) and slurm_job_id else None,
+                    claim_id if isinstance(claim_id, str) else None,
+                )
+            )
+        else:
+            ordinary_pending.append(index)
+
+    initial_job_ids = {job_id for _, _, job_id, _ in active_candidates if job_id}
+    initial_slurm_states = _slurm_states(initial_job_ids)
+    for index, state, slurm_job_id, claim_id in active_candidates:
+        item = record.items[index]
+        if slurm_job_id and initial_slurm_states is None:
+            if claim_id is None:
                 raise ValueError(f"Active sample has no claim token: {item.item_id}")
             running[index] = _RunningSample(
                 index=index,
@@ -129,8 +188,38 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 claim_id=claim_id,
             )
-        else:
+            continue
+        if slurm_job_id and slurm_job_id in (initial_slurm_states or {}):
+            if claim_id is None:
+                raise ValueError(f"Active sample has no claim token: {item.item_id}")
+            running[index] = _RunningSample(
+                index=index,
+                slurm_job_id=slurm_job_id,
+                cpus=int(state.get("allocated_cpus") or execution.min_cpus_per_job),
+                submitted_epoch=float(
+                    state.get("submitted_epoch") or state.get("started_epoch") or time.time()
+                ),
+                claim_id=claim_id,
+            )
+            continue
+        reason = (
+            f"Slurm job {slurm_job_id} is no longer active"
+            if slurm_job_id
+            else "Previous coordinator stopped before a sample worker was submitted"
+        )
+        prepared = _reclaim_interrupted(
+            builder,
+            item,
+            execution_id=record.execution_id,
+            state=state,
+            reason=reason,
+        )
+        interrupted_priority.add(index)
+        if prepared is None:
             pending.append(index)
+        else:
+            ready[index] = prepared
+    pending.extend(ordinary_pending)
 
     worker_cpu_budget = execution.total_cpu_quota - execution.coordinator_cpus
     stage_threads = max(1, execution.coordinator_cpus // queue.download_workers)
@@ -165,18 +254,22 @@ def main(argv: list[str] | None = None) -> int:
                     if active.missing_since is None:
                         active.missing_since = now
                     elif now - active.missing_since > 30:
-                        current_claim = saved.get("claim_id")
-                        if (
-                            saved.get("execution_id") == record.execution_id
-                            and isinstance(current_claim, str)
-                        ):
-                            builder.state.fail(
-                                item.item_id,
+                        prepared = _reclaim_interrupted(
+                            builder,
+                            item,
+                            execution_id=record.execution_id,
+                            state=saved,
+                            reason=(
                                 f"Slurm job {active.slurm_job_id} ended without "
-                                "terminal sample state",
-                                claim_id=current_claim,
-                            )
+                                "terminal sample state"
+                            ),
+                        )
                         running.pop(index)
+                        interrupted_priority.add(index)
+                        if prepared is None:
+                            pending.insert(0, index)
+                        else:
+                            ready[index] = prepared
                         made_progress = True
 
             active_cpus = sum(value.cpus for value in running.values())
@@ -188,7 +281,10 @@ def main(argv: list[str] | None = None) -> int:
                 available_cpus = worker_cpu_budget - active_cpus
                 if available_cpus < execution.min_cpus_per_job:
                     break
-                index = min(ready)
+                index = min(
+                    ready,
+                    key=lambda candidate: (candidate not in interrupted_priority, candidate),
+                )
                 prepared = ready[index]
                 item = prepared.item
                 ready_items = [ready[key].item for key in sorted(ready) if key != index]
@@ -246,6 +342,7 @@ def main(argv: list[str] | None = None) -> int:
                     claim_id=prepared.claim_id,
                 )
                 ready.pop(index)
+                interrupted_priority.discard(index)
                 active_cpus += cpus
                 made_progress = True
 

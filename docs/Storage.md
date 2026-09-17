@@ -143,7 +143,7 @@ QueuePolicy(
 
 | Parameter | Default | What it controls | How to choose | Restrictions |
 | --- | --- | --- | --- | --- |
-| `download_workers: int` | `2` | Size of the shared staging thread pool in local and single-node modes | Begin with `1` or `2`; increase after checking NCBI/network and disk throughput | Must be positive; does not create a separate download pool in distributed mode |
+| `download_workers: int` | `2` | Size of the staging thread pool in every mode | Begin with `1` or `2`; increase after checking NCBI/network, disk, and coordinator resources | Must be positive |
 | `max_inflight_gb: float \| None` | `None` | Estimated total admitted workload | Set below usable storage after reserving space for caches, outputs, metadata, and estimation error | Must be positive when set |
 | `processing_storage_multiplier: float` | `1.0` | Estimated peak total processing footprint relative to raw size | Measure a representative sample; use a conservative initial value such as `2`–`4` for archive + FASTQ + BAM pipelines | Must be at least `1` |
 | `cleanup` | `"after_success"` | Whether provider-owned inputs are removed after verified success | Keep default if NCBI input can be reacquired; choose `"never"` for offline reuse | Only `"after_success"` or `"never"` |
@@ -172,14 +172,16 @@ Before admitting a new download, its raw size is added to that estimate.
 
 ### Distributed mode
 
-There is no separate coordinator download pool. Each active worker stages and
-processes its own unit, so the estimate is:
+The coordinator tracks raw size for staging and downloaded-ready units, plus
+the multiplied estimate for active processor workers:
 
 ```text
-sum(raw size of active worker units × processing_storage_multiplier)
+sum(raw size of staging and ready units)
++ sum(raw size of active worker units × processing_storage_multiplier)
 ```
 
-A candidate adds its own multiplied raw estimate before admission.
+A new staging candidate adds its raw estimate before admission. It does not
+consume processing CPUs until it reaches the ready queue.
 
 ### Oversized single-unit exception
 

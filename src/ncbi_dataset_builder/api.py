@@ -1011,6 +1011,21 @@ class DatasetBuilder:
                     scientific_name=item.unit.scientific_name,
                     pin=item.genome_pin,
                 )
+                self.state.set_genome(
+                    item.item_id,
+                    genome.to_dict(),
+                    claim_id=str(claim_id),
+                )
+                download_phase = (
+                    "downloading-sra"
+                    if isinstance(self.fastq_provider, SraToolkitProvider)
+                    else "downloading-input"
+                )
+                self.state.set_phase(
+                    item.item_id,
+                    download_phase,
+                    claim_id=str(claim_id),
+                )
                 staged = self._stage_fastq(item, threads=stage_threads)
                 prepared = _PreparedUnit(
                     item=item,
@@ -1608,7 +1623,15 @@ class DatasetBuilder:
                 output_roles = [Path(str(path)).name for path in serialized_outputs]
             else:
                 output_roles = []
-            genome = result.get("genome") if isinstance(result.get("genome"), dict) else {}
+            prepared = state.get("prepared") if isinstance(state.get("prepared"), dict) else {}
+            prepared_genome = (
+                prepared.get("genome") if isinstance(prepared.get("genome"), dict) else {}
+            )
+            state_genome = state.get("genome") if isinstance(state.get("genome"), dict) else {}
+            result_genome = (
+                result.get("genome") if isinstance(result.get("genome"), dict) else {}
+            )
+            genome = result_genome or prepared_genome or state_genome
             if genome.get("accession"):
                 execution_genomes[str(genome["accession"])] = genome
             error_lines = [line.strip() for line in str(state.get("error") or "").splitlines() if line.strip()]
@@ -1630,6 +1653,8 @@ class DatasetBuilder:
                     "attempts": int(state.get("attempts", 0)),
                     "allocated_cpus": state.get("allocated_cpus"),
                     "slurm_job_id": state.get("slurm_job_id"),
+                    "previous_slurm_job_id": state.get("previous_slurm_job_id"),
+                    "interruption_reason": state.get("interruption_reason"),
                     "started_at": state.get("started_at"),
                     "finished_at": state.get("finished_at"),
                     "log_path": state.get("log_path"),

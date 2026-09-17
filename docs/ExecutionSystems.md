@@ -35,8 +35,8 @@ topology, path visibility, and some queue semantics change.
 | Processor CPU assignment | Dynamic when processing starts | Dynamic when processing starts | Fixed when the worker is submitted |
 | Sample memory | Not modeled or enforced | Admission reservation inside the allocation | Hard `--mem` request per worker |
 | Storage policy | `FilesystemStorage` | `QuotaStorage` | `QuotaStorage` |
-| Download topology | Shared download thread pool | Shared download thread pool in allocation | Each sample worker stages its own input |
-| `download_workers` effect | Limits concurrent staging | Limits concurrent staging | No separate coordinator download pool; worker concurrency is controlled by `max_running_jobs` |
+| Download topology | Shared download thread pool | Shared download thread pool in allocation | Coordinator-side download thread pool |
+| `download_workers` effect | Limits concurrent staging | Limits concurrent staging | Limits coordinator-side staging before worker submission |
 | Failure isolation | Per-unit state, same process | Per-unit state, same Slurm allocation | Per-unit state and separate Slurm job |
 | Main API | `builder.build()` | `builder.submit_slurm()` | `builder.submit_slurm()` |
 | Return at submission | Completed `BuildReport` | Script path and coordinator job ID | Script path and coordinator job ID |
@@ -102,7 +102,7 @@ operational effect in every topology.
 
 | Parameter | Default | Meaning | Starting point | Restrictions and interactions |
 | --- | --- | --- | --- | --- |
-| `download_workers: int` | `2` | Maximum simultaneous stage operations in the local/single-node download pool | Start at `1`–`2`; increase only if network/storage tolerate it | Positive; distributed mode has no separate pool, so this does not cap worker downloads |
+| `download_workers: int` | `2` | Maximum simultaneous stage operations | Start at `1`–`2`; increase only if network/storage and coordinator resources tolerate it | Positive; in distributed mode staging runs inside the coordinator allocation |
 | `max_inflight_gb: float \| None` | `None` | Estimated workload window for downloading, ready, and processing units | Set after measuring sample sizes; leave `None` only when physical capacity is comfortably large | Positive when set; it is an estimate, not a disk quota |
 | `processing_storage_multiplier: float` | `1.0` | Peak total processing footprint divided by raw sample size | For raw + FASTQ + BAM workflows, begin around `2`–`4`, then measure | At least `1`; not “additional copies” |
 | `cleanup` | `"after_success"` | Removes provider-owned staged input after verified success | Keep default when inputs are reproducible from NCBI | Only `"after_success"` or `"never"` |
@@ -137,8 +137,8 @@ Important consequences:
 - allocations are chosen at launch, not continuously resized;
 - a running processor keeps its assigned integer `threads`;
 - later units may receive different allocations;
-- the FASTQ provider stages/materializes using the unit’s configured minimum
-  CPU request, while the processor receives the dynamic launch allocation; and
+- the FASTQ provider stages using the staging-pool budget and materializes
+  FASTQ with the dynamic processor allocation; and
 - the processor must respect the `threads` argument.
 
 ### Distributed Slurm
@@ -149,10 +149,13 @@ The worker CPU budget is:
 total_cpu_quota - coordinator_cpus
 ```
 
-For each admission, the coordinator divides this budget by the running plus
-pending worker cohort, then clamps the result to the configured minimum,
-maximum, and currently available CPUs. That integer becomes both
-`#SBATCH --cpus-per-task` and the processor’s `threads` value.
+The coordinator first resolves the genome and stages provider input. Only a
+downloaded-ready unit can enter worker admission. For each admission, the
+coordinator divides the worker budget across active plus ready units, then
+clamps the result to the configured minimum, maximum, and currently available
+CPUs. Pending and still-downloading units do not dilute the share. The selected
+integer becomes both `#SBATCH --cpus-per-task` and the processor’s `threads`
+value.
 
 A submitted Slurm job cannot be resized. A later job can receive another
 request when the cohort or available quota changes.
@@ -166,7 +169,7 @@ request when the cohort or available quota changes.
 | Memory limit | None | Sum of active `memory_gb_per_job` reservations cannot exceed `allocation_memory_gb` | Slurm enforces each worker’s `--mem`; coordinator has its own request |
 | Storage limit | Filesystem usable free space | Quota usable space | Quota usable space |
 | Workload estimate | `max_inflight_gb` | `max_inflight_gb` | `max_inflight_gb` |
-| Download limit | `download_workers` | `download_workers` | Worker admission; no separate download pool |
+| Download limit | `download_workers` | `download_workers` | `download_workers` in the coordinator staging pool |
 
 Effective concurrency is always the smallest limit that currently permits a
 unit. Configuring `max_running_jobs=50` does not guarantee 50 simultaneous
@@ -301,14 +304,13 @@ Continue with [Distributed Slurm](SlurmDistributedExecution.md).
 - Local execution has no memory parameter or memory enforcement.
 - Single-node `memory_gb_per_job` is an admission reservation inside one
   allocation, not a separate Slurm memory cgroup per sample.
-- Distributed workers stage their own input. `download_workers` does not
-  create a separate distributed download pool.
+- Distributed staging runs in the coordinator allocation and is limited by
+  `download_workers`; size `coordinator_cpus` for that work.
 - Distributed CPU requests are fixed after worker submission.
 - Slurm requires an importable processor reference; direct callable objects
   are local-only.
-- The standard Slurm worker reconstruction uses the default SRA provider and
-  default genome manager. Custom provider/manager objects attached to the
-  submitting builder are not serialized.
+- Standard SRA and GEO provider settings are serialized. Custom provider or
+  genome-manager objects attached to the submitting builder are not serialized.
 - Generated Slurm scripts pass the workspace, email, grouping, execution
   record, and processor reference. They do not reproduce arbitrary shell
   initialization.

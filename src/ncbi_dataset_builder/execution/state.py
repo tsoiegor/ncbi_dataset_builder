@@ -17,6 +17,8 @@ from ..support.util import (
     utc_timestamp,
 )
 
+ACTIVE_STATUSES = frozenset({"downloading", "ready", "submitted", "running"})
+
 
 class UnitStateStore:
     """Persist restart-safe state for independently processed samples."""
@@ -90,7 +92,7 @@ class UnitStateStore:
                     return False
                 if status == "failed" and same_work and not retry_failed and not force:
                     return False
-                if status in {"running", "submitted"}:
+                if status in ACTIVE_STATUSES:
                     started = float(
                         previous.get("started_epoch")
                         or previous.get("submitted_epoch")
@@ -117,12 +119,12 @@ class UnitStateStore:
                 self._path(unit_id),
                 {
                     "unit_id": unit_id,
-                    "status": "running",
+                    "status": "downloading",
                     "attempts": attempts,
                     "started_at": utc_timestamp(),
                     "started_epoch": time.time(),
                     "host": socket.gethostname(),
-                    "phase": "staging",
+                    "phase": "resolving-genome",
                     "log_path": str(log_path),
                     "fingerprint": fingerprint,
                     "execution_id": execution_id,
@@ -131,6 +133,9 @@ class UnitStateStore:
                     "slurm_job_id": submitted.get("slurm_job_id"),
                     "allocated_cpus": submitted.get("allocated_cpus"),
                     "allocated_memory_gb": submitted.get("allocated_memory_gb"),
+                    "interrupted_at": (previous or {}).get("interrupted_at"),
+                    "interruption_reason": (previous or {}).get("interruption_reason"),
+                    "previous_slurm_job_id": (previous or {}).get("previous_slurm_job_id"),
                 },
             )
             return claim_id
@@ -164,7 +169,7 @@ class UnitStateStore:
             raise ValueError("Submission needs a job ID and positive resources")
         with exclusive_file_lock(self._lock(unit_id), timeout_seconds=60):
             previous = self.get(unit_id)
-            if previous and previous.get("status") in {"running", "submitted"}:
+            if previous and previous.get("status") in ACTIVE_STATUSES:
                 raise UnitAlreadyRunning(f"Sample is already active: {unit_id}")
             if previous and previous.get("fingerprint") != fingerprint:
                 self._archive(unit_id, previous)
@@ -209,11 +214,44 @@ class UnitStateStore:
 
         with exclusive_file_lock(self._lock(unit_id), timeout_seconds=60):
             previous = self._require_claim(unit_id, self.get(unit_id), claim_id)
-            if not previous or previous.get("status") != "running":
+            if previous.get("status") not in ACTIVE_STATUSES:
                 raise ValueError(f"Cannot update an unclaimed sample: {unit_id}")
+            status = previous.get("status")
+            updates: dict[str, Any] = {}
+            if phase == "processing":
+                status = "running"
+                updates["host"] = socket.gethostname()
+                if previous.get("slurm_job_id") and not previous.get("worker_activated_at"):
+                    updates["worker_activated_at"] = utc_timestamp()
+            elif phase in {"resolving-genome", "downloading-input", "downloading-sra"}:
+                status = "downloading"
             atomic_write_json(
                 self._path(unit_id),
-                {**previous, "phase": phase, "phase_updated_at": utc_timestamp()},
+                {
+                    **previous,
+                    **updates,
+                    "status": status,
+                    "phase": phase,
+                    "phase_updated_at": utc_timestamp(),
+                },
+            )
+
+    def set_genome(self, unit_id: str, genome: dict[str, Any], *, claim_id: str) -> None:
+        """Persist the resolved *genome* while input download continues.
+
+        Args:
+            unit_id: Processing unit whose genome was resolved.
+            genome: Serialized genome reference.
+            claim_id: Current owner token for the unit.
+        """
+
+        with exclusive_file_lock(self._lock(unit_id), timeout_seconds=60):
+            previous = self._require_claim(unit_id, self.get(unit_id), claim_id)
+            if previous.get("status") not in {"downloading", "running"}:
+                raise ValueError(f"Cannot record a genome for an inactive sample: {unit_id}")
+            atomic_write_json(
+                self._path(unit_id),
+                {**previous, "genome": genome, "genome_updated_at": utc_timestamp()},
             )
 
     def set_ready(
@@ -227,12 +265,13 @@ class UnitStateStore:
 
         with exclusive_file_lock(self._lock(unit_id), timeout_seconds=60):
             previous = self._require_claim(unit_id, self.get(unit_id), claim_id)
-            if previous.get("status") != "running":
+            if previous.get("status") not in {"downloading", "running"}:
                 raise ValueError(f"Cannot prepare an unclaimed sample: {unit_id}")
             atomic_write_json(
                 self._path(unit_id),
                 {
                     **previous,
+                    "status": "ready",
                     "phase": "ready",
                     "phase_updated_at": utc_timestamp(),
                     "prepared": prepared,
@@ -254,7 +293,7 @@ class UnitStateStore:
             raise ValueError("Submission needs a job ID and positive resources")
         with exclusive_file_lock(self._lock(unit_id), timeout_seconds=60):
             previous = self._require_claim(unit_id, self.get(unit_id), claim_id)
-            if previous.get("status") != "running" or previous.get("phase") != "ready":
+            if previous.get("status") not in {"ready", "running"} or previous.get("phase") != "ready":
                 raise ValueError(f"Cannot submit a sample that is not ready: {unit_id}")
             if not isinstance(previous.get("prepared"), dict):
                 raise TypeError(f"Ready sample lacks persisted input: {unit_id}")
@@ -263,6 +302,8 @@ class UnitStateStore:
                 {
                     **previous,
                     "status": "submitted",
+                    "phase": "queued",
+                    "phase_updated_at": utc_timestamp(),
                     "submitted_at": utc_timestamp(),
                     "submitted_epoch": time.time(),
                     "slurm_job_id": slurm_job_id,
@@ -277,18 +318,72 @@ class UnitStateStore:
 
         with exclusive_file_lock(self._lock(unit_id), timeout_seconds=60):
             previous = self._require_claim(unit_id, self.get(unit_id), claim_id)
-            if previous.get("status") != "submitted" or previous.get("phase") != "ready":
+            if previous.get("status") != "submitted" or previous.get("phase") not in {
+                "queued",
+                "ready",
+            }:
                 raise ValueError(f"Cannot activate a sample that is not submitted: {unit_id}")
             atomic_write_json(
                 self._path(unit_id),
                 {
                     **previous,
                     "status": "running",
+                    "phase": "starting",
+                    "phase_updated_at": utc_timestamp(),
                     "started_at": utc_timestamp(),
                     "started_epoch": time.time(),
                     "worker_activated_at": utc_timestamp(),
+                    "host": socket.gethostname(),
                 },
             )
+
+    def requeue_interrupted(
+        self,
+        unit_id: str,
+        *,
+        reason: str,
+        expected_job_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Invalidate an abandoned claim and put *unit_id* back into pending state.
+
+        Args:
+            unit_id: Processing unit to recover.
+            reason: Human-readable interruption explanation retained in state.
+            expected_job_id: Optional Slurm job that must still own the state.
+        """
+
+        with exclusive_file_lock(self._lock(unit_id), timeout_seconds=60):
+            previous = self.get(unit_id)
+            if not previous:
+                raise ValueError(f"Cannot requeue missing sample state: {unit_id}")
+            if expected_job_id is not None and previous.get("slurm_job_id") != expected_job_id:
+                raise StaleUnitClaim(
+                    f"Slurm job changed for {unit_id}: expected {expected_job_id}, "
+                    f"current {previous.get('slurm_job_id')}"
+                )
+            if previous.get("status") not in ACTIVE_STATUSES:
+                return previous
+            now = utc_timestamp()
+            updated = {
+                **previous,
+                "status": "pending",
+                "phase": "interrupted",
+                "phase_updated_at": now,
+                "interrupted_at": now,
+                "interruption_reason": reason,
+                "previous_slurm_job_id": previous.get("slurm_job_id"),
+                "slurm_job_id": None,
+                "allocated_cpus": None,
+                "allocated_memory_gb": None,
+                "submitted_at": None,
+                "submitted_epoch": None,
+                "worker_activated_at": None,
+                "claim_id": None,
+                "finished_at": None,
+                "error": None,
+            }
+            atomic_write_json(self._path(unit_id), updated)
+            return updated
 
     def set_runtime_resources(
         self,
@@ -302,7 +397,7 @@ class UnitStateStore:
 
         with exclusive_file_lock(self._lock(unit_id), timeout_seconds=60):
             previous = self._require_claim(unit_id, self.get(unit_id), claim_id)
-            if not previous or previous.get("status") != "running":
+            if previous.get("status") != "running":
                 raise ValueError(f"Cannot allocate an unclaimed sample: {unit_id}")
             atomic_write_json(
                 self._path(unit_id),
@@ -356,7 +451,15 @@ class UnitStateStore:
             else sorted(self.root.glob("*.json"))
         )
         records = [read_json(path) for path in paths if path.is_file()]
-        counts = {"pending": 0, "submitted": 0, "running": 0, "succeeded": 0, "failed": 0}
+        counts = {
+            "pending": 0,
+            "downloading": 0,
+            "ready": 0,
+            "submitted": 0,
+            "running": 0,
+            "succeeded": 0,
+            "failed": 0,
+        }
         for record in records:
             status = str(record.get("status", "pending"))
             counts[status] = counts.get(status, 0) + 1

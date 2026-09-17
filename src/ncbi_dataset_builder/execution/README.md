@@ -319,9 +319,11 @@ UnitStateStore(root)
 | `start(unit_id, *, fingerprint, execution_id, item, log_path, retry_failed=False, reclaim_running=False, stale_after_seconds=604800, force=False)` | Atomically claim a unit; return a unique claim token when work should run, otherwise `False`. |
 | `record_submission(unit_id, *, slurm_job_id, cpus, memory_gb, fingerprint, execution_id, item, log_path)` | Persist a held distributed job before release and return its unique claim token. |
 | `set_phase(unit_id, phase, *, claim_id)` | Update the phase only while the caller still owns the claim. |
+| `set_genome(unit_id, genome, *, claim_id)` | Persist the resolved genome before provider input finishes downloading. |
 | `set_ready(unit_id, prepared, *, claim_id)` | Persist restartable genome/input staging under the current claim. |
 | `record_ready_submission(unit_id, *, slurm_job_id, cpus, memory_gb, claim_id)` | Attach a held worker job to an already-ready claim. |
 | `activate_ready_submission(unit_id, *, claim_id)` | Transition a submitted ready unit when its worker starts. |
+| `requeue_interrupted(unit_id, *, reason, expected_job_id=None)` | Invalidate abandoned ownership and expose the unit as pending for prioritized recovery. |
 | `set_runtime_resources(unit_id, *, cpus, memory_gb, claim_id)` | Record actual launch resources only for the current claim. |
 | `succeed(unit_id, result, *, claim_id)` | Persist terminal success only for the current claim. |
 | `fail(unit_id, error, *, claim_id)` | Persist terminal failure with a bounded traceback tail only for the current claim. |

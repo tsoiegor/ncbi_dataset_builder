@@ -135,9 +135,11 @@ scientific semantics must change.
 | Status/phase | Meaning |
 | --- | --- |
 | No file / pending | Unit has not been claimed for this workspace state |
+| `downloading` / `resolving-genome` | Genome selection/download is in progress |
+| `downloading` / `downloading-sra` or `downloading-input` | Provider input is being staged |
+| `ready` / `ready` | Input and genome are durable and waiting for processing capacity |
 | `submitted` / `queued` | Distributed Slurm job ID and resources are durably recorded |
-| `running` / `staging` | Unit is claimed; genome and provider input are being prepared |
-| `running` / `ready` | Input and genome are ready for processing |
+| `running` / `starting` | A distributed worker has started but has not entered the processor yet |
 | `running` / `processing` | Processor is running |
 | `succeeded` / `completed` | Result and validation metadata are durable |
 | `failed` / `failed` | Bounded traceback tail is stored |
@@ -170,7 +172,7 @@ resets its processor-owned unit output directory before processing.
 | Matching success with invalid output | Rebuild | Rebuild |
 | Matching failure | Return/leave skipped failure state | Reclaim and retry |
 | Different fingerprint | Archive old state and run new work | Same |
-| Active matching claim | Local caller receives skipped `UnitAlreadyRunning`; distributed worker may reclaim its submitted/running claim | Same relevant mode behavior |
+| Active matching claim | Local caller receives skipped `UnitAlreadyRunning`; distributed resume checks its recorded Slurm job before either reattaching or reclaiming it | Same relevant mode behavior |
 
 Retry changes whether matching failures are reclaimed. It does not bypass
 fingerprints or make invalid outputs acceptable.
@@ -217,9 +219,12 @@ For each sample the coordinator:
 4. releases the held job; and
 5. cancels it if durable submission bookkeeping fails after `sbatch`.
 
-The coordinator uses `squeue` to observe active jobs. When `squeue` fails, new
-admission pauses. If a job disappears for more than 30 seconds without writing
-terminal unit state, the coordinator marks that unit failed.
+The coordinator reads the active Slurm queue once and filters it to recorded job
+IDs, so a purged historical ID does not make `squeue` fail. When `squeue` itself
+fails, new admission pauses. If a job disappears for more than 30 seconds
+without writing terminal unit state, its old claim is invalidated and the unit
+is put at the front of the queue. Persisted prepared input is reused; otherwise
+provider staging resumes from its cache.
 
 ## Dataset shaping
 

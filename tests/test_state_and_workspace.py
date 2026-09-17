@@ -41,6 +41,8 @@ def test_state_claim_success_resume_and_repair(tmp_path):
     }
     claim_id = store.start(item.item_id, **arguments)
     assert isinstance(claim_id, str)
+    assert store.get(item.item_id)["status"] == "downloading"
+    assert store.get(item.item_id)["phase"] == "resolving-genome"
     with pytest.raises(UnitAlreadyRunning):
         store.start(item.item_id, **arguments)
     store.set_phase(item.item_id, "processing", claim_id=claim_id)
@@ -94,6 +96,32 @@ def test_submitted_state_and_summary(tmp_path):
     summary = store.summary([item.item_id, "SRX2"])
     assert summary["counts"]["submitted"] == 1
     assert summary["counts"]["pending"] == 1
+
+
+def test_interrupted_state_is_requeued_and_old_claim_is_invalidated(tmp_path):
+    store = UnitStateStore(tmp_path / "state" / "units")
+    item = queue_item()
+    old_claim = store.start(
+        item.item_id,
+        fingerprint=item.fingerprint,
+        execution_id="old-execution",
+        item=item.to_dict(),
+        log_path=tmp_path / "sample.log",
+    )
+    assert isinstance(old_claim, str)
+    store.set_phase(item.item_id, "processing", claim_id=old_claim)
+
+    state = store.requeue_interrupted(
+        item.item_id,
+        reason="Slurm job 1582667 is no longer active",
+    )
+
+    assert state["status"] == "pending"
+    assert state["phase"] == "interrupted"
+    assert state["allocated_cpus"] is None
+    assert state["slurm_job_id"] is None
+    with pytest.raises(StaleUnitClaim):
+        store.succeed(item.item_id, {}, claim_id=old_claim)
 
 
 def test_workspace_persists_only_execution_records(tmp_path):
