@@ -24,9 +24,7 @@ def test_default_export_is_compact_and_keyed_by_experiment(tmp_path):
     text = "Protocol: " + "step with exact concentration 2.5 mM; " * 300
     bundle.experiments[0]["library"]["construction_protocol"] = text
     bundle.save(tmp_path)
-    description = json.loads(
-        (tmp_path / "experiment_descriptions/SRX5809925.json").read_text(encoding="utf-8")
-    )
+    description = bundle.descriptions_by_experiment()["SRX5809925"]
     assert description["ID"] == "SRX5809925"
     assert description["SRA Sample ID"] == "SRS4739189"
     assert description["Strategy"] == "ATAC-seq"
@@ -41,6 +39,7 @@ def test_default_export_is_compact_and_keyed_by_experiment(tmp_path):
     )
     # Complete metadata is still available for auditing and downloads.
     assert json.loads((tmp_path / "metadata.json").read_text(encoding="utf-8"))["runs"][0]["files"]
+    assert not (tmp_path / "experiment_descriptions").exists()
 
 
 def test_biology_aliases_placeholders_and_administrative_attributes():

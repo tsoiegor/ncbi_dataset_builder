@@ -91,7 +91,7 @@ READMEs answer “what does this class or method accept?”:
 | NCBI metadata | [Metadata API](../src/ncbi_dataset_builder/metadata/README.md) |
 | Custom processors | [Processing API](../src/ncbi_dataset_builder/processing/README.md) |
 | Built-in ATAC processor | [ATAC API](../src/ncbi_dataset_builder/processing/atac/README.md) |
-| Workspace and publication | [Workspace API](../src/ncbi_dataset_builder/workspace/README.md) |
+| Workspace and manifest | [Workspace API](../src/ncbi_dataset_builder/workspace/README.md) |
 
 ## Units used in these guides
 

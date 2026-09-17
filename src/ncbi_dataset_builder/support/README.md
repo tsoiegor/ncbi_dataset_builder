@@ -233,8 +233,7 @@ exclusive_file_lock(
 
 The context records PID, host, creation time, and optional heartbeat. Local
 ownership checks use process liveness where possible. Callers use narrow lock
-paths for workspace config, queue coordination, downloads, genomes, state, and
-publication.
+paths for workspace config, queue coordination, downloads, genomes, and state.
 
 # Export status
 

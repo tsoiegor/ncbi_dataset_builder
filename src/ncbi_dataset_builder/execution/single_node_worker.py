@@ -6,7 +6,7 @@ import argparse
 import os
 from pathlib import Path
 
-from ..api import BuilderConfig, DatasetBuilder
+from ..api import DatasetBuilder
 from ..processing.base import load_processor
 from ..workspace import WorkspaceStore
 from .config import (
@@ -32,13 +32,11 @@ def main(argv: list[str] | None = None) -> int:
     if not isinstance(execution, SlurmSingleNodeExecution):
         raise TypeError("Execution record is not configured for one-node Slurm")
     queue = queue_policy_from_dict(record.queue_config)
-    builder = DatasetBuilder(
-        BuilderConfig(
-            workspace=arguments.workspace,
-            email=arguments.email,
-            ncbi_api_key=os.environ.get("NCBI_API_KEY"),
-            group_by=record.group_by,
-        )
+    builder = DatasetBuilder.from_execution_record(
+        workspace=arguments.workspace,
+        record=record,
+        email=arguments.email,
+        ncbi_api_key=os.environ.get("NCBI_API_KEY"),
     )
     report = builder._run_streaming(
         record,

@@ -26,7 +26,6 @@ this page explains exact argument-to-object mapping.
 | `submit-single-node` | `builder.submit_slurm(..., SlurmSingleNodeExecution(...))` | 0 after script creation/submission |
 | `submit-distributed` | `builder.submit_slurm(..., SlurmDistributedExecution(...))` | 0 after coordinator script creation/submission |
 | `status` | `builder.status()` | Prints an experiment summary; `--json` prints structured data |
-| `publish` | `builder.publish_dataset()` | Prints manifest path |
 
 ## Stable builder arguments
 
@@ -35,6 +34,7 @@ Every command accepts:
 | Option | Default | `BuilderConfig` field |
 | --- | --- | --- |
 | `--workspace PATH` | required | `workspace` |
+| `--output-dir PATH` | `WORKSPACE/output` | `output_dir` |
 | `--email ADDRESS` | `NCBI_EMAIL` | `email` |
 | `--ncbi-api-key KEY` | `NCBI_API_KEY` | `ncbi_api_key` |
 | `--group-by LEVEL` | `experiment` | `group_by` |
@@ -155,20 +155,6 @@ Stable builder arguments are accepted because the same builder initializes the
 workspace, but status reads saved execution and unit state. The default view
 shows overall progress, all experiment states, phases, species, runs, genomes,
 named outputs, attempts, metadata-cache coverage, and actionable failures.
-
-## `publish`
-
-```bash
-# Publish the latest verified experiment execution.
-ncbi-dataset publish +  --workspace /data/ncbi-workspace +  --destination /data/model-dataset +  --mode auto
-```
-
-| Option | Meaning |
-| --- | --- |
-| `--destination PATH` | Separate target; omitted means in-place publication. |
-| `--execution-id ID` | Explicit snapshot; omitted selects the latest. |
-| `--mode auto|hardlink|copy` | File materialization policy. |
-| `--overwrite` | Permit atomic replacement of an existing separate target. |
 
 # Python entry point
 

@@ -15,7 +15,7 @@ from a wheel built from this checkout.
 | Load an existing RunInfo CSV and use custom local files/tools | Base package | Only commands required by your provider and processor |
 | Fetch SRA archives and convert to FASTQ | Base package | `prefetch`, `vdb-validate`, `fasterq-dump`; optional `pigz` |
 | Resolve and download NCBI genomes | Base package | NCBI `datasets` |
-| Run the built-in ATAC processor | Base package | `fastp`, `bowtie2`, `bowtie2-build`, `samtools`, `bamCoverage` |
+| Run the built-in ATAC processor | Base package | `fastp`, `bowtie2`, `bowtie2-build`, `samtools`, `bamCoverage`, ExpressionPredict `bam2bw.py`, and that script's Python dependencies |
 | Submit Slurm jobs | Base package | `sbatch`; distributed mode also needs `scontrol`, `scancel`, and `squeue` |
 | Show tqdm progress bars | `progress` extra | No additional command |
 | Run tests and lint | `dev` extra | No additional command |
@@ -63,7 +63,7 @@ pytest-cov, and Ruff.
 | `bowtie2-build` | `AtacSeqProcessor` | Creates a reusable six-file Bowtie2 index |
 | `bowtie2` | `AtacSeqProcessor` | Aligns cleaned reads |
 | `samtools` | `AtacSeqProcessor` | Converts, sorts, merges/copies, and CSI-indexes BAM files |
-| `bamCoverage` | `AtacSeqProcessor` | Produces BigWig coverage |
+| `bam2bw.py` + `bamCoverage` | `AtacSeqProcessor` | Splits unstranded ATAC signal into forward/reverse BigWigs and annotates coverage |
 | `sbatch` | Both Slurm modes | Submits generated coordinator and, in distributed mode, worker scripts |
 | `scontrol` | Distributed Slurm | Releases a worker after its job ID and resources are persisted |
 | `scancel` | Distributed Slurm | Cancels a held worker when durable submission fails |
@@ -122,6 +122,8 @@ srun --partition=compute --cpus-per-task=1 --mem=2G --time=00:05:00 \
 | Import works on login node but Slurm job fails | Different interpreter, missing editable checkout, or batch `PATH` | Inspect the generated script and test its exact Python path inside `srun` |
 | `datasets` is missing | NCBI Datasets CLI was not installed | Install `ncbi-datasets-cli` and rerun `GenomeManager.preflight()` |
 | ATAC preflight fails at `bamCoverage` | deepTools is missing from the active environment | Install deepTools in the compute environment |
+| ATAC preflight cannot open `bam2bw.py` | `bam2bw_script`/`BAM2BW_SCRIPT` is unset or node-local | Configure an absolute path visible on every processing node |
+| `bam2bw.py --help` fails during preflight | Its Python dependencies or sibling modules are missing | Use the configured interpreter and keep `utils.py`/`bam_utils.py` beside the script |
 | SRA conversion is slow during compression | `pigz` is absent | Install `pigz` or accept single-process Python gzip |
 | Tool exists interactively but not in Slurm | Shell modules/Conda activation are not applied in batch | Make the submitting interpreter and tool `PATH` available to the batch environment |
 

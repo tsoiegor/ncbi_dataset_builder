@@ -5,7 +5,7 @@ import pytest
 
 from ncbi_dataset_builder.acquisition.fastq import GeoFastqProvider, SraToolkitProvider
 from ncbi_dataset_builder.errors import DownloadError, ExternalToolError
-from ncbi_dataset_builder.models import FastqLayout, ProcessingUnit
+from ncbi_dataset_builder.models import FastqLayout, FastqSet, ProcessingUnit
 
 
 class FakeDownloader:
@@ -75,6 +75,31 @@ class RecoveringPrefetchRunner(FakeSraRunner):
         target.write_bytes(b"sra")
 
 
+@pytest.mark.parametrize(
+    ("layout", "paired", "single"),
+    [
+        (FastqLayout.SINGLE, True, True),
+        (FastqLayout.PAIRED, True, True),
+        (FastqLayout.MIXED, True, False),
+    ],
+)
+def test_fastq_set_rejects_fields_that_contradict_layout(tmp_path, layout, paired, single):
+    read1 = tmp_path / "R1.fastq"
+    read2 = tmp_path / "R2.fastq"
+    orphan = tmp_path / "single.fastq"
+    for path in (read1, read2, orphan):
+        path.write_bytes(b"reads")
+    value = FastqSet(
+        layout,
+        ("SRR1",),
+        read1=(read1,) if paired else (),
+        read2=(read2,) if paired else (),
+        single=(orphan,) if single else (),
+    )
+    with pytest.raises(ValueError):
+        value.validate()
+
+
 def test_geo_provider_pairs_by_sample_key_and_preserves_single_reads(tmp_path):
     unit = ProcessingUnit("GSE1", ())
     provider = GeoFastqProvider(
@@ -100,6 +125,9 @@ def test_geo_provider_pairs_by_sample_key_and_preserves_single_reads(tmp_path):
         "sampleB_R2.fastq.gz",
     ]
     assert result.single[0].name == "orphans.fastq.gz"
+    staged = provider.stage(unit, tmp_path / "fastq", threads=2)
+    assert staged.cleanup_roots == (result.read1[0].parents[1],)
+    assert staged.size_gb > 0
 
 
 def test_geo_provider_rejects_an_unpaired_mate(tmp_path):

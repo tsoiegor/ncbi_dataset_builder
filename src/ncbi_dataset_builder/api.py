@@ -9,6 +9,7 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
 import traceback
 from collections.abc import Iterable, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -16,11 +17,16 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from .acquisition.fastq import FastqProvider, SraToolkitProvider
+from .acquisition.fastq import (
+    AtomicDownloader,
+    FastqProvider,
+    GeoFastqProvider,
+    SraToolkitProvider,
+)
 from .acquisition.genomes import GenomeManager, GenomeSelectionPolicy
 from .acquisition.geo import GeoClient
 from .catalog import GroupLevel, RunCatalog, validate_polars_runtime
-from .errors import UnitAlreadyRunning
+from .errors import StaleUnitClaim, UnitAlreadyRunning
 from .execution.config import (
     ExecutionSystem,
     LocalExecution,
@@ -41,7 +47,6 @@ from .metadata import (
     fetch_metadata_for_accessions,
     fetch_metadata_for_catalog,
 )
-from .metadata.descriptions import DescriptionPolicy
 from .models import (
     FastqSet,
     GenomeRef,
@@ -61,7 +66,6 @@ from .support.util import (
     utc_timestamp,
 )
 from .workspace import WorkspaceStore
-from .workspace.publishing import DatasetExport, DatasetPublisher, PublishMode
 
 LOGGER = logging.getLogger("ncbi_dataset_builder.api")
 
@@ -71,12 +75,12 @@ class BuilderConfig:
     """Configure stable NCBI and workspace behavior.
 
     Args:
-        workspace: Root directory for caches, state, work, and outputs.
+        workspace: Root directory for the manifest, runtime data, and default output.
+        output_dir: Processor-owned output root; defaults to ``workspace/output``.
         email: Contact email required by NCBI Entrez.
         ncbi_api_key: Optional NCBI key for a higher request rate.
         genome_policy: Policy used to choose NCBI assemblies.
         group_by: Catalog entity represented by one processing unit.
-        description_profile: ``training`` or ``full`` metadata projection.
         prefetch_max_size: SRA Toolkit archive-size limit, or ``u`` for unlimited.
         show_progress: Display long-running operation progress.
         progress_bars: Use tqdm bars when available.
@@ -86,11 +90,11 @@ class BuilderConfig:
     """
 
     workspace: Path
+    output_dir: Path | None = None
     email: str | None = None
     ncbi_api_key: str | None = None
     genome_policy: GenomeSelectionPolicy = field(default_factory=GenomeSelectionPolicy)
     group_by: GroupLevel = "experiment"
-    description_profile: str = "training"
     prefetch_max_size: str = "u"
     show_progress: bool = True
     progress_bars: bool = True
@@ -99,12 +103,47 @@ class BuilderConfig:
         """Normalize the workspace and validate stable settings."""
 
         object.__setattr__(self, "workspace", Path(self.workspace))
+        if self.output_dir is not None:
+            object.__setattr__(self, "output_dir", Path(self.output_dir))
         if self.group_by not in {"run", "experiment", "sra_sample", "biosample"}:
             raise ValueError(f"Unknown workspace grouping level: {self.group_by!r}")
-        if self.description_profile not in {"training", "full"}:
-            raise ValueError(f"Unknown description profile: {self.description_profile!r}")
         if not self.prefetch_max_size.strip():
             raise ValueError("prefetch_max_size cannot be empty")
+
+    def to_worker_dict(self, *, output_dir: Path) -> dict[str, Any]:
+        """Serialize non-secret settings with resolved processor *output_dir*."""
+
+        return {
+            "output_dir": str(output_dir.resolve()),
+            "genome_policy": asdict(self.genome_policy),
+            "group_by": self.group_by,
+            "prefetch_max_size": self.prefetch_max_size,
+            "show_progress": self.show_progress,
+            "progress_bars": self.progress_bars,
+        }
+
+    @classmethod
+    def from_worker_dict(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        workspace: Path,
+        email: str | None,
+        ncbi_api_key: str | None,
+    ) -> BuilderConfig:
+        """Restore *value* for *workspace* using runtime *email* and *ncbi_api_key*."""
+
+        return cls(
+            workspace=workspace,
+            output_dir=Path(str(value["output_dir"])) if value.get("output_dir") else None,
+            email=email,
+            ncbi_api_key=ncbi_api_key,
+            genome_policy=GenomeSelectionPolicy(**dict(value.get("genome_policy", {}))),
+            group_by=str(value.get("group_by", "experiment")),
+            prefetch_max_size=str(value.get("prefetch_max_size", "u")),
+            show_progress=bool(value.get("show_progress", True)),
+            progress_bars=bool(value.get("progress_bars", True)),
+        )
 
 
 @dataclass(frozen=True)
@@ -165,6 +204,7 @@ class _PreparedUnit:
     staged: StagedFastq | None = None
     outcome: UnitOutcome | None = None
     reset_outputs: bool = False
+    claim_id: str | None = None
 
 
 class DatasetBuilder:
@@ -193,12 +233,12 @@ class DatasetBuilder:
             enabled=config.show_progress,
             use_bars=config.progress_bars,
         )
-        self.workspace = WorkspaceStore(config.workspace)
+        self.workspace = WorkspaceStore(config.workspace, output_dir=config.output_dir)
         if config.email:
             entrez = EntrezClient(
                 email=config.email,
                 api_key=config.ncbi_api_key,
-                cache_dir=config.workspace / "metadata_cache",
+                cache_dir=self.workspace.path("metadata_cache"),
                 progress=self.progress,
             )
             self.sra: SraClient | None = SraClient(entrez)
@@ -213,11 +253,183 @@ class DatasetBuilder:
             progress=self.progress,
         )
         self.genomes = genome_manager or GenomeManager(
-            config.workspace / "work" / "genome_cache",
+            self.workspace.path("genomes"),
             policy=config.genome_policy,
             progress=self.progress,
         )
-        self.state = UnitStateStore(config.workspace / "state" / "units")
+        self.state = UnitStateStore(self.workspace.path("state") / "units")
+        self._description_cache_lock = threading.Lock()
+        self._description_cache_signature: tuple[str, str] | None = None
+        self._description_cache: dict[str, dict[str, Any]] = {}
+
+    def _serialize_fastq_provider(self, *, required: bool) -> dict[str, Any] | None:
+        """Serialize the configured provider, rejecting unsupported Slurm providers."""
+
+        provider = self.fastq_provider
+        if type(provider) is SraToolkitProvider:
+            return {
+                "kind": "sra_toolkit",
+                "retries": provider.retries,
+                "prefetch_max_size": provider.prefetch_max_size,
+                "prefetch_reset_after_failures": provider.prefetch_reset_after_failures,
+                "prefetch_retry_max_delay_seconds": provider.prefetch_retry_max_delay_seconds,
+            }
+        if type(provider) is GeoFastqProvider:
+            downloader = provider.downloader
+            return {
+                "kind": "geo_fastq",
+                "urls": provider.urls,
+                "downloader": {
+                    "user_agent": downloader.user_agent,
+                    "retries": downloader.retries,
+                    "timeout_seconds": downloader.timeout_seconds,
+                },
+            }
+        if required:
+            raise TypeError(
+                "Slurm execution requires a serializable SraToolkitProvider or "
+                "GeoFastqProvider; custom providers cannot be reconstructed safely"
+            )
+        return None
+
+    @staticmethod
+    def _restore_fastq_provider(value: Mapping[str, Any] | None) -> FastqProvider | None:
+        """Restore a built-in FASTQ provider from serialized *value*."""
+
+        if not value:
+            return None
+        kind = value.get("kind")
+        if kind == "sra_toolkit":
+            return SraToolkitProvider(
+                retries=int(value.get("retries", 3)),
+                prefetch_max_size=str(value.get("prefetch_max_size", "u")),
+                prefetch_reset_after_failures=int(
+                    value.get("prefetch_reset_after_failures", 4)
+                ),
+                prefetch_retry_max_delay_seconds=float(
+                    value.get("prefetch_retry_max_delay_seconds", 300.0)
+                ),
+            )
+        if kind == "geo_fastq":
+            downloader_value = dict(value.get("downloader", {}))
+            downloader = AtomicDownloader(
+                user_agent=str(downloader_value["user_agent"]),
+                retries=int(downloader_value.get("retries", 5)),
+                timeout_seconds=float(downloader_value.get("timeout_seconds", 120.0)),
+            )
+            return GeoFastqProvider(
+                {
+                    str(unit_id): [str(url) for url in urls]
+                    for unit_id, urls in dict(value.get("urls", {})).items()
+                },
+                downloader=downloader,
+            )
+        raise ValueError(f"Unknown serialized FASTQ provider: {kind!r}")
+
+    @classmethod
+    def from_execution_record(
+        cls,
+        *,
+        workspace: Path,
+        record: ExecutionRecord,
+        email: str | None,
+        ncbi_api_key: str | None,
+    ) -> DatasetBuilder:
+        """Reconstruct *record* in *workspace* using runtime *email* and *ncbi_api_key*."""
+
+        serialized = record.metadata.get("builder_config")
+        if not isinstance(serialized, Mapping):
+            raise TypeError(
+                "Execution record lacks complete builder_config; recreate the Slurm execution"
+            )
+        config = BuilderConfig.from_worker_dict(
+            serialized,
+            workspace=workspace,
+            email=email,
+            ncbi_api_key=ncbi_api_key,
+        )
+        provider_value = record.metadata.get("fastq_provider_config")
+        if provider_value is not None and not isinstance(provider_value, Mapping):
+            raise TypeError("Execution fastq_provider_config must be a mapping")
+        return cls(config, fastq_provider=cls._restore_fastq_provider(provider_value))
+
+    def _processor_description(
+        self,
+        processor: Processor,
+        unit: ProcessingUnit,
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Return the profile and description requested by *processor* for *unit*."""
+
+        profile = getattr(processor, "description_profile", None)
+        if profile is None:
+            return None
+        if not isinstance(profile, str) or not profile:
+            raise TypeError("Processor description_profile must be a non-empty string")
+        experiments = unit.experiment_accessions
+        if len(experiments) != 1:
+            raise ValueError(
+                f"Processor {processor!r} requires exactly one experiment per unit; "
+                f"{unit.unit_id} contains {list(experiments)}"
+            )
+        metadata_path = self.workspace.path("metadata") / "metadata.json"
+        if not metadata_path.is_file():
+            raise FileNotFoundError(
+                f"Processor {processor!r} requires materialized {profile!r} metadata, "
+                f"but normalized metadata is missing at {metadata_path}. "
+                "Call builder.enrich_metadata(catalog) before build()."
+            )
+        signature = (profile, sha256_file(metadata_path, progress=self.progress))
+        with self._description_cache_lock:
+            if self._description_cache_signature != signature:
+                bundle = MetadataBundle.load(metadata_path, progress=self.progress)
+                self._description_cache = bundle.descriptions_by_experiment(
+                    profile=profile,
+                    progress=self.progress,
+                )
+                self._description_cache_signature = signature
+            descriptions = self._description_cache
+        experiment = experiments[0]
+        description = descriptions.get(experiment)
+        if description is None:
+            raise KeyError(
+                f"No {profile!r} description is available for experiment {experiment}"
+            )
+        return profile, description
+
+    def _materialize_processor_description(
+        self,
+        processor: Processor,
+        item: QueueItem,
+        output_dir: Path,
+    ) -> Path | None:
+        """Materialize a requested experiment description beside processor outputs."""
+
+        requested = self._processor_description(processor, item.unit)
+        if requested is None:
+            return None
+        _profile, description = requested
+        destination = output_dir / f"{item.item_id}.json"
+        atomic_write_json(destination, description)
+        return destination
+
+    def _description_identity(
+        self,
+        processor: Processor,
+        unit: ProcessingUnit,
+    ) -> dict[str, str] | None:
+        """Return the profile and canonical content hash affecting *unit*."""
+
+        requested = self._processor_description(processor, unit)
+        if requested is None:
+            return None
+        profile, description = requested
+        payload = json.dumps(
+            description,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return {"profile": profile, "sha256": hashlib.sha256(payload).hexdigest()}
 
     def fetch_runs(self, query: str, *, refresh: bool = False) -> RunCatalog:
         """Fetch an SRA RunInfo catalog for *query*.
@@ -232,7 +444,7 @@ class DatasetBuilder:
             raise ValueError("fetch_runs requires an email in BuilderConfig")
         validate_polars_runtime()
         digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
-        cache = self.config.workspace / "catalogs" / f"sra.{digest}.csv"
+        cache = self.workspace.path("catalogs") / f"sra.{digest}.csv"
         if cache.is_file() and not refresh:
             return RunCatalog.from_csv(cache).deduplicate_runs()
         catalog = self.sra.fetch_runinfo(query, refresh=refresh)
@@ -269,18 +481,14 @@ class DatasetBuilder:
         destination: Path | None = None,
         include_raw: bool = False,
         refresh: bool = False,
-        description_profile: str | None = None,
-        description_policy: DescriptionPolicy | None = None,
     ) -> MetadataBundle:
         """Fetch normalized metadata for SRA *accessions* and save it.
 
         Args:
             accessions: SRA accessions such as ``SRP...``, ``SRX...``, or ``SRR...``.
-            destination: Output directory; defaults to ``workspace/metadata``.
+            destination: Output directory; defaults to ``workspace/runtime/metadata``.
             include_raw: Retain parsed raw XML trees in the bundle.
             refresh: Bypass reusable NCBI response caches.
-            description_profile: ``training`` or ``full``; defaults to builder config.
-            description_policy: Optional compact-field selection policy.
         """
 
         if self.sra is None or self.biosample is None:
@@ -293,9 +501,7 @@ class DatasetBuilder:
             refresh=refresh,
         )
         bundle.save(
-            destination or self.config.workspace / "metadata",
-            description_profile=description_profile or self.config.description_profile,
-            policy=description_policy,
+            destination or self.workspace.path("metadata"),
             progress=self.progress,
         )
         return bundle
@@ -307,23 +513,19 @@ class DatasetBuilder:
         destination: Path | None = None,
         include_raw: bool = False,
         refresh: bool = False,
-        description_profile: str | None = None,
-        description_policy: DescriptionPolicy | None = None,
     ) -> MetadataBundle:
         """Fetch and save normalized metadata for runs in *catalog*.
 
         Args:
             catalog: Run catalog whose linked accessions are fetched.
-            destination: Output directory; defaults to ``workspace/metadata``.
+            destination: Output directory; defaults to ``workspace/runtime/metadata``.
             include_raw: Retain parsed raw XML trees in the bundle.
             refresh: Bypass reusable NCBI response caches.
-            description_profile: ``training`` or ``full``; defaults to builder config.
-            description_policy: Optional compact-field selection policy.
         """
 
         if self.sra is None or self.biosample is None:
             raise ValueError("enrich_metadata requires an email in BuilderConfig")
-        target = destination or self.config.workspace / "metadata"
+        target = destination or self.workspace.path("metadata")
         target.mkdir(parents=True, exist_ok=True)
         with exclusive_file_lock(target / ".metadata.lock", timeout_seconds=120):
             metadata_path = target / "metadata.json"
@@ -384,8 +586,6 @@ class DatasetBuilder:
                 cumulative.merge_from(scoped)
             cumulative.save(
                 target,
-                description_profile=description_profile or self.config.description_profile,
-                policy=description_policy,
                 progress=self.progress,
             )
             sample_by_accession = {
@@ -468,6 +668,7 @@ class DatasetBuilder:
         group_by: GroupLevel,
         genome_pin: str | None,
         processor_identity: str,
+        description_identity: dict[str, str] | None,
     ) -> str:
         """Hash all semantic inputs for *unit*."""
 
@@ -481,6 +682,7 @@ class DatasetBuilder:
             "taxid": unit.taxid,
             "genome_pin": genome_pin,
             "processor_identity": processor_identity,
+            "description_identity": description_identity,
             "fastq_identity": self._fastq_identity(unit),
         }
         return hashlib.sha256(
@@ -537,11 +739,10 @@ class DatasetBuilder:
 
         clean = catalog.deduplicate_runs()
         selected_group = group_by or self.config.group_by
-        resolved = None if isinstance(processor, str) else processor
+        resolved = load_processor(processor) if isinstance(processor, str) else processor
         processor_identity = self._processor_identity(processor, processor_id, resolved)
         self.workspace.configure(
             group_by=selected_group,
-            description_profile=self.config.description_profile,
             genome_policy=asdict(self.config.genome_policy),
         )
         pins = genome_pins or {}
@@ -567,6 +768,7 @@ class DatasetBuilder:
                         group_by=selected_group,
                         genome_pin=pin,
                         processor_identity=processor_identity,
+                        description_identity=self._description_identity(resolved, unit),
                     ),
                 )
             )
@@ -587,6 +789,15 @@ class DatasetBuilder:
                     f"{self.fastq_provider.__class__.__module__}:"
                     f"{self.fastq_provider.__class__.__qualname__}"
                 ),
+                "builder_config": self.config.to_worker_dict(
+                    output_dir=self.workspace.output
+                ),
+                "fastq_provider_config": self._serialize_fastq_provider(
+                    required=isinstance(
+                        execution, (SlurmSingleNodeExecution, SlurmDistributedExecution)
+                    )
+                ),
+                "output_dir": str(self.workspace.output.resolve()),
             },
         )
         self.workspace.save_execution(execution_record)
@@ -642,12 +853,12 @@ class DatasetBuilder:
         """Return the permanent workspace log path for *item*."""
 
         species = sanitize_identifier(item.unit.scientific_name or "unknown_species")
-        return self.config.workspace / "logs" / species / f"{item.item_id}.log"
+        return self.workspace.path("logs") / species / f"{item.item_id}.log"
 
     def _stage_fastq(self, item: QueueItem) -> StagedFastq:
         """Stage input for *item*, adapting providers that expose only ``fetch``."""
 
-        destination = self.config.workspace / "fastq"
+        destination = self.workspace.path("fastq")
         stage = getattr(self.fastq_provider, "stage", None)
         if callable(stage):
             return stage(item.unit, destination, threads=item.resources.cpus)
@@ -672,7 +883,7 @@ class DatasetBuilder:
             return materialize(
                 prepared.item.unit,
                 prepared.staged,
-                self.config.workspace / "fastq",
+                self.workspace.path("fastq"),
                 threads=prepared.item.resources.cpus,
             )
         if prepared.staged.ready_fastq is None:
@@ -706,7 +917,7 @@ class DatasetBuilder:
             or previous.get("phase") == "processing"
         )
         try:
-            claimed = self.state.start(
+            claim_id = self.state.start(
                 item.item_id,
                 fingerprint=item.fingerprint,
                 execution_id=execution_id,
@@ -722,7 +933,7 @@ class DatasetBuilder:
                 log_path,
                 outcome=UnitOutcome(item.item_id, "skipped", error=str(exc)),
             )
-        if not claimed:
+        if not claim_id:
             saved = self.state.get(item.item_id) or {}
             return _PreparedUnit(
                 item,
@@ -754,17 +965,18 @@ class DatasetBuilder:
                     pin=item.genome_pin,
                 )
                 staged = self._stage_fastq(item)
-                self.state.set_phase(item.item_id, "ready")
+                self.state.set_phase(item.item_id, "ready", claim_id=str(claim_id))
             return _PreparedUnit(
                 item=item,
                 log_path=log_path,
                 genome=genome,
                 staged=staged,
                 reset_outputs=reset_outputs,
+                claim_id=str(claim_id),
             )
         except Exception:  # noqa: BLE001 - sample boundary persists operational failures
             error = traceback.format_exc()
-            self.state.fail(item.item_id, error)
+            self.state.fail(item.item_id, error, claim_id=str(claim_id))
             with unit_log(
                 log_path,
                 phase="download-error",
@@ -793,12 +1005,19 @@ class DatasetBuilder:
             return prepared.outcome
         if prepared.genome is None or prepared.staged is None:
             raise ValueError(f"Prepared sample {item.item_id} is incomplete")
+        if prepared.claim_id is None:
+            raise ValueError(f"Prepared sample {item.item_id} has no state claim")
         try:
-            self.state.set_phase(item.item_id, "processing")
+            self.state.set_phase(
+                item.item_id,
+                "processing",
+                claim_id=prepared.claim_id,
+            )
             self.state.set_runtime_resources(
                 item.item_id,
                 cpus=cpus,
                 memory_gb=item.resources.memory_gb,
+                claim_id=prepared.claim_id,
             )
             with (
                 unit_log(
@@ -810,19 +1029,18 @@ class DatasetBuilder:
                 self.progress.minimum_level(logging.WARNING),
             ):
                 fastq = self._materialize_fastq(prepared)
-                work_root = self.config.workspace / "work" / "units" / item.item_id
-                output_root = self.config.workspace / "outputs" / item.item_id
+                output_root = self.workspace.output / item.item_id
                 if prepared.reset_outputs:
-                    for owned in (work_root, output_root):
-                        if owned.is_dir():
-                            shutil.rmtree(owned)
-                        elif owned.exists():
-                            owned.unlink()
+                    if output_root.is_dir():
+                        shutil.rmtree(output_root)
+                    elif output_root.exists():
+                        output_root.unlink()
+                output_root.mkdir(parents=True, exist_ok=True)
+                self._materialize_processor_description(processor, item, output_root)
                 current_state = self.state.get(item.item_id) or {}
                 context = ProcessingContext(
                     unit_id=item.item_id,
                     threads=cpus,
-                    work_dir=work_root,
                     output_dir=output_root,
                     log_path=prepared.log_path,
                     execution_id=str(current_state.get("execution_id") or "unknown"),
@@ -833,9 +1051,15 @@ class DatasetBuilder:
                         "Processor must return ProcessingResult, got "
                         f"{type(result).__name__} for {item.item_id}"
                     )
-                result.validate()
+                result.validate(output_dir=output_root)
+                resolved_outputs = result.resolved_outputs(output_root)
                 payload = {
-                    "processing": result.to_dict(),
+                    "processing": {
+                        **result.to_dict(),
+                        "outputs": {
+                            role: str(path) for role, path in resolved_outputs.items()
+                        },
+                    },
                     "output_files": {
                         role: {
                             "path": str(path),
@@ -843,18 +1067,22 @@ class DatasetBuilder:
                             "size": path.stat().st_size,
                             "modified_ns": path.stat().st_mtime_ns,
                         }
-                        for role, path in result.outputs.items()
+                        for role, path in resolved_outputs.items()
                     },
                     "genome": prepared.genome.to_dict(),
                     "fastq": fastq.to_dict(),
                     "context": context.to_dict(),
                     "log_path": str(prepared.log_path),
                 }
-                self.state.succeed(item.item_id, payload)
+                self.state.succeed(item.item_id, payload, claim_id=prepared.claim_id)
             return UnitOutcome(item.item_id, "succeeded", result=payload)
         except Exception:  # noqa: BLE001 - sample boundary persists operational failures
             error = traceback.format_exc()
-            self.state.fail(item.item_id, error)
+            try:
+                self.state.fail(item.item_id, error, claim_id=prepared.claim_id)
+            except StaleUnitClaim:
+                LOGGER.exception("Discard stale processing result for %s", item.item_id)
+                raise
             with unit_log(
                 prepared.log_path,
                 phase="processing-error",
@@ -877,7 +1105,7 @@ class DatasetBuilder:
             return True
         if outcome.status != "succeeded" and queue.keep_failed_inputs:
             return True
-        boundary = (self.config.workspace / "fastq").resolve()
+        boundary = self.workspace.path("fastq").resolve()
         try:
             for raw in prepared.staged.cleanup_roots:
                 path = raw.resolve()
@@ -1085,7 +1313,7 @@ class DatasetBuilder:
                         execution_id=record.execution_id,
                         retry_failed=retry_failed,
                         queue=queue,
-                        reclaim_running=True,
+                        reclaim_running=False,
                     )
                     downloads[future] = item
                     inflight_items.append(item)
@@ -1167,7 +1395,7 @@ class DatasetBuilder:
             query=query,
             processor_id=processor_id,
         )
-        lock = self.config.workspace / "state" / "queue-coordinator.lock"
+        lock = self.workspace.path("state") / "queue-coordinator.lock"
         with exclusive_file_lock(
             lock,
             timeout_seconds=120,
@@ -1228,7 +1456,7 @@ class DatasetBuilder:
             processor_id=None,
         )
         record_path = self.workspace.executions / f"{record.execution_id}.json"
-        target = script_path or self.config.workspace / "slurm" / f"{record.execution_id}.sbatch"
+        target = script_path or self.workspace.path("slurm") / f"{record.execution_id}.sbatch"
         executor = SlurmExecutor(progress=self.progress)
         if isinstance(execution, SlurmSingleNodeExecution):
             script = executor.create_single_node_script(
@@ -1253,16 +1481,33 @@ class DatasetBuilder:
     def status(self, execution_id: str | None = None) -> dict[str, Any]:
         """Return a rich status report for optional *execution_id*."""
 
-        record = (
-            self.workspace.load_execution(execution_id)
-            if execution_id is not None
-            else self.workspace.latest_execution()
-        )
-        summary = self.state.summary([item.item_id for item in record.items])
+        if execution_id is not None:
+            record = self.workspace.load_execution(execution_id)
+            items = list(record.items)
+            scope = "execution"
+        else:
+            records = self.workspace.all_executions()
+            if not records:
+                raise FileNotFoundError("Workspace has no execution records")
+            record = records[-1]
+            indexed_items: dict[str, QueueItem] = {}
+            for saved_record in records:
+                for item in saved_record.items:
+                    indexed_items[item.item_id] = item
+            workspace_states = self.state.summary()["units"]
+            for state in workspace_states:
+                serialized_item = state.get("item")
+                if not isinstance(serialized_item, dict):
+                    continue
+                item = QueueItem.from_dict(serialized_item)
+                indexed_items[item.item_id] = item
+            items = list(indexed_items.values())
+            scope = "workspace"
+        summary = self.state.summary([item.item_id for item in items])
         states = {state.get("unit_id"): state for state in summary["units"]}
         experiments = []
         execution_genomes: dict[str, dict[str, Any]] = {}
-        for item in record.items:
+        for item in items:
             state = states.get(item.item_id) or {}
             result = state.get("result") if isinstance(state.get("result"), dict) else {}
             processing = (
@@ -1335,7 +1580,7 @@ class DatasetBuilder:
             )
         genomes = list(genome_inventory.values())
 
-        metadata_index = self.config.workspace / "metadata" / "metadata_index.json"
+        metadata_index = self.workspace.path("metadata") / "metadata_index.json"
         cached_experiments = 0
         if metadata_index.is_file():
             try:
@@ -1345,13 +1590,14 @@ class DatasetBuilder:
                 pass
         return {
             "execution_id": record.execution_id,
+            "scope": scope,
             "execution": {
                 "created_at": record.created_at,
                 "type": record.execution_type,
                 "group_by": record.group_by,
                 "processor": record.processor_identity,
                 "query": record.query,
-                "total_experiments": len(record.items),
+                "total_experiments": len(items),
             },
             "counts": summary["counts"],
             "experiments": experiments,
@@ -1363,32 +1609,3 @@ class DatasetBuilder:
             "metadata": {"cached_experiments": cached_experiments},
             "units": summary["units"],
         }
-
-    def publish_dataset(
-        self,
-        destination: Path | None = None,
-        *,
-        execution_id: str | None = None,
-        mode: PublishMode = "auto",
-        overwrite: bool = False,
-    ) -> DatasetExport:
-        """Publish verified workspace outputs into *destination*.
-
-        Args:
-            destination: Target dataset directory, or the workspace defaults.
-            execution_id: Execution to publish; ``None`` selects the latest.
-            mode: ``copy``, ``hardlink``, or ``auto``.
-            overwrite: Atomically replace an existing published dataset.
-        """
-
-        record = (
-            self.workspace.load_execution(execution_id)
-            if execution_id is not None
-            else self.workspace.latest_execution()
-        )
-        return DatasetPublisher(self.config.workspace, progress=self.progress).publish(
-            record,
-            destination,
-            mode=mode,
-            overwrite=overwrite,
-        )

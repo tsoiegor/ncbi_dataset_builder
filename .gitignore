@@ -9,6 +9,7 @@ dist/
 build/
 
 # Runtime data are intentionally outside source control.
+workspace/
 *.part
 *.lock
 *.sra

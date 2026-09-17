@@ -7,7 +7,7 @@ a callable with three inputs and one `ProcessingResult`:
 processor(
     fastq: FastqSet,
     genome: GenomeRef,
-    threads: int,
+    context: ProcessingContext,
 ) -> ProcessingResult
 ```
 
@@ -34,18 +34,17 @@ def process_sample(
     Args:
         fastq: Validated local FASTQ paths and acquisition provenance.
         genome: Selected local reference and its provenance.
-        context: Unit identity, directories, log, execution, and CPU budget.
+        context: Unit identity, processor-owned output directory, log, execution, and CPU budget.
     """
 
     # Fail before expensive commands if inputs are missing or inconsistent.
     fastq.validate()
     genome.validate()
 
-    # Recoverable intermediates belong below work_dir.
-    work = context.work_dir / "my_processor"
+    # The processor may organize artifacts and intermediates however it wants.
+    work = context.output_dir / "work"
     work.mkdir(parents=True, exist_ok=True)
 
-    # Final reusable artifacts belong below output_dir.
     context.output_dir.mkdir(parents=True, exist_ok=True)
     output = context.output_dir / f"{context.unit_id}.result.txt"
     partial = output.with_name(output.name + ".part")
@@ -84,7 +83,17 @@ def process_sample(
 | --- | --- | --- |
 | `fastq: FastqSet` | Local input paths, layout, and acquisition provenance | Validate and obey layout |
 | `genome: GenomeRef` | Selected FASTA, accession, taxonomy, checksum, and rationale | Validate; build/reuse indexes safely |
-| `context: ProcessingContext` | Unit identity, work/output paths, log, execution ID, and CPUs | Use owned paths and treat `threads` as an upper budget |
+| `context: ProcessingContext` | Unit identity, one owned output path, log, execution ID, and CPUs | Keep every created artifact below `output_dir` |
+
+### Optional experiment-description hook
+
+A callable may expose `description_profile = "training"`. Before invoking that
+processor, the builder loads `workspace/runtime/metadata/metadata.json`, requires
+exactly one Experiment in the unit, projects
+`bundle.descriptions_by_experiment(profile="training")`, and writes the matching
+record as `<output_dir>/<unit-id>.json`. The processor must declare that file in
+`ProcessingResult.outputs` if it is a durable artifact. Run
+`builder.enrich_metadata(catalog)` before building with such a processor.
 
 ## `FastqSet` fields
 
@@ -123,7 +132,7 @@ Every referenced input must exist and be non-empty.
 | `indexes` | Optional named index paths |
 
 If several units share a genome index, protect index construction with a lock
-and publish completed index files atomically. The built-in ATAC processor is an
+and finalize completed index files atomically. The built-in ATAC processor is an
 example.
 
 ## `ProcessingResult` parameters
@@ -131,7 +140,7 @@ example.
 | Parameter | Default | Meaning | Restriction |
 | --- | --- | --- | --- |
 | `success: bool` | Required | Whether scientific processing succeeded | Must be `True` for builder success |
-| `outputs: dict[str, Path]` | Empty | Final files keyed by stable artifact role | Non-empty unique roles and paths; every path must exist and be non-empty |
+| `outputs: dict[str, Path]` | Empty | Durable files keyed by stable artifact role | Paths may be relative to `output_dir`; every resolved path must remain inside it and be non-empty |
 | `metrics: dict` | Empty | Compact structured QC/summary values | Must be JSON-serializable for state |
 | `tool_versions: dict[str, str]` | Empty | Executable/software versions | Prefer actual reported versions |
 | `message: str \| None` | `None` | Failure/status explanation | Used when `success=False` |
@@ -143,11 +152,10 @@ for every declared output.
 
 | Location | Put here | Restart behavior |
 | --- | --- | --- |
-| `context.work_dir` | Intermediates that can be recreated | May be reset before rebuilt processing |
-| `context.output_dir` | Final processor outputs | May be reset when the unit must rebuild |
+| `context.output_dir` | All processor artifacts and intermediates | The complete unit directory may be reset when the unit rebuilds |
 | Original `fastq.read*` paths | Provider-owned input | Do not delete from processor |
 | Genome cache/index area | Shared reference artifacts | Use locks and complete-file validation |
-| Arbitrary external path | Avoid | Builder cannot safely manage/reuse it |
+| Arbitrary external path | Forbidden for declared output | Builder rejects artifacts outside the owned directory |
 
 Use `.part` files plus atomic rename so interruption cannot leave a final name
 that appears complete.
@@ -204,13 +212,15 @@ Save an importable module:
 
 ```python
 # my_package/atac_processors.py
+from pathlib import Path
+
 from ncbi_dataset_builder.processing.atac import AtacSeqConfig, AtacSeqProcessor
 
 # Module-level object can be loaded as a callable by every worker.
 custom_atac = AtacSeqProcessor(
     AtacSeqConfig(
-        bin_size=10,
-        normalize_using="CPM",
+        bam2bw_script=Path("/shared/ExpressionPredict/src/bam2bw.py"),
+        min_coverage=1_000_000,
     )
 )
 ```
@@ -249,7 +259,7 @@ Raise an exception when:
 - an external command fails;
 - an expected intermediate is invalid;
 - scientific validation fails; or
-- a final output cannot be published safely.
+- a final output cannot be finalized safely.
 
 Returning `ProcessingResult(success=False, message=...)` also fails validation,
 but raising preserves a useful traceback in unit state/logs.
@@ -275,8 +285,7 @@ Run preflight in the actual compute environment.
 - [ ] All three inputs have correct types.
 - [ ] `fastq.validate()` and `genome.validate()` run first.
 - [ ] Every layout is handled or rejected explicitly.
-- [ ] Temporary files use `work_dir`.
-- [ ] Final files use `output_dir`.
+- [ ] Every created file stays below `output_dir`.
 - [ ] External commands receive safe argument lists.
 - [ ] CPU usage respects `threads`.
 - [ ] Shared indexes use locking and complete validation.

@@ -74,7 +74,6 @@ builder = DatasetBuilder(
         email="researcher@example.org",
         ncbi_api_key=None,
         group_by="experiment",
-        description_profile="training",
         prefetch_max_size="u",
         show_progress=True,
         progress_bars=True,
@@ -142,7 +141,6 @@ After inspection, repeat with `submit=True`.
 | `ncbi_api_key` | `None` | Higher Entrez request rate | Export `NCBI_API_KEY` into batch environment if needed | The generated script does not pass the key as a command argument |
 | `genome_policy` | Default | Submission-side semantic identity and intended assembly selection | Prefer defaults or exact `genome_pins` for Slurm reproducibility | Standard worker reconstruction currently uses default manager/policy |
 | `group_by` | `"experiment"` | Processing-unit grouping stored in execution | Usually experiment | Stable after state exists |
-| `description_profile` | `"training"` | Workspace metadata semantic setting | Choose before first state | Standard worker reconstruction uses default profile; workspace remains configured at submission |
 | `prefetch_max_size` | `"u"` | Submission-side SRA archive limit setting | Use default or ensure worker behavior matches requirements | Standard worker reconstruction currently creates the default provider |
 | `show_progress` | `True` | Submission-process display | Any | Worker creates its standard reporter |
 | `progress_bars` | `True` | Submission-process bar preference | Any | Batch logs may render plain progress more cleanly |
@@ -316,9 +314,9 @@ print(job_id)
 Use site tools such as `squeue`/`sacct` and inspect:
 
 ```text
-workspace/logs/slurm/<job-id>.coordinator.log
-workspace/logs/<species>/<unit-id>.log
-workspace/state/units/<unit-id>.json
+workspace/runtime/logs/slurm/<job-id>.coordinator.log
+workspace/runtime/logs/<species>/<unit-id>.log
+workspace/runtime/state/units/<unit-id>.json
 ```
 
 If the allocation ends early, submit the same semantic work again. Valid

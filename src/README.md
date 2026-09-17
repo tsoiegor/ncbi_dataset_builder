@@ -12,7 +12,7 @@ accidentally bypass installation.
 | [`ncbi_dataset_builder/metadata/`](ncbi_dataset_builder/metadata/README.md) | NCBI metadata clients and models |
 | [`ncbi_dataset_builder/processing/`](ncbi_dataset_builder/processing/README.md) | Processor contract |
 | [`ncbi_dataset_builder/processing/atac/`](ncbi_dataset_builder/processing/atac/README.md) | Built-in ATAC-seq API |
-| [`ncbi_dataset_builder/workspace/`](ncbi_dataset_builder/workspace/README.md) | Workspace and publication |
+| [`ncbi_dataset_builder/workspace/`](ncbi_dataset_builder/workspace/README.md) | Runtime layout and public manifest |
 | [`ncbi_dataset_builder/support/`](ncbi_dataset_builder/support/README.md) | Advanced support helpers |
 | [`ncbi_dataset_builder/cli/`](ncbi_dataset_builder/cli/README.md) | CLI implementation |
 

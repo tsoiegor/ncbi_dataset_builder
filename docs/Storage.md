@@ -252,13 +252,12 @@ candidate max_inflight_gb         1,100 GB
 | `"after_success"` | Failure | `False` | Remove |
 
 Cleanup is restricted to provider-declared roots strictly below
-`workspace/fastq/`. The queue refuses to delete the `fastq` root itself or a
+`workspace/runtime/fastq/`. The queue refuses to delete the `fastq` root itself or a
 path outside that boundary.
 
 Cleanup does not remove:
 
-- `workspace/work/units/`;
-- `workspace/outputs/`;
+- `workspace/output/<unit-id>/`;
 - normalized metadata;
 - genome caches or indexes;
 - state, execution records, or logs; or

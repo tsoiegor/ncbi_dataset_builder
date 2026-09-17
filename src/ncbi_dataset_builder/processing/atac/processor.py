@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import csv
 import gzip
 import json
 import logging
 import os
 import shutil
 import subprocess
+import sys
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -20,9 +23,22 @@ from ...support.util import (
     exclusive_file_lock,
     existing_nonempty,
     sanitize_identifier,
+    sha256_file,
 )
 
 LOGGER = logging.getLogger("ncbi_dataset_builder.processing.atac")
+
+
+def _bam2bw_script_from_env() -> Path:
+    """Return the required ``BAM2BW_SCRIPT`` path or raise an actionable error."""
+
+    value = os.environ.get("BAM2BW_SCRIPT")
+    if not value:
+        raise ValueError(
+            "bam2bw_script is required. Pass AtacSeqConfig(bam2bw_script=Path(...)) "
+            "or set BAM2BW_SCRIPT."
+        )
+    return Path(value)
 
 
 @dataclass(frozen=True)
@@ -76,11 +92,10 @@ class AtacSeqConfig:
         bowtie2_build: Bowtie2 index-builder executable.
         samtools: Samtools executable.
         fastp: Fastp executable.
-        bam_coverage: deepTools ``bamCoverage`` executable.
+        bam2bw_script: Path to the ExpressionPredict ``bam2bw.py`` script.
+        python_executable: Python interpreter used to run ``bam2bw.py``.
         maximum_insert_size: Maximum paired-end alignment insert size.
-        bin_size: BigWig coverage bin size.
-        normalize_using: Optional ``bamCoverage`` normalization method.
-        coverage_strands: Optional forward/reverse RNA-strand filters.
+        min_coverage: Minimum coverage accepted by ``bam2bw.py``.
         fastp_deduplicate: Enable fastp duplicate removal.
         fastp_max_threads: Maximum threads passed to fastp.
         strict_mixed_layout: Inspect fastp reports for mixed paired/single input
@@ -94,7 +109,6 @@ class AtacSeqConfig:
             length to the shorter paired-end mean length.
         mixed_min_retained_fraction: Minimum acceptable fraction of single-end
             reads remaining after fastp.
-        coverage_ignore_duplicates: Ignore duplicate reads in coverage output.
         intermediates: Retention policy for every processor-created file
             category. See :class:`AtacIntermediateFiles`.
     """
@@ -103,11 +117,10 @@ class AtacSeqConfig:
     bowtie2_build: str = "bowtie2-build"
     samtools: str = "samtools"
     fastp: str = "fastp"
-    bam_coverage: str = "bamCoverage"
+    bam2bw_script: Path = field(default_factory=_bam2bw_script_from_env)
+    python_executable: str = sys.executable
     maximum_insert_size: int = 2000
-    bin_size: int = 1
-    normalize_using: str | None = None
-    coverage_strands: tuple[str, ...] = ()
+    min_coverage: int = 1_000_000
     fastp_deduplicate: bool = True
     fastp_max_threads: int = 16
     strict_mixed_layout: bool = True
@@ -115,15 +128,20 @@ class AtacSeqConfig:
     mixed_max_short_read_length: int = 30
     mixed_min_length_ratio: float = 0.5
     mixed_min_retained_fraction: float = 0.1
-    coverage_ignore_duplicates: bool = True
     intermediates: AtacIntermediateFiles = field(default_factory=AtacIntermediateFiles)
 
     def __post_init__(self) -> None:
-        """Validate positive numeric settings and supported strand labels."""
+        """Normalize paths and validate positive numeric settings."""
 
-        if self.maximum_insert_size < 1 or self.bin_size < 1 or self.fastp_max_threads < 1:
+        object.__setattr__(self, "bam2bw_script", Path(self.bam2bw_script))
+        if (
+            self.maximum_insert_size < 1
+            or self.min_coverage < 0
+            or self.fastp_max_threads < 1
+        ):
             raise ValueError(
-                "maximum_insert_size, bin_size, and fastp_max_threads must be positive"
+                "maximum_insert_size and fastp_max_threads must be positive; "
+                "min_coverage must be non-negative"
             )
         if not 0 <= self.mixed_count_tolerance < 1:
             raise ValueError("mixed_count_tolerance must be in [0, 1)")
@@ -133,13 +151,12 @@ class AtacSeqConfig:
             raise ValueError("mixed_min_length_ratio must be in (0, 1]")
         if not 0 <= self.mixed_min_retained_fraction <= 1:
             raise ValueError("mixed_min_retained_fraction must be in [0, 1]")
-        invalid = set(self.coverage_strands) - {"forward", "reverse"}
-        if invalid:
-            raise ValueError(f"Unknown coverage strand(s): {sorted(invalid)}")
 
 
 class AtacSeqProcessor:
     """Build checked BAM and BigWig outputs from ATAC-seq FASTQ inputs."""
+
+    description_profile = "training"
 
     def __init__(
         self,
@@ -162,14 +179,26 @@ class AtacSeqProcessor:
             self.config.bowtie2,
             self.config.bowtie2_build,
             self.config.samtools,
-            self.config.bam_coverage,
+            self.config.python_executable,
+            "bamCoverage",
         )
         self.runner.require(*tools)
+        script = self.config.bam2bw_script.resolve()
+        if not script.is_file():
+            raise ExternalToolError(
+                f"bam2bw.py was not found at {script}. "
+                "Set AtacSeqConfig(bam2bw_script=Path(...)) to its location."
+            )
+        self.runner.run(
+            [self.config.python_executable, str(script), "--help"],
+            cwd=script.parent,
+        )
         return {
             self.config.fastp: self.runner.version(self.config.fastp, "--version"),
             self.config.bowtie2: self.runner.version(self.config.bowtie2, "--version"),
             self.config.samtools: self.runner.version(self.config.samtools, "--version"),
-            self.config.bam_coverage: self.runner.version(self.config.bam_coverage, "--version"),
+            "bamCoverage": self.runner.version("bamCoverage", "--version"),
+            "bam2bw.py": f"sha256:{sha256_file(script)}",
         }
 
     def _merge_inputs(self, paths: tuple[Path, ...], destination: Path) -> Path | None:
@@ -578,6 +607,154 @@ class AtacSeqProcessor:
         os.replace(partial, output)
         return output
 
+    @staticmethod
+    def _write_chromosome_sizes(fasta: Path, destination: Path) -> Path:
+        """Write two-column chromosome sizes derived from *fasta*."""
+
+        opener = gzip.open if fasta.suffix == ".gz" else open
+        records: list[tuple[str, int]] = []
+        name: str | None = None
+        length = 0
+        with opener(fasta, "rt", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if line.startswith(">"):
+                    if name is not None:
+                        records.append((name, length))
+                    name = line[1:].split(maxsplit=1)[0]
+                    length = 0
+                else:
+                    if name is None:
+                        raise ProcessingError(f"Sequence encountered before FASTA header: {fasta}")
+                    length += len(line)
+        if name is not None:
+            records.append((name, length))
+        if not records:
+            raise ProcessingError(f"Genome FASTA contains no sequences: {fasta}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        partial = destination.with_name(destination.name + ".part")
+        with partial.open("w", encoding="utf-8", newline="") as handle:
+            for chromosome, size in records:
+                handle.write(f"{chromosome}\t{size}\n")
+        os.replace(partial, destination)
+        return destination
+
+    @staticmethod
+    def _find_description(output_dir: Path, unit_id: str) -> Path:
+        """Find the one materialized experiment description matching *unit_id*."""
+
+        expected = output_dir / f"{sanitize_identifier(unit_id)}.json"
+        if expected.is_file():
+            return expected
+        matches: list[Path] = []
+        for candidate in sorted(output_dir.glob("*.json")):
+            try:
+                value = json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(value, dict):
+                continue
+            identifiers = {value.get("ID"), value.get("Experiment ID")}
+            if unit_id in identifiers:
+                matches.append(candidate)
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            raise ProcessingError(
+                f"Multiple descriptions match experiment {unit_id}: {matches}"
+            )
+        raise ProcessingError(
+            f"No materialized training description matches experiment {unit_id} in "
+            f"{output_dir}. Generate it from "
+            "bundle.descriptions_by_experiment(profile='training') before processing."
+        )
+
+    def _run_bam2bw(
+        self,
+        *,
+        bam: Path,
+        genome: GenomeRef,
+        description: Path,
+        output_dir: Path,
+        work: Path,
+        threads: int,
+        safe_id: str,
+        log_path: Path,
+    ) -> tuple[Path, Path, Path]:
+        """Run ExpressionPredict ``bam2bw.py`` for one unstranded ATAC BAM."""
+
+        genome_root = work / "bam2bw_genomes"
+        chromosome_sizes = (
+            genome_root / genome.accession / f"{genome.accession}.chrom.sizes"
+        )
+        self._write_chromosome_sizes(genome.fasta, chromosome_sizes)
+        mapping = work / "file_mappings.csv"
+        fields = ("id", "bam", "metadata", "genome", "assay", "source")
+        with mapping.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "id": safe_id,
+                    "bam": os.path.relpath(bam, mapping.parent),
+                    "metadata": os.path.relpath(description, mapping.parent),
+                    "genome": genome.accession,
+                    "assay": "ATAC",
+                    # bam_utils ignores source for ATAC. Keep the required value
+                    # visibly disposable so it cannot be mistaken for provenance.
+                    "source": f"placeholder-{uuid.uuid4().hex}",
+                }
+            )
+        script = self.config.bam2bw_script.resolve()
+        self.progress.message(f"Create strand-split BigWigs with {script.name}")
+        self.runner.run(
+            [
+                self.config.python_executable,
+                str(script),
+                "--file-mapping",
+                str(mapping.resolve()),
+                "--bigwig-out-dir",
+                str(output_dir.resolve()),
+                "--genome-folder",
+                str(genome_root.resolve()),
+                "--bamcoverage-cpus",
+                str(max(1, threads)),
+                "--total-cpus",
+                str(max(1, threads)),
+                "--min-coverage",
+                str(self.config.min_coverage),
+                "--always-compute-stats",
+                "--log-file",
+                str(log_path.resolve()),
+            ],
+            cwd=script.parent,
+            timeout=24 * 60 * 60,
+        )
+        forward = output_dir / f"{safe_id}.forward.bw"
+        reverse = output_dir / f"{safe_id}.reverse.bw"
+        missing = [path for path in (forward, reverse) if not existing_nonempty(path)]
+        if missing:
+            raise ProcessingError(
+                "bam2bw.py did not create both strand BigWigs. It can log a record "
+                f"failure while exiting successfully; missing or empty: {missing}"
+            )
+        try:
+            metadata = json.loads(description.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ProcessingError(
+                f"bam2bw.py left an unreadable description: {description}"
+            ) from exc
+        required_coverage = {"forward_total_coverage", "reverse_total_coverage"}
+        missing_coverage = required_coverage - metadata.keys()
+        if missing_coverage:
+            raise ProcessingError(
+                "bam2bw.py did not append coverage metrics to the description: "
+                f"{sorted(missing_coverage)}"
+            )
+        return forward, reverse, mapping
+
     def __call__(
         self,
         fastq: FastqSet,
@@ -592,7 +769,7 @@ class AtacSeqProcessor:
         self.progress.message(f"ATAC processing started: {context.unit_id}")
         versions = self.preflight()
         output_dir = context.output_dir
-        work = context.work_dir / "processing" / "atac"
+        work = output_dir / "work" / "atac"
         output_dir.mkdir(parents=True, exist_ok=True)
         work.mkdir(parents=True, exist_ok=True)
         safe_id = sanitize_identifier(context.unit_id)
@@ -672,37 +849,18 @@ class AtacSeqProcessor:
                 str(final_bam),
             ]
         )
-        coverage_outputs: list[Path] = []
-        coverage_modes: tuple[str | None, ...] = self.config.coverage_strands or (None,)
-        for strand in coverage_modes:
-            label = strand or "coverage"
-            bigwig = output_dir / f"{safe_id}.{label}.bw"
-            if not existing_nonempty(bigwig):
-                self.progress.message(f"Create BigWig coverage: {bigwig.name}")
-                command = [
-                    self.config.bam_coverage,
-                    "--bam",
-                    str(final_bam),
-                    "--outFileName",
-                    str(bigwig),
-                    "--outFileFormat",
-                    "bigwig",
-                    "--binSize",
-                    str(self.config.bin_size),
-                    "--numberOfProcessors",
-                    str(max(1, threads)),
-                    "--skipNAs",
-                ]
-                if strand:
-                    command.extend(("--filterRNAstrand", strand))
-                if self.config.coverage_ignore_duplicates:
-                    command.append("--ignoreDuplicates")
-                if self.config.normalize_using:
-                    command.extend(("--normalizeUsing", self.config.normalize_using))
-                self.runner.run(command, timeout=24 * 60 * 60)
-            else:
-                self.progress.message(f"BigWig cache hit: {bigwig.name}")
-            coverage_outputs.append(bigwig)
+        description = self._find_description(output_dir, context.unit_id)
+        forward_bigwig, reverse_bigwig, file_mapping = self._run_bam2bw(
+            bam=final_bam,
+            genome=genome,
+            description=description,
+            output_dir=output_dir,
+            work=work,
+            threads=threads,
+            safe_id=safe_id,
+            log_path=context.log_path,
+        )
+        coverage_outputs = (forward_bigwig, reverse_bigwig)
         final_index = Path(str(final_bam) + ".csi")
         produced = (
             final_bam,
@@ -755,8 +913,10 @@ class AtacSeqProcessor:
             outputs["alignment_bam"] = final_bam
         if retention.keep_final_bam_index:
             outputs["alignment_index"] = final_index
-        for strand, path in zip(coverage_modes, coverage_outputs, strict=True):
-            outputs["coverage" if strand is None else f"coverage_{strand}"] = path
+        outputs["coverage_forward"] = forward_bigwig
+        outputs["coverage_reverse"] = reverse_bigwig
+        outputs["description"] = description
+        outputs["file_mapping"] = file_mapping
         for report in reports:
             if report.suffix == ".json" and not retention.keep_fastp_json:
                 continue
@@ -775,9 +935,6 @@ class AtacSeqProcessor:
         return result
 
 
-default_atac_processor = AtacSeqProcessor()
-
-
 def process_atac(
     fastq: FastqSet,
     genome: GenomeRef,
@@ -785,4 +942,8 @@ def process_atac(
 ) -> ProcessingResult:
     """Run the default ATAC processor on *fastq* and *genome* within *context*."""
 
-    return default_atac_processor(fastq, genome, context)
+    return AtacSeqProcessor()(fastq, genome, context)
+
+
+process_atac.description_profile = "training"
+default_atac_processor = process_atac

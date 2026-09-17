@@ -3,7 +3,7 @@
 `ncbi-dataset-builder` turns NCBI SRA or GEO sequencing records into a
 restartable, auditable dataset on your own server. It manages the repetitive
 parts of the job—catalog retrieval, metadata, reference genomes, FASTQ
-materialization, scheduling, state, logs, and publication—while letting you use
+materialization, scheduling, state, logs, and artifact indexing—while letting you use
 the built-in ATAC-seq workflow or supply your own processor.
 
 The same Python API runs on:
@@ -192,27 +192,26 @@ examples, configuration tables, and selection advice—is in
 7. The processor returns a validated `ProcessingResult`.
 8. Unit state stores output paths, hashes, file metadata, genome provenance,
    FASTQ provenance, and the unit log path.
-9. `publish_dataset()` can assemble experiment BigWigs, descriptions, genomes,
-   and a manifest into a compact dataset.
+9. `manifest.json` indexes processor-owned artifacts for arbitrary downstream
+   reshaping scripts.
 
 ## Workspace layout
 
 ```text
 ncbi-workspace/
-├── workspace.json       # Stable grouping and genome-selection semantics.
-├── manifest.json        # Latest unit state and optional published dataset.
-├── catalogs/            # Cached RunInfo query results.
-├── metadata/            # Normalized records and experiment descriptions.
-├── metadata_cache/      # Reusable raw NCBI responses.
-├── genomes/             # Optional in-place published genome FASTAs.
-├── fastq/               # Provider-owned staged inputs; cleanup may remove these.
-├── work/genome_cache/   # Downloaded references, lockfile, and indexes.
-├── work/units/          # Processor intermediates by processing unit.
-├── outputs/             # Processor-declared outputs by processing unit.
-├── state/units/         # Atomic per-unit status records.
-├── executions/          # Immutable execution snapshots.
-├── slurm/               # Generated coordinator and sample scripts.
-└── logs/                # Per-unit and Slurm logs.
+├── manifest.json        # Public portable artifact index.
+├── output/              # Processor-owned data, grouped by unit by default.
+└── runtime/             # Visible package-owned operational data.
+    ├── workspace.json   # Stable grouping, output, and genome semantics.
+    ├── state/           # Atomic per-unit state, locks, and history.
+    ├── executions/      # Immutable execution snapshots.
+    ├── fastq/           # Provider-owned staged inputs.
+    ├── genomes/         # Downloaded references and indexes.
+    ├── metadata/        # Normalized metadata and local inventory.
+    ├── metadata_cache/  # Reusable raw NCBI responses.
+    ├── catalogs/        # Cached RunInfo queries.
+    ├── slurm/           # Generated scheduler scripts.
+    └── logs/            # Per-unit and Slurm logs.
 ```
 
 These roles are identical in all three execution systems. What changes is
@@ -245,9 +244,8 @@ processor are removed after validation. Bowtie2 indexes and their uncompressed
 FASTA are retained for reuse.
 
 Queue cleanup is a separate layer: `QueuePolicy(cleanup="after_success")`
-removes only provider-declared roots below `workspace/fastq/` after successful
-processing. It does not remove `workspace/work/units/` or
-`workspace/outputs/`.
+removes only provider-declared roots below `workspace/runtime/fastq/` after
+successful processing. Processor-owned data remains under `workspace/output/`.
 
 See the [ATAC API reference](src/ncbi_dataset_builder/processing/atac/README.md)
 for every command option, output name, mixed-layout rule, and retention flag.
@@ -282,7 +280,7 @@ for every command option, output name, mixed-layout rule, and retention flag.
 | [Metadata API](src/ncbi_dataset_builder/metadata/README.md) | Entrez, SRA, BioSample, bundles, and description projection |
 | [Processing API](src/ncbi_dataset_builder/processing/README.md) | Processor contract and loading |
 | [ATAC API](src/ncbi_dataset_builder/processing/atac/README.md) | Built-in processor configuration and files |
-| [Workspace API](src/ncbi_dataset_builder/workspace/README.md) | Durable layout and publication |
+| [Workspace API](src/ncbi_dataset_builder/workspace/README.md) | Runtime layout and artifact manifest |
 | [Support API](src/ncbi_dataset_builder/support/README.md) | Commands, progress, logging, and filesystem helpers |
 | [CLI implementation](src/ncbi_dataset_builder/cli/README.md) | Python-to-command mapping |
 

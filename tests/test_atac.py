@@ -1,4 +1,6 @@
+import csv
 import json
+import os
 from pathlib import Path
 from typing import ClassVar
 
@@ -17,10 +19,20 @@ class FakeRunner:
 
     def run(self, command, **kwargs):
         del kwargs
-        if command[1] == "index":
+        if "--file-mapping" in command:
+            mapping = Path(command[command.index("--file-mapping") + 1])
+            output_dir = Path(command[command.index("--bigwig-out-dir") + 1])
+            with mapping.open("r", encoding="utf-8", newline="") as handle:
+                row = next(csv.DictReader(handle))
+            for strand in ("forward", "reverse"):
+                (output_dir / f"{row['id']}.{strand}.bw").write_bytes(b"bigwig")
+            description = (mapping.parent / row["metadata"]).resolve()
+            value = json.loads(description.read_text(encoding="utf-8"))
+            value["forward_total_coverage"] = 100
+            value["reverse_total_coverage"] = 100
+            description.write_text(json.dumps(value), encoding="utf-8")
+        elif command[1] == "index":
             Path(str(command[-1]) + ".csi").write_bytes(b"index")
-        elif "--outFileName" in command:
-            Path(command[command.index("--outFileName") + 1]).write_bytes(b"bigwig")
 
 
 class LightweightAtacProcessor(AtacSeqProcessor):
@@ -60,17 +72,37 @@ class IndexingAtacProcessor(LightweightAtacProcessor):
 
 
 def context(tmp_path, unit_id="SRX1", threads=2):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / f"{unit_id}.json").write_text(
+        json.dumps({"ID": unit_id}), encoding="utf-8"
+    )
     return ProcessingContext(
         unit_id=unit_id,
         threads=threads,
-        work_dir=tmp_path / "work",
-        output_dir=tmp_path / "output",
+        output_dir=output_dir,
         log_path=tmp_path / "unit.log",
         execution_id="execution-test",
     )
 
 
-def test_default_atac_coverage_is_unstranded_and_outputs_are_validated(tmp_path):
+def atac_config(tmp_path, **kwargs):
+    return AtacSeqConfig(bam2bw_script=tmp_path / "bam2bw.py", **kwargs)
+
+
+def test_bam2bw_script_is_required_without_environment(monkeypatch):
+    monkeypatch.delenv("BAM2BW_SCRIPT", raising=False)
+    with pytest.raises(ValueError, match="bam2bw_script is required"):
+        AtacSeqConfig()
+
+
+def test_bam2bw_script_can_come_from_environment(tmp_path, monkeypatch):
+    script = tmp_path / "bam2bw.py"
+    monkeypatch.setenv("BAM2BW_SCRIPT", os.fspath(script))
+    assert AtacSeqConfig().bam2bw_script == script
+
+
+def test_default_atac_coverage_is_split_by_strand_and_outputs_are_validated(tmp_path):
     reads = tmp_path / "reads.fastq.gz"
     reads.write_bytes(b"reads")
     fasta = tmp_path / "genome.fna"
@@ -81,12 +113,24 @@ def test_default_atac_coverage_is_unstranded_and_outputs_are_validated(tmp_path)
         single=(reads,),
     )
     genome = GenomeRef(9606, "Homo sapiens", "GCF_TEST", fasta, "not-used")
-    result = LightweightAtacProcessor(runner=FakeRunner())(fastq, genome, context(tmp_path))
+    result = LightweightAtacProcessor(config=atac_config(tmp_path), runner=FakeRunner())(
+        fastq, genome, context(tmp_path)
+    )
     assert result.success
-    assert result.outputs["coverage"] == tmp_path / "output" / "SRX1.coverage.bw"
-    assert not any("forward" in role or "reverse" in role for role in result.outputs)
-    assert not (tmp_path / "work" / "processing" / "atac" / "single.clean.fastq.gz").exists()
-    assert not (tmp_path / "work" / "processing" / "atac" / "single.sorted.bam").exists()
+    assert result.outputs["coverage_forward"] == tmp_path / "output" / "SRX1.forward.bw"
+    assert result.outputs["coverage_reverse"] == tmp_path / "output" / "SRX1.reverse.bw"
+    assert result.outputs["description"] == tmp_path / "output" / "SRX1.json"
+    assert result.outputs["file_mapping"].name == "file_mappings.csv"
+    with result.outputs["file_mapping"].open("r", encoding="utf-8", newline="") as handle:
+        mapping = next(csv.DictReader(handle))
+    assert mapping["id"] == "SRX1"
+    assert mapping["assay"] == "ATAC"
+    assert mapping["source"].startswith("placeholder-")
+    description = json.loads(result.outputs["description"].read_text(encoding="utf-8"))
+    assert description["forward_total_coverage"] == 100
+    assert description["reverse_total_coverage"] == 100
+    assert not (tmp_path / "output" / "work" / "atac" / "single.clean.fastq.gz").exists()
+    assert not (tmp_path / "output" / "work" / "atac" / "single.sorted.bam").exists()
 
 
 def test_atac_intermediate_policy_can_retain_unit_work_files(tmp_path):
@@ -102,7 +146,8 @@ def test_atac_intermediate_policy_can_retain_unit_work_files(tmp_path):
         single=(reads, second_reads),
     )
     genome = GenomeRef(9606, "Homo sapiens", "GCF_TEST", fasta, "not-used")
-    config = AtacSeqConfig(
+    config = atac_config(
+        tmp_path,
         intermediates=AtacIntermediateFiles(
             keep_staged_fastq=True,
             keep_cleaned_fastq=True,
@@ -115,7 +160,7 @@ def test_atac_intermediate_policy_can_retain_unit_work_files(tmp_path):
     result = LightweightAtacProcessor(config=config, runner=FakeRunner())(
         fastq, genome, context(tmp_path)
     )
-    work = tmp_path / "work" / "processing" / "atac"
+    work = tmp_path / "output" / "work" / "atac"
 
     assert (work / "single.clean.fastq.gz").is_file()
     assert (work / "single.sorted.bam").is_file()
@@ -135,7 +180,8 @@ def test_atac_policy_can_publish_bigwig_without_bam_or_reports(tmp_path):
         single=(reads,),
     )
     genome = GenomeRef(9606, "Homo sapiens", "GCF_TEST", fasta, "not-used")
-    config = AtacSeqConfig(
+    config = atac_config(
+        tmp_path,
         intermediates=AtacIntermediateFiles(
             keep_fastp_json=False,
             keep_fastp_html=False,
@@ -148,11 +194,16 @@ def test_atac_policy_can_publish_bigwig_without_bam_or_reports(tmp_path):
         fastq, genome, context(tmp_path)
     )
 
-    assert result.outputs == {"coverage": tmp_path / "output" / "SRX1.coverage.bw"}
+    assert result.outputs == {
+        "coverage_forward": tmp_path / "output" / "SRX1.forward.bw",
+        "coverage_reverse": tmp_path / "output" / "SRX1.reverse.bw",
+        "description": tmp_path / "output" / "SRX1.json",
+        "file_mapping": tmp_path / "output" / "work" / "atac" / "file_mappings.csv",
+    }
     assert not (tmp_path / "output" / "SRX1.bam").exists()
     assert not (tmp_path / "output" / "SRX1.bam.csi").exists()
-    assert not (tmp_path / "work" / "processing" / "atac" / "single.fastp.json").exists()
-    assert not (tmp_path / "work" / "processing" / "atac" / "single.fastp.html").exists()
+    assert not (tmp_path / "output" / "work" / "atac" / "single.fastp.json").exists()
+    assert not (tmp_path / "output" / "work" / "atac" / "single.fastp.html").exists()
 
 
 def test_atac_policy_can_remove_cached_index_and_materialized_genome(tmp_path):
@@ -166,7 +217,8 @@ def test_atac_policy_can_remove_cached_index_and_materialized_genome(tmp_path):
         single=(reads,),
     )
     genome = GenomeRef(9606, "Homo sapiens", "GCF_TEST", fasta, "not-used")
-    config = AtacSeqConfig(
+    config = atac_config(
+        tmp_path,
         intermediates=AtacIntermediateFiles(
             keep_bowtie2_index=False,
             keep_uncompressed_genome=False,
@@ -229,7 +281,7 @@ def test_strict_mixed_layout_excludes_attached_sample_pattern(tmp_path):
         read1_length=16,
     )
 
-    decision = AtacSeqProcessor()._mixed_layout_defense(tmp_path)
+    decision = AtacSeqProcessor(atac_config(tmp_path))._mixed_layout_defense(tmp_path)
 
     assert decision["action"] == "excluded_single_end"
     assert decision["statistics"]["count_relative_difference"] == 0
@@ -239,8 +291,8 @@ def test_strict_mixed_layout_excludes_attached_sample_pattern(tmp_path):
 
 def test_strict_mixed_layout_aligns_only_paired_reads(tmp_path):
     class MixedAtacProcessor(LightweightAtacProcessor):
-        def __init__(self):
-            super().__init__(runner=FakeRunner())
+        def __init__(self, script_root):
+            super().__init__(config=atac_config(script_root), runner=FakeRunner())
             self.aligned: list[str] = []
 
         def _run_fastp(self, *, read1, read2, single, root, threads):
@@ -297,13 +349,13 @@ def test_strict_mixed_layout_aligns_only_paired_reads(tmp_path):
         single=(single,),
     )
     genome = GenomeRef(9606, "Homo sapiens", "GCF_TEST", fasta, "not-used")
-    processor = MixedAtacProcessor()
+    processor = MixedAtacProcessor(tmp_path)
 
     result = processor(fastq, genome, context(tmp_path, unit_id="SRX34494525"))
 
     assert processor.aligned == ["paired"]
     assert result.metrics["mixed_layout_defense"]["action"] == "excluded_single_end"
-    assert not (tmp_path / "work" / "processing" / "atac" / "single.sorted.bam").exists()
+    assert not (tmp_path / "output" / "work" / "atac" / "single.sorted.bam").exists()
 
 
 def test_strict_mixed_layout_keeps_plausible_single_reads(tmp_path):
@@ -321,7 +373,7 @@ def test_strict_mixed_layout_keeps_plausible_single_reads(tmp_path):
         read1_length=70,
     )
 
-    decision = AtacSeqProcessor()._mixed_layout_defense(tmp_path)
+    decision = AtacSeqProcessor(atac_config(tmp_path))._mixed_layout_defense(tmp_path)
 
     assert decision == {
         "enabled": True,
@@ -345,14 +397,16 @@ def test_strict_mixed_layout_excludes_single_reads_when_reports_are_invalid(tmp_
     (tmp_path / "paired.fastp.json").write_text("{}", encoding="utf-8")
     (tmp_path / "single.fastp.json").write_text("{}", encoding="utf-8")
 
-    decision = AtacSeqProcessor()._mixed_layout_defense(tmp_path)
+    decision = AtacSeqProcessor(atac_config(tmp_path))._mixed_layout_defense(tmp_path)
 
     assert decision["action"] == "excluded_single_end"
     assert "unavailable" in decision["reasons"][0]
 
 
 def test_mixed_layout_defense_can_be_disabled(tmp_path):
-    processor = AtacSeqProcessor(config=AtacSeqConfig(strict_mixed_layout=False))
+    processor = AtacSeqProcessor(
+        config=atac_config(tmp_path, strict_mixed_layout=False)
+    )
 
     assert processor._mixed_layout_defense(tmp_path) == {
         "enabled": False,

@@ -73,7 +73,6 @@ config = BuilderConfig(
     email="researcher@example.org",
     ncbi_api_key=None,
     group_by="experiment",
-    description_profile="training",
     prefetch_max_size="u",
     show_progress=True,
     progress_bars=True,
@@ -134,7 +133,6 @@ Replace the values only after reading the tables below.
 | `ncbi_api_key` | `None` | Optional higher Entrez rate | Use your own environment/secret handling | Not a processing resource |
 | `genome_policy` | Default policy | Assembly selection behavior | Start with default or pin exact assemblies in `build()` | Stable after workspace state exists |
 | `group_by` | `"experiment"` | Default catalog entity per processor call | Usually experiment for ATAC | Only four supported values; stable after state exists |
-| `description_profile` | `"training"` | Saved metadata projection | `training` for compact output | `training` or `full`; stable after state exists |
 | `prefetch_max_size` | `"u"` | Per-SRA-run `prefetch` archive limit | Use `u` when queue storage is configured | Non-empty; too small can block a run |
 | `show_progress` | `True` | Enables operation progress | Keep during first runs | Logs are separate |
 | `progress_bars` | `True` | Requests tqdm display | Keep in interactive terminals | Falls back to text |
@@ -195,7 +193,7 @@ It does not enforce a user quota. See the
 | `download_workers` | `2` | Maximum simultaneous genome/input staging operations | `1`; increase after measuring network and storage | Positive |
 | `max_inflight_gb` | `None` | Estimated raw/processing window across downloading, ready, and processing units | Enough for one or two largest units | Positive when set |
 | `processing_storage_multiplier` | `1.0` | Processing unit peak total size / raw catalog size | Measure; begin conservatively at `2`–`4` for alignment | At least `1` |
-| `cleanup` | `"after_success"` | Removes provider roots below `workspace/fastq/` after verified success | Keep default if input is reproducible | `"after_success"` or `"never"` |
+| `cleanup` | `"after_success"` | Removes provider roots below `workspace/runtime/fastq/` after verified success | Keep default if input is reproducible | `"after_success"` or `"never"` |
 | `keep_failed_inputs` | `True` | Preserves staged inputs after processor failure | Keep during validation | Ignored when cleanup is `"never"` |
 | `fsync_logs` | `True` | Synchronizes phase-boundary unit logs | Keep for first/long runs | Turning off weakens immediate durability |
 | `scheduler_poll_seconds` | `1.0` | Maximum idle wait between queue checks | Keep default | Positive |
@@ -296,7 +294,7 @@ status = builder.status(report.execution_id)
 print(status["counts"])
 ```
 
-Use unit logs below `workspace/logs/<species>/` for failure diagnosis. Successful
+Use unit logs below `workspace/runtime/logs/<species>/` for failure diagnosis. Successful
 reuse appears as `skipped`, with the persisted result attached.
 
 ## Retry and restart

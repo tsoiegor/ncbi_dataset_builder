@@ -42,7 +42,6 @@ from .processing import (
 )
 from .support.progress import ProgressReporter, ProgressTask
 from .workspace import WorkspaceConfig, WorkspaceStore
-from .workspace.publishing import DatasetExport, DatasetPublisher, PublishMode
 
 __all__ = [
     "AtacIntermediateFiles",
@@ -53,8 +52,6 @@ __all__ = [
     "BuildReport",
     "BuilderConfig",
     "DatasetBuilder",
-    "DatasetExport",
-    "DatasetPublisher",
     "DescriptionPolicy",
     "EntrezClient",
     "FastqLayout",
@@ -74,7 +71,6 @@ __all__ = [
     "Processor",
     "ProgressReporter",
     "ProgressTask",
-    "PublishMode",
     "QueuePolicy",
     "QuotaStorage",
     "RunCatalog",

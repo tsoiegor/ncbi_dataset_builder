@@ -94,7 +94,7 @@ QueuePolicy(
 | `fsync_logs: bool` | Synchronize unit logs at phase boundaries. |
 | `scheduler_poll_seconds: float` | Positive maximum wait between queue state checks. |
 
-Provider cleanup is constrained below `workspace/fastq/`. It is separate from
+Provider cleanup is constrained below `workspace/runtime/fastq/`. It is separate from
 processor-specific intermediate retention.
 
 # Execution-system classes
@@ -299,7 +299,7 @@ ExecutionRecord(
 )
 ```
 
-It is the immutable snapshot written under `workspace/executions/`.
+It is the immutable snapshot written under `workspace/runtime/executions/`.
 `to_dict()` and `from_dict(value)` round-trip all queue items and settings.
 
 ## `UnitStateStore`
@@ -311,16 +311,18 @@ UnitStateStore(root)
 | Method | Arguments and behavior |
 | --- | --- |
 | `get(unit_id)` | Read current JSON state or return `None`. |
-| `start(unit_id, *, fingerprint, execution_id, item, log_path, retry_failed=False, reclaim_running=False, stale_after_seconds=604800, force=False)` | Atomically claim a unit; return true only when work should run. |
-| `record_submission(unit_id, *, slurm_job_id, cpus, memory_gb, fingerprint, execution_id, item, log_path)` | Persist a held distributed job before release. |
-| `set_phase(unit_id, phase)` | Update the current staging/processing phase. |
-| `set_runtime_resources(unit_id, *, cpus, memory_gb)` | Record actual launch resources. |
-| `succeed(unit_id, result)` | Persist terminal successful payload. |
-| `fail(unit_id, error)` | Persist terminal failure with a bounded traceback tail. |
+| `start(unit_id, *, fingerprint, execution_id, item, log_path, retry_failed=False, reclaim_running=False, stale_after_seconds=604800, force=False)` | Atomically claim a unit; return a unique claim token when work should run, otherwise `False`. |
+| `record_submission(unit_id, *, slurm_job_id, cpus, memory_gb, fingerprint, execution_id, item, log_path)` | Persist a held distributed job before release and return its unique claim token. |
+| `set_phase(unit_id, phase, *, claim_id)` | Update the phase only while the caller still owns the claim. |
+| `set_runtime_resources(unit_id, *, cpus, memory_gb, claim_id)` | Record actual launch resources only for the current claim. |
+| `succeed(unit_id, result, *, claim_id)` | Persist terminal success only for the current claim. |
+| `fail(unit_id, error, *, claim_id)` | Persist terminal failure with a bounded traceback tail only for the current claim. |
 | `summary(unit_ids=None)` | Return counts and selected state records. |
 
 The builder uses this class to decide whether success is reusable, failure
-needs an explicit retry, or a running claim is still owned.
+needs an explicit retry, or a running claim is still owned. Every mutating
+operation after `start()`/`record_submission()` requires the returned token;
+a superseded worker raises `StaleUnitClaim` instead of overwriting newer state.
 
 ## `SlurmExecutor`
 

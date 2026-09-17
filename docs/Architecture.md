@@ -31,43 +31,38 @@ NCBI query or RunInfo CSV
                                          per-unit state and manifest
                                                      |
                                                      v
-                                  optional compact dataset publication
+                                  downstream manifest-driven reshaping
 ```
 
 ## Main concepts
 
 | Concept | Meaning | Where it is stored |
 | --- | --- | --- |
-| Run catalog | One row per SRA run plus an immutable audit trail | Memory and optional `catalogs/` CSV cache |
+| Run catalog | One row per SRA run plus an immutable audit trail | Memory and optional `runtime/catalogs/` CSV cache |
 | Processing unit | Group of runs processed together | Execution record and manifest |
-| Execution record | Immutable snapshot of requested units, resource config, queue config, and provenance | `executions/<execution-id>.json` |
+| Execution record | Immutable snapshot of requested units, resource config, queue config, and provenance | `runtime/executions/<execution-id>.json` |
 | Unit fingerprint | Hash of semantic work identity | Execution item and unit state |
-| Unit state | Current claim, phase, resources, result, or error for one unit | `state/units/<unit-id>.json` |
-| Workspace manifest | Latest execution summary and optional published dataset section | `manifest.json` |
-| Provider input | Downloaded/staged data controlled by queue cleanup | `fastq/` |
-| Processor work | Recoverable or removable processor-created intermediates | `work/units/<unit-id>/` |
-| Processor output | Declared final files | `outputs/<unit-id>/` |
+| Unit state | Current claim, phase, resources, result, or error for one unit | `runtime/state/units/<unit-id>.json` |
+| Workspace manifest | Public cumulative unit and processor-artifact index | `manifest.json` |
+| Provider input | Downloaded/staged data controlled by queue cleanup | `runtime/fastq/` |
+| Processor output | Processor-owned artifacts and intermediates | `output/<unit-id>/` |
 
 ## Workspace layout
 
 | Path | Owner | Purpose | May default cleanup remove it? |
 | --- | --- | --- | --- |
-| `workspace.json` | Workspace | Stable grouping, description profile, genome policy, schema, and directory roles | No |
-| `manifest.json` | Workspace | Latest execution/unit summary and publication manifest | No |
-| `catalogs/` | Builder | Cached RunInfo query CSVs | No |
-| `metadata/` | Metadata layer | Normalized records, cache index, and experiment descriptions | No |
-| `metadata_cache/` | Entrez clients | Reusable raw NCBI responses | No |
-| `fastq/` | FASTQ provider | SRA archives, converted/merged FASTQs, and provider manifests | Yes, only declared unit roots |
-| `work/genome_cache/` | Genome manager | Downloaded genomes, lockfile, and indexes | No |
-| `work/units/<id>/` | Processor | Unit-local intermediates | No; processor retention may remove its own files |
-| `outputs/<id>/` | Processor | Final declared artifacts | No |
-| `state/units/` | State store | Current atomic per-unit JSON state | No |
-| `state/history/` | State store | Archived prior state after semantic changes/repairs | No |
-| `state/locks/` | State store | Unit update locks | No |
-| `executions/` | Workspace | Immutable automatic execution snapshots | No |
-| `slurm/` | Slurm executor | Coordinator and distributed sample scripts | No |
-| `logs/` | Logging layer/Slurm | Per-unit and scheduler logs | No |
-| `bigWig/`, `descriptions/`, `genomes/` | Publisher | Optional in-place compact dataset | No |
+| `manifest.json` | Workspace | Public artifact index | No |
+| `output/<id>/` | Processor | All processor-owned files | Replaced only when that unit rebuilds |
+| `runtime/workspace.json` | Workspace | Stable grouping, output root, genome policy, and schema | No |
+| `runtime/catalogs/` | Builder | Cached RunInfo query CSVs | No |
+| `runtime/metadata/` | Metadata layer | Normalized records and cache index | No |
+| `runtime/metadata_cache/` | Entrez clients | Reusable raw NCBI responses | No |
+| `runtime/fastq/` | FASTQ provider | SRA archives, FASTQs, and provider manifests | Yes, only declared unit roots |
+| `runtime/genomes/` | Genome manager | Downloaded genomes, lockfile, and indexes | No |
+| `runtime/state/` | State store | Unit state, locks, and retry history | No |
+| `runtime/executions/` | Workspace | Immutable automatic execution snapshots | No |
+| `runtime/slurm/` | Slurm executor | Coordinator and sample scripts | No |
+| `runtime/logs/` | Logging layer/Slurm | Per-unit and scheduler logs | No |
 
 ## How processing units are formed
 
@@ -76,7 +71,7 @@ NCBI query or RunInfo CSV
 | `group_by` | Unit identifier | Typical use | Restriction |
 | --- | --- | --- | --- |
 | `"run"` | SRA run accession | Treat each run independently | Replicates/runs are not merged |
-| `"experiment"` | SRA experiment accession | Default; combine runs from one experiment | Required for compact publication |
+| `"experiment"` | SRA experiment accession | Default; combine runs from one experiment | Usually best for assay-level processing |
 | `"sra_sample"` | SRA Sample accession | Combine experiments/runs linked to one SRA sample | Requires the `SRA Sample` column |
 | `"biosample"` | BioSample accession | Broad biological-sample grouping | Requires the `BioSample` column |
 
@@ -122,13 +117,13 @@ Changing a semantic input archives prior state and creates fresh work.
 
 ## Stable workspace configuration
 
-The first execution writes `workspace.json`. Three settings are treated as
+The first execution writes `runtime/workspace.json`. Three settings are treated as
 stable semantics:
 
 | Setting | Why stable |
 | --- | --- |
 | `group_by` | Changes which runs belong to one unit |
-| `description_profile` | Changes published/normalized description meaning |
+| `output_dir` | Changes ownership and location of processor artifacts |
 | `genome_policy` | Changes reference-selection semantics |
 
 If unit state already exists, changing one of these values raises instead of
@@ -148,8 +143,10 @@ scientific semantics must change.
 | `failed` / `failed` | Bounded traceback tail is stored |
 
 State writes and execution writes are atomic. Unit updates are protected by
-per-unit file locks. Local/single-node coordination also uses a workspace queue
-coordinator lock.
+per-unit file locks and a unique claim token. Once a retry or replacement owns
+a newer claim, the superseded worker cannot publish a phase, resource update,
+success, or failure over it. Local/single-node coordination also uses a
+workspace queue coordinator lock.
 
 ## Success validation and reuse
 
@@ -163,7 +160,7 @@ A matching success is reusable only when:
 5. the persisted genome FASTA exists and is non-empty.
 
 If a matching success has invalid outputs, the builder force-reclaims it and
-resets its package-owned unit work/output directories before processing.
+resets its processor-owned unit output directory before processing.
 
 ## Retry behavior
 
@@ -184,8 +181,7 @@ When a unit must be rebuilt after a changed fingerprint, failed processing, or
 invalid success, the processor phase may remove:
 
 ```text
-workspace/work/units/<unit-id>/
-workspace/outputs/<unit-id>/
+workspace/output/<unit-id>/
 ```
 
 The builder does not reset arbitrary paths supplied by the user.
@@ -194,7 +190,7 @@ After processing, queue cleanup is separately constrained to provider-declared
 roots strictly below:
 
 ```text
-workspace/fastq/
+workspace/runtime/fastq/
 ```
 
 See [Storage](Storage.md#cleanup-matrix) for the cleanup decision table.
@@ -203,10 +199,10 @@ See [Storage](Storage.md#cleanup-matrix) for the cleanup decision table.
 
 | Log | Location | Contents |
 | --- | --- | --- |
-| Unit log | `logs/<sanitized-species>/<unit-id>.log` | Download, processing, warnings, errors, and cleanup diagnostics |
-| Single-node coordinator log | `logs/slurm/<job-id>.coordinator.log` | Whole allocation/coordinator output |
-| Distributed coordinator log | `logs/slurm/<job-id>.coordinator.log` | Admissions, scheduler queries, and worker coordination |
-| Distributed worker log | `logs/slurm/sample-<item-index>.<job-id>.log` | Batch stdout/stderr for one sample job |
+| Unit log | `runtime/logs/<sanitized-species>/<unit-id>.log` | Download, processing, warnings, errors, and cleanup diagnostics |
+| Single-node coordinator log | `runtime/logs/slurm/<job-id>.coordinator.log` | Whole allocation/coordinator output |
+| Distributed coordinator log | `runtime/logs/slurm/<job-id>.coordinator.log` | Admissions, scheduler queries, and worker coordination |
+| Distributed worker log | `runtime/logs/slurm/sample-<item-index>.<job-id>.log` | Batch stdout/stderr for one sample job |
 
 Unit logs append across attempts. `QueuePolicy.fsync_logs=True` synchronizes
 phase-boundary records for durability.
@@ -225,23 +221,15 @@ The coordinator uses `squeue` to observe active jobs. When `squeue` fails, new
 admission pauses. If a job disappears for more than 30 seconds without writing
 terminal unit state, the coordinator marks that unit failed.
 
-## Publication
+## Dataset shaping
 
-`publish_dataset()` creates a compact dataset only when:
-
-| Requirement | Reason |
-| --- | --- |
-| Execution is grouped by experiment | Publication keys are experiment IDs |
-| Each unit has exactly one matching experiment | Prevents ambiguous output ownership |
-| Each experiment links exactly one SRA Sample | Description identity must be unambiguous |
-| Unit state is successful | Failed or pending data is not publishable |
-| Exactly one BigWig is declared | Compact manifest expects one coverage track per experiment |
-| Normalized metadata and experiment description exist | Required for published descriptions |
-| Genome taxonomy matches the unit | Prevents cross-species publication |
-
-Publication can use hard links or copies. `auto` attempts a hard link and
-falls back to copying. An external existing destination requires
-`overwrite=True`; replacement is staged and swapped atomically.
+The core does not impose a BigWig, description, or genome folder structure.
+Each processor owns its unit output directory and declares durable artifacts.
+`manifest.json` retains units from every execution and records each unit's
+latest portable paths, roles, sizes, checksums, execution ID, and processor
+identity. A small downstream script can therefore create any consolidated
+dataset layout without losing older experiments when a later run selects only
+a subset.
 
 ## Operational checklist
 

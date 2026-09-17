@@ -87,8 +87,7 @@ These parameters are common to all modes.
 | `email: str \| None` | `None` | NCBI contact email used by Entrez and passed to Slurm workers | Supply a real monitored address for live NCBI calls | Required by `fetch_runs`, GEO resolution, and metadata fetching; not needed to load a CSV |
 | `ncbi_api_key: str \| None` | `None` | Optional NCBI API key for a higher Entrez request rate | Use your key for large metadata/catalog work | Never put a real key in committed examples; Slurm workers read `NCBI_API_KEY` from their environment |
 | `genome_policy: GenomeSelectionPolicy` | Default policy | Deterministic assembly filtering and ranking | Start with defaults; pin exact assemblies when reproducibility requires them | Stable workspace semantic setting after state exists |
-| `group_by` | `"experiment"` | Entity represented by one processing unit | Usually experiment for ATAC and publication; use run/sample only when scientifically intended | One of `run`, `experiment`, `sra_sample`, `biosample`; stable after state exists |
-| `description_profile` | `"training"` | Metadata projection written for descriptions | Use `training` for compact model inputs; `full` for relationship-rich metadata | Only `training` or `full`; stable after state exists |
+| `group_by` | `"experiment"` | Entity represented by one processing unit | Usually experiment for ATAC; use run/sample only when scientifically intended | One of `run`, `experiment`, `sra_sample`, `biosample`; stable after state exists |
 | `prefetch_max_size: str` | `"u"` | Value sent to SRA Toolkit `prefetch --max-size` | Start with `u` if storage admission already protects capacity; otherwise set a deliberate per-run limit such as `100G` | Must be non-empty; too-small values can make a run impossible to stage |
 | `show_progress: bool` | `True` | Enables progress reporting | Keep for interactive work; disable in very controlled logging environments | Does not disable per-unit logs |
 | `progress_bars: bool` | `True` | Uses tqdm bars when available | Use interactively; plain text is safer for some batch logs | Falls back when tqdm is absent |
@@ -188,13 +187,12 @@ converted into an execution snapshot. Slurm workers do not reopen that CSV.
 | Python executable | Current interpreter | Submitting interpreter path embedded in script | Same path embedded in coordinator and sample scripts |
 | Processor module | Current environment | Importable on allocation node | Importable on coordinator/worker environment |
 | Custom registered genome | Visible locally | Visible on allocation node | Visible on every worker |
-| Generated scripts | Not used | Coordinator script, usually in `workspace/slurm/` | Coordinator plus per-unit scripts in `workspace/slurm/` |
-| Logs | `workspace/logs/<species>/` | Unit logs plus `%j.coordinator.log` | Unit logs, coordinator log, and `sample-<index>.<jobid>.log` |
+| Generated scripts | Not used | Coordinator script, usually in `workspace/runtime/slurm/` | Coordinator plus per-unit scripts in `workspace/runtime/slurm/` |
+| Logs | `workspace/runtime/logs/<species>/` | Unit logs plus `%j.coordinator.log` | Unit logs, coordinator log, and `sample-<index>.<jobid>.log` |
 
 The Slurm generator resolves workspace and execution-record paths before
-writing commands. A workstation path such as
-`C:\data\ncbi-workspace` is not usable on a Linux cluster unless that exact
-path really exists there.
+writing commands. A workstation-only path is not usable on a cluster unless
+that exact path exists on the submit host and every relevant compute node.
 
 ## Slurm value restrictions
 
@@ -223,7 +221,7 @@ rejected in scheduler fields.
 | `genome_pins: dict[int, str] \| None` | No | Exact assembly accession by taxonomy ID | Taxonomy must match the unit |
 | `query: str \| None` | No | Provenance stored in the execution record | Does not itself fetch a catalog |
 | `retry_failed: bool` | No | Reclaims matching failed units | Default `False` leaves matching failures untouched |
-| `script_path: Path \| None` | No | Coordinator `.sbatch` destination | Defaults below `workspace/slurm/` |
+| `script_path: Path \| None` | No | Coordinator `.sbatch` destination | Defaults below `workspace/runtime/slurm/` |
 | `submit: bool` | No | Call `sbatch` after script generation | `False` is the safe first-run dry run |
 
 The return is `(script_path, job_id)`. `job_id` is `None` for a dry run.

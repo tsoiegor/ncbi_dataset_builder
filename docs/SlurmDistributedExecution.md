@@ -83,7 +83,6 @@ builder = DatasetBuilder(
         email="researcher@example.org",
         ncbi_api_key=None,
         group_by="experiment",
-        description_profile="training",
         prefetch_max_size="u",
         show_progress=True,
         progress_bars=True,
@@ -156,7 +155,6 @@ Repeat with `submit=True` only after checking paths, resources, and imports.
 | `ncbi_api_key` | `None` | Optional Entrez rate increase | Export `NCBI_API_KEY` to batch jobs | Not added as a generated command argument |
 | `genome_policy` | Default | Intended genome selection and workspace semantic | Prefer defaults or explicit genome pins | Standard workers reconstruct default manager/policy |
 | `group_by` | `"experiment"` | Processing-unit grouping in the saved record | Usually experiment | Stable after state exists |
-| `description_profile` | `"training"` | Workspace metadata semantic | Choose before first state | Worker reconstruction uses default profile |
 | `prefetch_max_size` | `"u"` | Intended SRA archive-size limit | Validate behavior with representative run | Standard workers reconstruct default provider |
 | `show_progress` | `True` | Submission-side progress | Any | Coordinator/worker reporting is created independently |
 | `progress_bars` | `True` | Submission-side bars | Any | Batch logs may be plain text |
@@ -313,7 +311,7 @@ download queue. Full storage details are in [Storage](Storage.md).
 
 For each admitted processing unit:
 
-1. create `workspace/slurm/<execution-id>/<unit-id>.sbatch`;
+1. create `workspace/runtime/slurm/<execution-id>/<unit-id>.sbatch`;
 2. call `sbatch --parsable --hold`;
 3. parse the scheduler job ID;
 4. atomically persist job ID, CPUs, memory, fingerprint, item, and log path;
@@ -377,10 +375,10 @@ The code does not use `sacct` to reconstruct historical completion.
 Monitor:
 
 ```text
-workspace/logs/slurm/<coordinator-job-id>.coordinator.log
-workspace/logs/slurm/sample-<index>.<worker-job-id>.log
-workspace/logs/<species>/<unit-id>.log
-workspace/state/units/<unit-id>.json
+workspace/runtime/logs/slurm/<coordinator-job-id>.coordinator.log
+workspace/runtime/logs/slurm/sample-<index>.<worker-job-id>.log
+workspace/runtime/logs/<species>/<unit-id>.log
+workspace/runtime/state/units/<unit-id>.json
 ```
 
 ## Restart and coordinator-loss procedure

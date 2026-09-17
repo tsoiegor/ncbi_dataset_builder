@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import socket
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
-from ..errors import UnitAlreadyRunning
+from ..errors import StaleUnitClaim, UnitAlreadyRunning
 from ..support.util import (
     atomic_write_json,
     exclusive_file_lock,
@@ -61,7 +62,7 @@ class UnitStateStore:
         reclaim_running: bool = False,
         stale_after_seconds: float = 7 * 24 * 60 * 60,
         force: bool = False,
-    ) -> bool:
+    ) -> str | bool:
         """Claim one sample for execution.
 
         Args:
@@ -76,7 +77,8 @@ class UnitStateStore:
             force: Repair a success whose declared outputs are invalid.
 
         Returns:
-            ``True`` when claimed and ``False`` when reusable or non-retryable.
+            A unique claim token when claimed and ``False`` when reusable or
+            non-retryable.
         """
 
         with exclusive_file_lock(self._lock(unit_id), timeout_seconds=60):
@@ -104,6 +106,7 @@ class UnitStateStore:
                 else 1
             )
             submitted = previous or {}
+            claim_id = uuid.uuid4().hex
             atomic_write_json(
                 self._path(unit_id),
                 {
@@ -117,13 +120,14 @@ class UnitStateStore:
                     "log_path": str(log_path),
                     "fingerprint": fingerprint,
                     "execution_id": execution_id,
+                    "claim_id": claim_id,
                     "item": item,
                     "slurm_job_id": submitted.get("slurm_job_id"),
                     "allocated_cpus": submitted.get("allocated_cpus"),
                     "allocated_memory_gb": submitted.get("allocated_memory_gb"),
                 },
             )
-            return True
+            return claim_id
 
     def record_submission(
         self,
@@ -136,7 +140,7 @@ class UnitStateStore:
         execution_id: str,
         item: dict[str, Any],
         log_path: Path,
-    ) -> None:
+    ) -> str:
         """Record one submitted distributed Slurm sample job.
 
         Args:
@@ -154,9 +158,12 @@ class UnitStateStore:
             raise ValueError("Submission needs a job ID and positive resources")
         with exclusive_file_lock(self._lock(unit_id), timeout_seconds=60):
             previous = self.get(unit_id)
+            if previous and previous.get("status") in {"running", "submitted"}:
+                raise UnitAlreadyRunning(f"Sample is already active: {unit_id}")
             if previous and previous.get("fingerprint") != fingerprint:
                 self._archive(unit_id, previous)
                 previous = None
+            claim_id = uuid.uuid4().hex
             atomic_write_json(
                 self._path(unit_id),
                 {
@@ -171,18 +178,31 @@ class UnitStateStore:
                     "allocated_memory_gb": memory_gb,
                     "fingerprint": fingerprint,
                     "execution_id": execution_id,
+                    "claim_id": claim_id,
                     "item": item,
                     "log_path": str(log_path),
                     "result": None,
                     "error": None,
                 },
             )
+            return claim_id
 
-    def set_phase(self, unit_id: str, phase: str) -> None:
-        """Set processing *phase* for a claimed *unit_id*."""
+    @staticmethod
+    def _require_claim(unit_id: str, state: dict[str, Any] | None, claim_id: str) -> dict[str, Any]:
+        """Return *state* when *claim_id* owns it, otherwise reject the update."""
+
+        if not state or state.get("claim_id") != claim_id:
+            current = state.get("claim_id") if state else None
+            raise StaleUnitClaim(
+                f"Unit claim was replaced for {unit_id}: expected {claim_id}, current {current}"
+            )
+        return state
+
+    def set_phase(self, unit_id: str, phase: str, *, claim_id: str) -> None:
+        """Set processing *phase* for *unit_id* owned by *claim_id*."""
 
         with exclusive_file_lock(self._lock(unit_id), timeout_seconds=60):
-            previous = self.get(unit_id)
+            previous = self._require_claim(unit_id, self.get(unit_id), claim_id)
             if not previous or previous.get("status") != "running":
                 raise ValueError(f"Cannot update an unclaimed sample: {unit_id}")
             atomic_write_json(
@@ -196,11 +216,12 @@ class UnitStateStore:
         *,
         cpus: int,
         memory_gb: float | None,
+        claim_id: str,
     ) -> None:
-        """Persist runtime *cpus* and optional Slurm *memory_gb* for *unit_id*."""
+        """Persist *cpus* and *memory_gb* for *unit_id* owned by *claim_id*."""
 
         with exclusive_file_lock(self._lock(unit_id), timeout_seconds=60):
-            previous = self.get(unit_id)
+            previous = self._require_claim(unit_id, self.get(unit_id), claim_id)
             if not previous or previous.get("status") != "running":
                 raise ValueError(f"Cannot allocate an unclaimed sample: {unit_id}")
             atomic_write_json(
@@ -213,11 +234,11 @@ class UnitStateStore:
                 },
             )
 
-    def succeed(self, unit_id: str, result: dict[str, Any]) -> None:
-        """Mark *unit_id* succeeded and persist serialized *result*."""
+    def succeed(self, unit_id: str, result: dict[str, Any], *, claim_id: str) -> None:
+        """Commit *result* for succeeded *unit_id* owned by *claim_id*."""
 
         with exclusive_file_lock(self._lock(unit_id), timeout_seconds=60):
-            previous = self.get(unit_id) or {}
+            previous = self._require_claim(unit_id, self.get(unit_id), claim_id)
             atomic_write_json(
                 self._path(unit_id),
                 {
@@ -230,11 +251,11 @@ class UnitStateStore:
                 },
             )
 
-    def fail(self, unit_id: str, error: str) -> None:
-        """Mark *unit_id* failed and persist a bounded tail of *error*."""
+    def fail(self, unit_id: str, error: str, *, claim_id: str) -> None:
+        """Persist bounded *error* for failed *unit_id* owned by *claim_id*."""
 
         with exclusive_file_lock(self._lock(unit_id), timeout_seconds=60):
-            previous = self.get(unit_id) or {}
+            previous = self._require_claim(unit_id, self.get(unit_id), claim_id)
             atomic_write_json(
                 self._path(unit_id),
                 {

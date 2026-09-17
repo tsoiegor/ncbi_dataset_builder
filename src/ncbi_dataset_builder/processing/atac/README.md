@@ -1,7 +1,8 @@
 # ATAC-seq processing
 
 The `ncbi_dataset_builder.processing.atac` subpackage implements a complete
-FASTQ-to-BigWig ATAC-seq processor using fastp, Bowtie2, samtools, and deepTools.
+FASTQ-to-BigWig ATAC-seq processor using fastp, Bowtie2, samtools, and the
+ExpressionPredict `bam2bw.py` script.
 It accepts single-end, paired-end, or mixed `FastqSet` inputs, validates final
 artifacts, and returns a standard `ProcessingResult`.
 
@@ -30,12 +31,13 @@ For one unit, `AtacSeqProcessor.__call__()`:
    `samtools sort`;
 8. copies one component BAM or merges several into the final BAM;
 9. creates a CSI index;
-10. creates one unstranded BigWig or requested strand-specific BigWigs;
-11. verifies all produced files;
-12. loads fastp JSON into result metrics;
-13. removes processor-owned intermediates according to
+10. finds the training description materialized for this Experiment;
+11. runs `bam2bw.py` to create forward/reverse BigWigs and append coverage;
+12. verifies both tracks and both description coverage keys;
+13. loads fastp JSON into result metrics;
+14. removes processor-owned intermediates according to
     `AtacIntermediateFiles`; and
-14. returns and validates `ProcessingResult`.
+15. returns and validates `ProcessingResult`.
 
 ## External commands
 
@@ -47,7 +49,7 @@ For one unit, `AtacSeqProcessor.__call__()`:
 | BAM stream | `samtools view -b -` piped to `samtools sort -@ <threads>` |
 | Component merge | `samtools merge -f -@ <threads>` when both paired and accepted single data exist |
 | Final index | `samtools index -c -@ <threads>` |
-| Coverage | `bamCoverage --binSize ... --numberOfProcessors <threads> --skipNAs` plus configured filters |
+| Coverage | Python runs `bam2bw.py`; that script invokes `bamCoverage` once per strand with bin size 1, strand filtering, `--skipNAs`, and `--ignoreDuplicates` |
 
 Bowtie2 and `samtools sort` both receive the full `threads` value while they
 run in the same pipeline. Account for this tool-level concurrency when choosing
@@ -93,16 +95,18 @@ several samples can share those cache files.
 # `AtacSeqConfig`
 
 ```python
+import sys
+from pathlib import Path
+
 AtacSeqConfig(
     bowtie2="bowtie2",
     bowtie2_build="bowtie2-build",
     samtools="samtools",
     fastp="fastp",
-    bam_coverage="bamCoverage",
+    bam2bw_script=Path("/shared/ExpressionPredict/src/bam2bw.py"),
+    python_executable=sys.executable,
     maximum_insert_size=2000,
-    bin_size=1,
-    normalize_using=None,
-    coverage_strands=(),
+    min_coverage=1_000_000,
     fastp_deduplicate=True,
     fastp_max_threads=16,
     strict_mixed_layout=True,
@@ -110,7 +114,6 @@ AtacSeqConfig(
     mixed_max_short_read_length=30,
     mixed_min_length_ratio=0.5,
     mixed_min_retained_fraction=0.1,
-    coverage_ignore_duplicates=True,
     intermediates=AtacIntermediateFiles(),
 )
 ```
@@ -123,7 +126,8 @@ AtacSeqConfig(
 | `bowtie2_build` | Bowtie2 index-builder executable. |
 | `samtools` | Samtools executable. |
 | `fastp` | Fastp executable. |
-| `bam_coverage` | deepTools `bamCoverage` executable. |
+| `bam2bw_script` | Required path to ExpressionPredict `bam2bw.py`; it may be omitted only when `$BAM2BW_SCRIPT` is set. There is no filesystem default. |
+| `python_executable` | Interpreter containing pandas, NumPy, pysam, pyBigWig, tqdm, and the script's other dependencies. |
 
 Names are resolved through `PATH` by default. Absolute executable paths are
 allowed when they are valid on the machine or every relevant compute node.
@@ -133,10 +137,7 @@ allowed when they are valid on the machine or every relevant compute node.
 | Argument | Meaning |
 | --- | --- |
 | `maximum_insert_size: int` | Positive Bowtie2 `-X` value for paired-end alignment. |
-| `bin_size: int` | Positive `bamCoverage --binSize`. |
-| `normalize_using: str | None` | Optional deepTools `--normalizeUsing` value such as one supported by the installed deepTools version. |
-| `coverage_strands: tuple[str, ...]` | Empty creates one unstranded `coverage` BigWig. Otherwise each entry must be `"forward"` or `"reverse"` and creates a separate file. |
-| `coverage_ignore_duplicates: bool` | Add `bamCoverage --ignoreDuplicates`. |
+| `min_coverage: int` | Non-negative minimum passed to `bam2bw.py`; defaults to 1,000,000 per strand. |
 
 ## Fastp fields
 
@@ -209,9 +210,9 @@ AtacSeqProcessor(
 
 ## `preflight() -> dict[str, str]`
 
-Require all five configured executables. Return version strings for fastp,
-Bowtie2, samtools, and bamCoverage. `bowtie2-build` is required but does not
-receive a separate version entry.
+Require fastp, Bowtie2, samtools, the configured Python interpreter, and
+`bamCoverage`. Run `bam2bw.py --help` to validate its import environment. Return
+tool versions plus the script SHA-256.
 
 ## `__call__(fastq, genome, context) -> ProcessingResult`
 
@@ -219,7 +220,7 @@ receive a separate version entry.
 | --- | --- |
 | `fastq: FastqSet` | Validated FASTQ inputs and provider provenance. |
 | `genome: GenomeRef` | Selected reference FASTA and assembly identity. |
-| `context: ProcessingContext` | Unit ID, CPU allocation, work/output directories, log path, and execution ID. |
+| `context: ProcessingContext` | Unit ID, CPU allocation, processor-owned output directory, log path, and execution ID. |
 
 The method raises on invalid input, missing tools, command failures, or
 missing/empty produced files. `DatasetBuilder` converts such exceptions to
@@ -231,7 +232,8 @@ For unit `SRX123` and assembly `GCF_123.1`:
 
 ```text
 workspace/
-├── work/units/SRX123/processing/atac/
+├── output/SRX123/
+│   ├── work/atac/
 │   ├── input.R1.fastq.gz
 │   ├── input.R2.fastq.gz
 │   ├── input.single.fastq.gz
@@ -244,19 +246,20 @@ workspace/
 │   ├── single.fastp.html
 │   ├── paired.sorted.bam
 │   └── single.sorted.bam
-├── outputs/SRX123/
 │   ├── SRX123.bam
 │   ├── SRX123.bam.csi
-│   └── SRX123.coverage.bw
-└── work/genome_cache/
+│   ├── SRX123.forward.bw
+│   ├── SRX123.reverse.bw
+│   ├── SRX123.json
+│   └── work/atac/file_mappings.csv
+└── runtime/genomes/
     └── .../indexes/GCF_123.1/
         ├── GCF_123.1.fna
         └── GCF_123.1.*.bt2
 ```
 
-Only paths relevant to the input layout are created. With
-`coverage_strands=("forward", "reverse")`, the BigWigs are
-`SRX123.forward.bw` and `SRX123.reverse.bw`.
+Only paths relevant to the input layout are created. Forward and reverse
+BigWigs are always produced because the mapping marks ATAC as unstranded.
 
 Existing non-empty staged inputs, fastp result sets, component BAMs, complete
 Bowtie2 indexes, final BAMs, and BigWigs are reused by the processor’s internal
@@ -267,7 +270,9 @@ output fingerprint.
 
 ## Always declared
 
-- every BigWig created for configured coverage modes.
+- forward and reverse BigWigs;
+- the coverage-annotated Experiment description; and
+- the one-row `file_mappings.csv` used by the external script.
 
 ## Declared when retained
 
@@ -278,7 +283,7 @@ output fingerprint.
 
 Cleaned/staged FASTQs, component BAMs, uncompressed index FASTA, and Bowtie2
 index files are never declared as `ProcessingResult.outputs`, even when
-retained. Their purpose is restart/reuse, not compact dataset publication.
+retained. Their purpose is processor-level restart/reuse.
 
 `metrics` contains parsed fastp JSON keyed by report stem, plus the optional
 mixed-layout decision. `tool_versions` contains preflight results.
@@ -290,25 +295,26 @@ Do not confuse processor retention with queue cleanup:
 | Layer | Timing | Controlled by | Paths |
 | --- | --- | --- | --- |
 | ATAC intermediate retention | After ATAC output validation | `AtacIntermediateFiles` | Processor-created unit work, final BAM/index, and genome-index files |
-| Provider input cleanup | After the unit outcome | `QueuePolicy` | Exact provider roots below `workspace/fastq/` |
+| Provider input cleanup | After the unit outcome | `QueuePolicy` | Exact provider roots below `workspace/runtime/fastq/` |
 
 Default queue cleanup removes the provider-owned SRA and converted FASTQ root
 after success. Default ATAC retention separately removes its staged/cleaned
-FASTQs and component BAMs, while retaining reports, final BAM/CSI, BigWig, and
-genome/index cache.
+FASTQs and component BAMs, while retaining reports, final BAM/CSI, both
+BigWigs, the Experiment description, mapping CSV, and genome/index cache.
 
 # Custom configuration example
 
 ```python
+from pathlib import Path
+
 from ncbi_dataset_builder import AtacIntermediateFiles, AtacSeqConfig
 from ncbi_dataset_builder.processing.atac import AtacSeqProcessor
 
 processor = AtacSeqProcessor(
     AtacSeqConfig(
         maximum_insert_size=2_000,
-        bin_size=10,
-        normalize_using="CPM",
-        coverage_strands=(),             # One unstranded coverage BigWig.
+        bam2bw_script=Path("/shared/ExpressionPredict/src/bam2bw.py"),
+        min_coverage=1_000_000,
         fastp_deduplicate=True,
         fastp_max_threads=16,
         strict_mixed_layout=True,
@@ -338,10 +344,12 @@ For Slurm, put a configured callable in an importable module:
 
 ```python
 # my_pipeline/atac.py
+from pathlib import Path
+
 from ncbi_dataset_builder.processing.atac import AtacSeqConfig, AtacSeqProcessor
 
 process_sample = AtacSeqProcessor(
-    AtacSeqConfig(bin_size=10, normalize_using="CPM")
+    AtacSeqConfig(bam2bw_script=Path("/shared/ExpressionPredict/src/bam2bw.py"))
 )
 ```
 
@@ -351,10 +359,9 @@ Then pass
 
 # Default wrapper
 
-`default_atac_processor = AtacSeqProcessor()` is the shared default instance.
-
-`process_atac(fastq, genome, context)` delegates to that instance. Its stable
-import path is:
+`default_atac_processor` is an alias of `process_atac(fastq, genome, context)`.
+The wrapper creates its processor lazily, so importing the package does not
+require `$BAM2BW_SCRIPT`; invoking it does. Its stable import path is:
 
 ```text
 ncbi_dataset_builder.processing.atac:process_atac

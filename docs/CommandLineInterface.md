@@ -6,8 +6,8 @@ Installation creates `ncbi-dataset`. The equivalent module entry point is:
 python -m ncbi_dataset_builder
 ```
 
-The CLI covers catalog fetching, local execution, both Slurm modes, status,
-and compact publication. It maps arguments directly to the same Python
+The CLI covers catalog fetching, local execution, both Slurm modes, and status.
+It maps arguments directly to the same Python
 configuration classes described in the execution guides.
 
 ## Commands
@@ -18,8 +18,7 @@ configuration classes described in the execution guides.
 | `build-local` | Run the streaming queue on the current server | `build()` |
 | `submit-single-node` | Generate/submit one Slurm allocation | `submit_slurm()` |
 | `submit-distributed` | Generate/submit a coordinator that launches sample jobs | `submit_slurm()` |
-| `status` | Print latest or selected execution/unit state | `status()` |
-| `publish` | Publish a compact experiment dataset | `publish_dataset()` |
+| `status` | Print workspace-wide or selected execution/unit state | `status()` |
 
 Run:
 
@@ -36,14 +35,14 @@ Every command accepts these options:
 | Option | Required/default | Python field | Meaning/restriction |
 | --- | --- | --- | --- |
 | `--workspace PATH` | Required | `BuilderConfig.workspace` | Durable workspace root |
+| `--output-dir PATH` | `WORKSPACE/output` | `BuilderConfig.output_dir` | Processor-owned output root |
 | `--email ADDRESS` | `NCBI_EMAIL` or unset | `email` | Required for live NCBI catalog/metadata work |
 | `--ncbi-api-key KEY` | `NCBI_API_KEY` or unset | `ncbi_api_key` | Optional higher Entrez request rate |
 | `--group-by LEVEL` | `experiment` | `group_by` | `run`, `experiment`, `sra_sample`, or `biosample` |
 | `--prefetch-max-size VALUE` | `u` | `prefetch_max_size` | SRA Toolkit archive limit such as `100G` or unlimited `u` |
 
-`group_by`, description profile, and genome policy are stable workspace
-semantics once unit state exists. The CLI exposes grouping but currently uses
-default description and genome policies.
+`group_by`, output directory, and genome policy are stable workspace semantics
+once unit state exists.
 
 ## Catalog-source options
 
@@ -150,7 +149,7 @@ Both Slurm commands accept:
 
 Use `--no-submit` on the first configuration and inspect the generated file.
 The CLI does not print the returned script/job tuple; find the default script
-under `workspace/slurm/`, or provide `--script-path`.
+under `workspace/runtime/slurm/`, or provide `--script-path`.
 
 ## `submit-single-node`
 
@@ -253,7 +252,7 @@ submission, monitoring, and restart restrictions.
 ## `status`
 
 ```bash
-# Latest execution record.
+# All units known to the workspace, across executions.
 ncbi-dataset status \
   --workspace /data/ncbi-workspace
 
@@ -268,9 +267,15 @@ ncbi-dataset status \
   --json
 ```
 
+Without `--execution-id`, status combines immutable execution records with the
+current state of every known unit. With `--execution-id`, it is scoped to that
+execution's requested units. The human-readable view includes the scope,
+grouping, state totals, genome availability, artifact totals, and one row per
+unit; `--json` exposes the same data for scripts.
+
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--execution-id ID` | Latest written execution | Select exact execution snapshot |
+| `--execution-id ID` | All workspace units | Select one exact execution snapshot |
 | `--json` | False | Print the complete structured report as JSON |
 
 The default output is a compact report containing:
@@ -284,29 +289,6 @@ The default output is a compact report containing:
 Use `--json` for the complete report, including persisted unit records.
 
 The command exits `0` after printing. It does not wait for running Slurm jobs.
-
-## `publish`
-
-```bash
-ncbi-dataset publish \
-  --workspace /data/ncbi-workspace \
-  --destination /data/model-dataset \
-  --execution-id execution-20260913T120000Z-abc123 \
-  --mode auto \
-  --overwrite
-```
-
-| Option | Required/default | Meaning/restriction |
-| --- | --- | --- |
-| `--destination PATH` | Workspace | External compact dataset root or in-place publication |
-| `--execution-id ID` | Latest | Execution snapshot to publish |
-| `--mode MODE` | `auto` | `auto`, `hardlink`, or `copy` |
-| `--overwrite` | False | Permit atomic replacement of existing external destination |
-
-The command prints the exported manifest path and exits `0` on success.
-Publication requires experiment grouping, successful states, exactly one SRA
-Sample and BigWig per experiment, metadata descriptions, and consistent genome
-taxonomy. See [Architecture](Architecture.md#publication).
 
 ## CLI-to-Python mapping
 
@@ -331,7 +313,7 @@ Use the Python API when you need:
 | Custom FASTQ provider or genome manager | `DatasetBuilder(..., fastq_provider=..., genome_manager=...)` |
 | Explicit genome pins | `genome_pins={taxid: accession}` |
 | Explicit dynamic processor identity | `processor_id=...` |
-| Custom description profile/policy methods | `BuilderConfig` and metadata APIs |
+| Explicit description projection | `MetadataBundle.descriptions_by_experiment()` |
 | Queue log sync or poll interval | `fsync_logs`, `scheduler_poll_seconds` |
 | Custom progress reporter | `DatasetBuilder(..., progress=...)` |
 | Programmatic `BuildReport`/script job ID handling | Method return values |
@@ -344,7 +326,6 @@ Use the Python API when you need:
 | `build-local` | No returned unit outcome has status `failed` | At least one unit failed |
 | Slurm submit commands | Script generation/submission call succeeded | Later batch failures do not change original CLI exit |
 | `status` | Mapping printed | Unhandled error |
-| `publish` | Manifest path printed | Unhandled error |
 
 ## Common CLI mistakes
 
@@ -353,7 +334,7 @@ Use the Python API when you need:
 | Parser rejects catalog arguments | Both or neither of `--catalog`/`--query` supplied | Supply exactly one |
 | Live query says email required | No flag/environment email | Set `--email` or `NCBI_EMAIL` |
 | Local CLI cannot find processor | Reference not importable | Use `module:callable` and install module |
-| `--no-submit` seems silent | CLI does not print tuple | Look below `workspace/slurm/` or set `--script-path` |
+| `--no-submit` seems silent | CLI does not print tuple | Look below `workspace/runtime/slurm/` or set `--script-path` |
 | Distributed downloads exceed expectation | `--download-workers` is not distributed staging concurrency | Lower `--max-running-jobs` |
 | Slurm command exits 0 but job later fails | CLI only submitted | Inspect logs and run `status` |
 | Existing inputs remain despite discard flag | `--keep-inputs` sets cleanup to never | Remove `--keep-inputs` |

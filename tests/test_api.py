@@ -1,12 +1,18 @@
 import json
 
+import pytest
+
 from ncbi_dataset_builder import (
     BuilderConfig,
     DatasetBuilder,
     FilesystemStorage,
+    GenomeSelectionPolicy,
     LocalExecution,
     QueuePolicy,
+    QuotaStorage,
     RunCatalog,
+    SlurmSingleNodeExecution,
+    SraToolkitProvider,
 )
 from ncbi_dataset_builder.cli.main import _print_status
 from ncbi_dataset_builder.metadata import MetadataBundle
@@ -49,6 +55,22 @@ def processor(fastq, genome, context):
     )
 
 
+def description_processor(fastq, genome, context):
+    del fastq, genome
+    description = context.output_dir / f"{context.unit_id}.json"
+    value = json.loads(description.read_text(encoding="utf-8"))
+    assert value["ID"] == context.unit_id
+    artifact = context.output_dir / f"{context.unit_id}.txt"
+    artifact.write_text("processed", encoding="utf-8")
+    return ProcessingResult(
+        True,
+        outputs={"description": description, "artifact": artifact},
+    )
+
+
+description_processor.description_profile = "training"
+
+
 def catalog(*experiment_ids):
     return RunCatalog.from_records(
         [
@@ -87,12 +109,11 @@ def test_local_sample_queue_builds_and_resumes(tmp_path):
     first = instance.build(catalog("SRX1", "SRX2"), processor, execution=execution, queue=queue)
     assert first.succeeded == 2
     assert first.failed == 0
-    assert not (tmp_path / "fastq" / "SRX1").exists()
+    assert not (tmp_path / "runtime" / "fastq" / "SRX1").exists()
     manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["schema_version"] == 2
-    result = manifest["units"]["SRX1"]["state"]["result"]
-    assert set(result["processing"]["outputs"]) == {"coverage"}
-    assert result["output_files"]["coverage"]["path"].endswith("SRX1.bw")
+    assert manifest["schema_version"] == 3
+    assert manifest["output_root"] == "output"
+    assert manifest["units"]["SRX1"]["artifacts"]["coverage"]["path"] == "SRX1/SRX1.bw"
     second = instance.build(catalog("SRX1", "SRX2"), processor, execution=execution, queue=queue)
     assert second.skipped == 2
     assert instance.status()["counts"]["succeeded"] == 2
@@ -100,7 +121,39 @@ def test_local_sample_queue_builds_and_resumes(tmp_path):
         "SRX1",
         "SRX2",
     ]
-    assert list((tmp_path / "executions").glob("execution-*.json"))
+    assert list((tmp_path / "runtime" / "executions").glob("execution-*.json"))
+    assert not any((tmp_path / name).exists() for name in ("bigWig", "descriptions", "genomes"))
+
+
+def test_workspace_is_lazy_and_custom_output_root_is_used(tmp_path):
+    custom_output = tmp_path / "dataset"
+    instance = DatasetBuilder(
+        BuilderConfig(tmp_path, output_dir=custom_output, show_progress=False),
+        fastq_provider=FakeFastqProvider(),
+        genome_manager=FakeGenomeManager(tmp_path / "genome-cache"),
+    )
+    assert {path.name for path in tmp_path.iterdir()} == {"runtime"}
+
+    instance.build(catalog("SRX1"), processor)
+
+    assert (custom_output / "SRX1" / "SRX1.bw").is_file()
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["output_root"] == "dataset"
+    reopened = DatasetBuilder(
+        BuilderConfig(tmp_path, show_progress=False),
+        fastq_provider=FakeFastqProvider(),
+        genome_manager=FakeGenomeManager(tmp_path / "genome-cache"),
+    )
+    assert reopened.workspace.output == custom_output.resolve()
+
+
+def test_processing_result_rejects_artifact_outside_output_dir(tmp_path):
+    outside = tmp_path / "outside.bw"
+    outside.write_bytes(b"track")
+    result = ProcessingResult(True, outputs={"coverage": outside})
+
+    with pytest.raises(ValueError, match="outside its output directory"):
+        result.validate(output_dir=tmp_path / "output" / "SRX1")
 
 
 def test_changed_processor_identity_rebuilds_sample(tmp_path):
@@ -108,7 +161,7 @@ def test_changed_processor_identity_rebuilds_sample(tmp_path):
     instance.build(catalog("SRX1"), processor, processor_id="processor-v1")
     rebuilt = instance.build(catalog("SRX1"), processor, processor_id="processor-v2")
     assert rebuilt.succeeded == 1
-    assert list((tmp_path / "state" / "history" / "SRX1").glob("*.json"))
+    assert list((tmp_path / "runtime" / "state" / "history" / "SRX1").glob("*.json"))
 
 
 def test_catalog_loads_from_csv_without_ncbi_credentials(tmp_path):
@@ -187,18 +240,155 @@ def test_enrich_metadata_fetches_only_missing_experiments(tmp_path):
     instance.biosample = IncrementalBioSample()
 
     instance.enrich_metadata(catalog("SRX1"))
-    scoped = instance.enrich_metadata(
-        catalog("SRX1", "SRX2"), description_profile="full"
-    )
+    scoped = instance.enrich_metadata(catalog("SRX1", "SRX2"))
 
     assert [call[0] for call in instance.sra.calls] == [["SRX1"], ["SRX2"]]
     assert [row["accession"] for row in scoped.experiments] == ["SRX1", "SRX2"]
     index = json.loads(
-        (tmp_path / "metadata" / "metadata_index.json").read_text(encoding="utf-8")
+        (tmp_path / "runtime" / "metadata" / "metadata_index.json").read_text(
+            encoding="utf-8"
+        )
     )
     assert set(index["experiments"]) == {"SRX1", "SRX2"}
-    assert (tmp_path / "metadata" / "experiment_descriptions" / "SRX1.json").is_file()
-    assert (tmp_path / "metadata" / "experiment_descriptions" / "SRX2.json").is_file()
+    assert not (tmp_path / "runtime" / "metadata" / "experiment_descriptions").exists()
+
+
+def test_processor_can_request_training_description_in_experiment_output(tmp_path):
+    instance = builder(tmp_path)
+    MetadataBundle(
+        packages=[
+            {
+                "accession": "SRX1",
+                "experiment_accession": "SRX1",
+                "sra_sample_accession": "SRS1",
+                "run_accessions": ["SRR1"],
+            }
+        ],
+        experiments=[{"accession": "SRX1", "library": {"strategy": "ATAC-seq"}}],
+        sra_samples=[
+            {
+                "accession": "SRS1",
+                "biosample": "SAMN1",
+                "organism": "Homo sapiens",
+            }
+        ],
+        biosamples=[{"accession": "SAMN1"}],
+    ).save(tmp_path / "runtime" / "metadata")
+
+    report = instance.build(catalog("SRX1"), description_processor)
+
+    assert report.succeeded == 1
+    description = tmp_path / "output" / "SRX1" / "SRX1.json"
+    assert json.loads(description.read_text(encoding="utf-8"))["Strategy"] == "ATAC-seq"
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["units"]["SRX1"]["artifacts"]["description"]["path"] == (
+        "SRX1/SRX1.json"
+    )
+
+
+def test_changed_description_content_invalidates_successful_unit(tmp_path):
+    instance = builder(tmp_path)
+
+    def save_metadata(strategy):
+        MetadataBundle(
+            packages=[
+                {
+                    "accession": "SRX1",
+                    "experiment_accession": "SRX1",
+                    "sra_sample_accession": "SRS1",
+                    "run_accessions": ["SRR1"],
+                }
+            ],
+            experiments=[{"accession": "SRX1", "library": {"strategy": strategy}}],
+            sra_samples=[
+                {
+                    "accession": "SRS1",
+                    "biosample": "SAMN1",
+                    "organism": "Homo sapiens",
+                }
+            ],
+            biosamples=[{"accession": "SAMN1"}],
+        ).save(tmp_path / "runtime" / "metadata")
+
+    save_metadata("ATAC-seq")
+    first = instance.build(catalog("SRX1"), description_processor)
+    save_metadata("DNase-Hypersensitivity")
+    second = instance.build(catalog("SRX1"), description_processor)
+
+    assert first.succeeded == 1
+    assert second.succeeded == 1
+    description = json.loads(
+        (tmp_path / "output" / "SRX1" / "SRX1.json").read_text(encoding="utf-8")
+    )
+    assert description["Strategy"] == "DNase-Hypersensitivity"
+
+
+def test_manifest_and_default_status_retain_prior_executions(tmp_path):
+    instance = builder(tmp_path)
+    instance.build(catalog("SRX1", "SRX2"), processor)
+    latest = instance.build(catalog("SRX2"), processor)
+
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert set(manifest["units"]) == {"SRX1", "SRX2"}
+    assert {item["experiment_id"] for item in instance.status()["experiments"]} == {
+        "SRX1",
+        "SRX2",
+    }
+    selected = instance.status(latest.execution_id)
+    assert [item["experiment_id"] for item in selected["experiments"]] == ["SRX2"]
+    assert selected["scope"] == "execution"
+
+
+def test_slurm_worker_reconstructs_builder_and_sra_provider_configuration(tmp_path):
+    config = BuilderConfig(
+        tmp_path,
+        output_dir=tmp_path / "dataset",
+        genome_policy=GenomeSelectionPolicy(allow_atypical=True, prefer_refseq=False),
+        prefetch_max_size="7G",
+        show_progress=False,
+        progress_bars=False,
+    )
+    provider = SraToolkitProvider(
+        retries=6,
+        prefetch_max_size="9G",
+        prefetch_reset_after_failures=2,
+        prefetch_retry_max_delay_seconds=17,
+    )
+    instance = DatasetBuilder(config, fastq_provider=provider)
+    execution = SlurmSingleNodeExecution(
+        allocation_cpus=4,
+        allocation_memory_gb=8,
+        allocation_time_limit="01:00:00",
+        storage=QuotaStorage(quota_gb=100),
+        memory_gb_per_job=4,
+    )
+    record = instance._create_execution(
+        catalog("SRX1"),
+        processor,
+        execution=execution,
+        queue=QueuePolicy(),
+        group_by=None,
+        genome_pins=None,
+        query=None,
+        processor_id="processor-v1",
+    )
+
+    restored = DatasetBuilder.from_execution_record(
+        workspace=tmp_path,
+        record=record,
+        email=None,
+        ncbi_api_key=None,
+    )
+
+    assert restored.config.output_dir == (tmp_path / "dataset").resolve()
+    assert restored.config.genome_policy == config.genome_policy
+    assert restored.config.prefetch_max_size == "7G"
+    assert restored.config.show_progress is False
+    assert isinstance(restored.fastq_provider, SraToolkitProvider)
+    assert restored.fastq_provider.retries == 6
+    assert restored.fastq_provider.prefetch_max_size == "9G"
+    assert restored.fastq_provider.prefetch_reset_after_failures == 2
+    assert restored.fastq_provider.prefetch_retry_max_delay_seconds == 17
 
 
 def test_status_formatter_lists_every_experiment_and_inventory(tmp_path, capsys):

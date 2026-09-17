@@ -33,5 +33,9 @@ class UnitAlreadyRunning(DatasetBuilderError):
     """A non-stale worker already owns a sample unit."""
 
 
+class StaleUnitClaim(DatasetBuilderError):
+    """A worker tried to mutate state after its unit claim was replaced."""
+
+
 class ProcessingError(DatasetBuilderError):
     """A processor failed or produced invalid outputs."""

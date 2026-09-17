@@ -56,7 +56,7 @@ EntrezClient(
 | `email: str` | Required NCBI contact email. Empty values are rejected. |
 | `api_key: str | None` | Optional key; default request rate is higher when present. |
 | `tool: str` | Tool name sent to NCBI. |
-| `cache_dir: Path | None` | Optional raw-response cache. The builder uses `workspace/metadata_cache/`. |
+| `cache_dir: Path | None` | Optional raw-response cache. The builder uses `workspace/runtime/metadata_cache/`. |
 | `http: HttpClient | None` | Injectable transport; a configured default is created otherwise. |
 | `progress: ProgressReporter | None` | Optional cache/network event reporter. |
 
@@ -169,8 +169,7 @@ package record. Unknown selections simply contribute no linked records.
 | Method | Arguments and result |
 | --- | --- |
 | `descriptions_by_experiment(*, profile="training", policy=None, progress=None)` | Build description dictionaries keyed by Experiment accession. |
-| `save_experiment_descriptions(directory, *, profile="training", policy=None, progress=None)` | Atomically write one `<experiment>.json` file per description. |
-| `save(directory, *, description_profile="training", policy=None, progress=None)` | Write `metadata.json`, collection NDJSON files, and `experiment_descriptions/`. |
+| `save(directory, *, progress=None)` | Write `metadata.json` and normalized collection NDJSON files. |
 
 `profile="training"` uses the compact biological projection.
 `profile="full"` retains the normalized relationship-rich Experiment
@@ -221,8 +220,11 @@ policy = DescriptionPolicy(
 
 bundle = builder.enrich_metadata(
     catalog,
-    description_profile="training",
-    description_policy=policy,
+)
+
+descriptions = bundle.descriptions_by_experiment(
+    profile="training",
+    policy=policy,
 )
 ```
 
@@ -368,7 +370,7 @@ from ncbi_dataset_builder.metadata import fetch_metadata_for_accessions
 
 entrez = EntrezClient(
     email="researcher@example.org",
-    cache_dir=Path("/data/ncbi-workspace/metadata_cache"),
+    cache_dir=Path("/data/ncbi-workspace/runtime/metadata_cache"),
 )
 sra = SraClient(entrez)
 biosample = BioSampleClient(entrez)
@@ -381,8 +383,5 @@ bundle = fetch_metadata_for_accessions(
     refresh=False,       # Reuse valid raw responses.
 )
 
-bundle.save(
-    Path("/data/ncbi-workspace/metadata"),
-    description_profile="training",
-)
+bundle.save(Path("/data/ncbi-workspace/runtime/metadata"))
 ```

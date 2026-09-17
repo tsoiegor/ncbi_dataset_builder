@@ -91,14 +91,15 @@ class FastqSet:
     def validate(self) -> None:
         """Validate layout-specific file counts and require non-empty FASTQs."""
 
-        if self.layout in {FastqLayout.PAIRED, FastqLayout.MIXED} and (
-            not self.read1 or len(self.read1) != len(self.read2)
-        ):
+        has_pair = bool(self.read1 or self.read2)
+        if has_pair and (not self.read1 or len(self.read1) != len(self.read2)):
             raise ValueError("Paired FASTQ input requires matching read1/read2 files")
-        if self.layout == FastqLayout.SINGLE and not self.single:
-            raise ValueError("Single-end FASTQ input has no files")
-        if self.layout == FastqLayout.MIXED and not self.single:
-            raise ValueError("Mixed FASTQ input has no single/orphan files")
+        if self.layout == FastqLayout.SINGLE and (not self.single or has_pair):
+            raise ValueError("Single-end FASTQ input requires only single/orphan files")
+        if self.layout == FastqLayout.PAIRED and (not self.read1 or self.single):
+            raise ValueError("Paired FASTQ input requires only matching read1/read2 files")
+        if self.layout == FastqLayout.MIXED and (not self.read1 or not self.single):
+            raise ValueError("Mixed FASTQ input requires paired and single/orphan files")
         for path in (*self.read1, *self.read2, *self.single):
             if not path.is_file() or path.stat().st_size == 0:
                 raise ValueError(f"FASTQ file is missing or empty: {path}")
@@ -227,15 +228,13 @@ class ProcessingContext:
     Args:
         unit_id: Stable processing-unit identifier.
         threads: Maximum CPUs assigned to the processor.
-        work_dir: Directory for recoverable processor intermediates.
-        output_dir: Directory for final processor artifacts.
+        output_dir: Processor-owned directory for all artifacts and intermediates.
         log_path: Permanent unit log path.
         execution_id: Execution snapshot that requested this invocation.
     """
 
     unit_id: str
     threads: int
-    work_dir: Path
     output_dir: Path
     log_path: Path
     execution_id: str
@@ -255,7 +254,6 @@ class ProcessingContext:
 
         return {
             **asdict(self),
-            "work_dir": str(self.work_dir),
             "output_dir": str(self.output_dir),
             "log_path": str(self.log_path),
         }
@@ -279,8 +277,25 @@ class ProcessingResult:
     tool_versions: dict[str, str] = field(default_factory=dict)
     message: str | None = None
 
-    def validate(self) -> None:
-        """Require success and at least one declared, non-empty output."""
+    def resolved_outputs(self, output_dir: Path) -> dict[str, Path]:
+        """Resolve declared paths below the processor-owned *output_dir*."""
+
+        root = output_dir.resolve()
+        resolved: dict[str, Path] = {}
+        for role, declared in self.outputs.items():
+            if not isinstance(declared, Path):
+                raise TypeError(f"Processor output {role!r} must be a pathlib.Path")
+            path = declared if declared.is_absolute() else output_dir / declared
+            path = path.resolve()
+            if path == root or not path.is_relative_to(root):
+                raise ValueError(
+                    f"Processor output {role!r} is outside its output directory: {path}"
+                )
+            resolved[role] = path
+        return resolved
+
+    def validate(self, *, output_dir: Path | None = None) -> None:
+        """Require outputs to be valid and, when given, inside *output_dir*."""
 
         if not self.success:
             raise ValueError(self.message or "Processor reported failure")
@@ -288,10 +303,15 @@ class ProcessingResult:
             raise ValueError("Processor reported success without outputs")
         if any(not isinstance(role, str) or not role.strip() for role in self.outputs):
             raise ValueError("Processor output roles must be non-empty strings")
-        paths = list(self.outputs.values())
+        resolved = (
+            self.resolved_outputs(output_dir)
+            if output_dir is not None
+            else dict(self.outputs)
+        )
+        paths = list(resolved.values())
         if len({str(path) for path in paths}) != len(paths):
             raise ValueError("Processor output paths must be unique")
-        for role, path in self.outputs.items():
+        for role, path in resolved.items():
             if not isinstance(path, Path):
                 raise TypeError(f"Processor output {role!r} must be a pathlib.Path")
             if not path.is_file() or path.stat().st_size == 0:

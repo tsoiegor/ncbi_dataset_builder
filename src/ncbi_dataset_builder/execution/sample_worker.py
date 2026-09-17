@@ -6,7 +6,7 @@ import argparse
 import os
 from pathlib import Path
 
-from ..api import BuilderConfig, DatasetBuilder
+from ..api import DatasetBuilder
 from ..processing.base import load_processor
 from ..workspace import WorkspaceStore
 from .config import (
@@ -38,13 +38,11 @@ def main(argv: list[str] | None = None) -> int:
     if not execution.min_cpus_per_job <= arguments.cpus <= execution.max_cpus_per_job:
         raise ValueError("Worker CPU allocation is outside execution limits")
     queue = queue_policy_from_dict(record.queue_config)
-    builder = DatasetBuilder(
-        BuilderConfig(
-            workspace=arguments.workspace,
-            email=arguments.email,
-            ncbi_api_key=os.environ.get("NCBI_API_KEY"),
-            group_by=record.group_by,
-        )
+    builder = DatasetBuilder.from_execution_record(
+        workspace=arguments.workspace,
+        record=record,
+        email=arguments.email,
+        ncbi_api_key=os.environ.get("NCBI_API_KEY"),
     )
     item = record.items[arguments.item_index]
     prepared = builder._claim_and_stage(

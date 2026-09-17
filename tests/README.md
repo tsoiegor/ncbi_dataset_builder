@@ -17,7 +17,6 @@ real Slurm jobs or download complete public datasets.
 | `test_genomes.py` | Candidate parsing, policy ranking, custom references, caches, and locks |
 | `test_metadata.py` | Entrez/SRA/BioSample parsing, relationships, caching, saving, and enrichment |
 | `test_progress.py` | Text/bar progress and visibility behavior |
-| `test_publishing.py` | Compact dataset validation, materialization, and atomic overwrite |
 | `test_state_and_workspace.py` | Workspace semantics, unit state, stale claims, and manifests |
 | `test_docstrings.py` | Public-module/class/function docstring coverage |
 

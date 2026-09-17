@@ -37,7 +37,7 @@ fetch(
 | Argument | Meaning |
 | --- | --- |
 | `unit` | Catalog-derived runs and species metadata to materialize together. |
-| `destination` | Package-managed FASTQ root, normally `workspace/fastq/`. |
+| `destination` | Package-managed FASTQ root, normally `workspace/runtime/fastq/`. |
 | `threads` | Maximum CPU count available to provider tools. |
 
 The result must have correct layout fields and non-empty files. The builder
@@ -377,7 +377,7 @@ from pathlib import Path
 
 from ncbi_dataset_builder import GenomeManager
 
-manager = GenomeManager(Path("/data/ncbi-workspace/work/genome_cache"))
+manager = GenomeManager(Path("/data/ncbi-workspace/runtime/genomes"))
 
 # Register an assembly already managed by your lab.
 custom = manager.register_custom(

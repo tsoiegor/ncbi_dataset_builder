@@ -731,48 +731,16 @@ class MetadataBundle:
             descriptions[experiment_accession] = description
         return descriptions
 
-    def save_experiment_descriptions(
-        self,
-        directory: Path,
-        *,
-        profile: str = "training",
-        policy: DescriptionPolicy | None = None,
-        progress: ProgressReporter | None = None,
-    ) -> None:
-        """Write Experiment JSON to *directory* using *profile*, *policy*, and *progress*."""
-
-        directory.mkdir(parents=True, exist_ok=True)
-        reporter = get_progress(progress)
-        descriptions = self.descriptions_by_experiment(
-            profile=profile,
-            policy=policy,
-            progress=reporter,
-        )
-        written = 0
-        unchanged = 0
-        for accession, description in reporter.track(
-            descriptions.items(), "Save experiment descriptions", unit="experiments"
-        ):
-            if atomic_write_json(directory / f"{accession}.json", description):
-                written += 1
-            else:
-                unchanged += 1
-        reporter.message(
-            f"Experiment description files: {unchanged:,} unchanged; {written:,} written"
-        )
-
     def save(
         self,
         directory: Path,
         *,
-        description_profile: str = "training",
-        policy: DescriptionPolicy | None = None,
         progress: ProgressReporter | None = None,
     ) -> None:
-        """Persist complete metadata and selected per-Experiment descriptions.
+        """Persist complete normalized metadata without creating dataset artifacts.
 
-        *directory* receives normalized JSON/NDJSON. *description_profile* and
-        *policy* control compact files, and *progress* reports writes.
+        *directory* receives normalized JSON/NDJSON and *progress* reports
+        writes. Description projection remains an in-memory caller operation.
         """
 
         reporter = get_progress(progress)
@@ -797,12 +765,6 @@ class MetadataBundle:
                     json.dumps(row, ensure_ascii=False, sort_keys=True) for row in rows
                 )
                 atomic_write_text(directory / f"{name}.ndjson", text + "\n")
-        self.save_experiment_descriptions(
-            directory / "experiment_descriptions",
-            profile=description_profile,
-            policy=policy,
-            progress=reporter,
-        )
 
     def attach_to_runs(self, catalog: RunCatalog) -> RunCatalog:
         """Join normalized metadata columns onto *catalog* by entity accession."""
@@ -1172,7 +1134,24 @@ class SraClient:
         reader = csv.DictReader(io.StringIO(text))
         if not reader.fieldnames or "Run" not in reader.fieldnames:
             raise MetadataError(f"Unexpected SRA RunInfo response header: {reader.fieldnames!r}")
-        return [dict(row) for row in reader if row.get("Run")]
+        records: list[dict[str, Any]] = []
+        aliases = {"Sample": "SRA Sample", "SRAStudy": "SRA Study"}
+        for source in reader:
+            if not source.get("Run"):
+                continue
+            row = dict(source)
+            for original, canonical in aliases.items():
+                original_value = row.get(original)
+                canonical_value = row.get(canonical)
+                if original_value and canonical_value and original_value != canonical_value:
+                    raise MetadataError(
+                        f"RunInfo columns {original!r} and {canonical!r} disagree "
+                        f"for run {row['Run']}"
+                    )
+                if original_value and not canonical_value:
+                    row[canonical] = original_value
+            records.append(row)
+        return records
 
     def fetch_runinfo(
         self, query: str, *, page_size: int = 5000, refresh: bool = False

@@ -123,6 +123,16 @@ def test_accessions_are_resolved_to_numeric_uids_before_efetch():
     ]
 
 
+def test_runinfo_normalizes_ncbi_sample_and_study_columns():
+    payload = (
+        b"Run,Experiment,Sample,SRAStudy,BioSample\n"
+        b"SRR1,SRX1,SRS1,SRP1,SAMN1\n"
+    )
+    records = SraClient._parse_runinfo(payload)
+    assert records[0]["SRA Sample"] == "SRS1"
+    assert records[0]["SRA Study"] == "SRP1"
+
+
 def test_entrez_raw_cache_is_read_through_and_refreshable(tmp_path):
     http = RecordingHttp()
     client = EntrezClient(email="test@example.org", cache_dir=tmp_path, http=http)
@@ -222,13 +232,8 @@ def test_experiment_description_and_persistence(tmp_path):
         "SRR9032675",
     ]
 
-    bundle.save(tmp_path, description_profile="full")
-    saved = json.loads(
-        (tmp_path / "experiment_descriptions" / "SRX5809925.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    assert saved["submission"]["accession"] == "SRA884593"
+    bundle.save(tmp_path)
+    assert not (tmp_path / "experiment_descriptions").exists()
     assert (tmp_path / "packages.ndjson").stat().st_size > 0
     assert (tmp_path / "experiments.ndjson").stat().st_size > 0
     assert (tmp_path / "biosamples.ndjson").stat().st_size > 0

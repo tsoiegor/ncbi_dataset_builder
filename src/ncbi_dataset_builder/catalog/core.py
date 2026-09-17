@@ -215,7 +215,7 @@ class RunCatalog:
             "experiments": ("Experiment",),
             "sra_samples": ("SRA Sample", "Sample"),
             "biosamples": ("BioSample",),
-            "studies": ("SRA Study", "BioProject"),
+            "studies": ("SRA Study", "SRAStudy", "BioProject"),
         }.items():
             columns = [column for column in candidates if column in self._frame.columns]
             if columns:
@@ -246,6 +246,8 @@ class RunCatalog:
 
         LOGGER.info("Create processing units grouped by %s", by)
         group_column = self.GROUP_COLUMNS[by]
+        if by == "sra_sample" and group_column not in self._frame.columns:
+            group_column = "Sample"
         if group_column not in self._frame.columns:
             raise ValueError(f"Cannot group by {by!r}: column {group_column!r} is missing")
         ordered: dict[str, list[dict[str, Any]]] = {}
@@ -292,7 +294,10 @@ class RunCatalog:
                     unit_id=key,
                     run_accessions=self._unique(rows, "Run"),
                     experiment_accessions=self._unique(rows, "Experiment"),
-                    sra_sample_accessions=self._unique(rows, "SRA Sample"),
+                    sra_sample_accessions=self._unique(
+                        rows,
+                        "SRA Sample" if "SRA Sample" in self._frame.columns else "Sample",
+                    ),
                     biosample_accessions=self._unique(rows, "BioSample"),
                     scientific_name=self._first_non_null(
                         rows, ("ScientificName", "scientific_name")

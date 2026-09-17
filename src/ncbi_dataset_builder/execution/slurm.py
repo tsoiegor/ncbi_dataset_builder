@@ -10,6 +10,7 @@ from pathlib import Path
 from ..support.commands import CommandRunner
 from ..support.progress import ProgressReporter, get_progress
 from ..support.util import atomic_write_text
+from ..workspace import WorkspaceStore
 from .config import SlurmDistributedExecution, SlurmSingleNodeExecution
 
 
@@ -71,7 +72,9 @@ class SlurmExecutor:
             retry_failed: Retry failed sample state.
         """
 
-        logs = builder_config.workspace / "logs" / "slurm"
+        logs = WorkspaceStore(
+            builder_config.workspace, output_dir=builder_config.output_dir
+        ).path("logs") / "slurm"
         command = [
             self.python_executable,
             "-m",
@@ -131,7 +134,9 @@ class SlurmExecutor:
             retry_failed: Retry failed sample state.
         """
 
-        logs = builder_config.workspace / "logs" / "slurm"
+        logs = WorkspaceStore(
+            builder_config.workspace, output_dir=builder_config.output_dir
+        ).path("logs") / "slurm"
         command = [
             self.python_executable,
             "-m",
@@ -216,7 +221,7 @@ class SlurmExecutor:
             command.extend(("--email", email))
         if retry_failed:
             command.append("--retry-failed")
-        log = workspace / "logs" / "slurm" / f"sample-{item_index}.%j.log"
+        log = WorkspaceStore(workspace).path("logs") / "slurm" / f"sample-{item_index}.%j.log"
         lines = [
             "#!/usr/bin/env bash",
             f"#SBATCH --job-name=ncbi-{item_index}",

@@ -8,7 +8,7 @@ complete.
 
 The package includes a full [ATAC-seq processor](atac/README.md). Other assays
 can implement the same callable shape without changing catalog, acquisition,
-execution, state, or publication code.
+execution, state, or dataset-layout code.
 
 ## Module map
 
@@ -35,24 +35,29 @@ __call__(
 | --- | --- |
 | `fastq` | Validated single, paired, or mixed local FASTQ inputs and provenance. |
 | `genome` | Checksum-validated local reference selected for the unit’s taxonomy ID. |
-| `context` | Unit identity, execution-owned paths, log, execution ID, and CPUs assigned at launch. |
+| `context` | Unit identity, processor-owned output path, log, execution ID, and CPUs assigned at launch. |
 | Return | A `ProcessingResult` whose declared output files exist and are non-empty. |
 
 Runtime inheritance from `Processor` is unnecessary. Functions, callable
 instances, and importable callable objects all work.
+
+A processor can opt into a pre-materialized experiment description by exposing
+`description_profile = "training"`. The builder then writes the matching
+description directly into the unit output directory before the call. This hook
+requires normalized metadata and one Experiment per processing unit. The
+built-in ATAC processor uses it so `bam2bw.py` can append coverage statistics.
 
 ## Processor rules
 
 1. Call `fastq.validate()` and `genome.validate()` before expensive work.
 2. Read inputs from `fastq.read1`, `read2`, and `single` according to
    `fastq.layout`.
-3. Put recoverable intermediates below `context.work_dir`.
-4. Put final artifacts below `context.output_dir`.
-5. Use `context.threads` as the processor’s CPU budget.
-6. Publish files atomically when possible; a partial file must not look final.
-7. Return success only after validating the artifacts.
-8. Declare every artifact required for reuse in `ProcessingResult.outputs`.
-9. Store compact QC in `metrics` and executable versions in
+3. Put every created file below `context.output_dir`; organize it freely.
+4. Use `context.threads` as the processor’s CPU budget.
+5. Finalize files atomically when possible; a partial file must not look final.
+6. Return success only after validating the artifacts.
+7. Declare every durable artifact in `ProcessingResult.outputs`.
+8. Store compact QC in `metrics` and executable versions in
    `tool_versions`.
 
 The builder calls `ProcessingResult.validate()`, computes SHA-256 values and
@@ -139,7 +144,7 @@ script.
 | `AtacIntermediateFiles` | Retention policy for each processor-created file category. |
 | `AtacSeqConfig` | Executables, alignment/coverage choices, strict mixed-layout thresholds, and retention. |
 | `AtacSeqProcessor` | Configurable callable implementation. |
-| `default_atac_processor` | Module-level default instance, exported from `ncbi_dataset_builder.processing` and `.processing.atac`. |
+| `default_atac_processor` | Alias of the lazy `process_atac` wrapper, exported from `ncbi_dataset_builder.processing` and `.processing.atac`. |
 | `process_atac` | Importable function delegating to the default instance; also exported at package top level. |
 
 See the [ATAC API](atac/README.md) before changing retention or mixed-layout
@@ -171,8 +176,8 @@ There are two independent cleanup layers:
 
 | Layer | Configured by | Can remove |
 | --- | --- | --- |
-| Queue input cleanup | `QueuePolicy` | Provider-declared roots below `workspace/fastq/` |
-| Processor intermediate cleanup | Processor-specific config | Files below its work/output/cache paths that it explicitly owns |
+| Queue input cleanup | `QueuePolicy` | Provider-declared roots below `workspace/runtime/fastq/` |
+| Processor intermediate cleanup | Processor-specific config | Files below its unit `output_dir` |
 
 A processor must never treat arbitrary input paths as owned cleanup roots.
 

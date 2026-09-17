@@ -6,14 +6,14 @@ trail of transformations.
 
 Execution deduplicates the catalog and converts its rows into processing units.
 Inspect this boundary carefully: grouping determines which runs are downloaded,
-merged, processed, retried, and published together.
+merged, processed, retried, and indexed together.
 
 ## Choose a catalog source
 
 | Source | Method | Needs NCBI email? | Cache behavior |
 | --- | --- | --- | --- |
 | Existing RunInfo CSV | `builder.load_runs(path)` | No | Reads the supplied file |
-| NCBI SRA query | `builder.fetch_runs(query, refresh=False)` | Yes | Caches CSV by query hash in `workspace/catalogs/` |
+| NCBI SRA query | `builder.fetch_runs(query, refresh=False)` | Yes | Caches CSV by query hash in `workspace/runtime/catalogs/` |
 | GEO GSE/GSM accessions | `builder.fetch_geo_runs(accessions)` | Yes | Resolves linked SRA records through Entrez |
 | Python records | `RunCatalog.from_records(records)` | No | In-memory construction |
 
@@ -23,14 +23,14 @@ merged, processed, retried, and published together.
 | --- | --- | --- |
 | Run identity | `Run` | Always required |
 | Experiment grouping | `Experiment` | Required for `group_by="experiment"` |
-| SRA Sample grouping | `SRA Sample` | Required for `group_by="sra_sample"` |
+| SRA Sample grouping | `SRA Sample` or NCBI RunInfo `Sample` | Required for `group_by="sra_sample"` |
 | BioSample grouping | `BioSample` | Required for `group_by="biosample"` |
 | Taxonomy | `TaxID`, `species_taxid`, or `taxid` | Required before genome resolution |
 | Species name | `ScientificName` or `scientific_name` | Strongly recommended |
 | Raw-size estimate | `size_MB` | Recommended for storage admission |
 | Base estimate | `bases` | Optional provenance/sizing |
 | Unit metadata | `LibraryStrategy`, `LibraryLayout`, `Platform` | Optional but useful |
-| Study views | `SRA Study`, `BioProject` | Optional |
+| Study views | `SRA Study`, NCBI RunInfo `SRAStudy`, or `BioProject` | Optional |
 
 Missing `size_MB` becomes zero in unit estimates. That can make storage
 admission optimistic, so inspect size coverage before a large run.

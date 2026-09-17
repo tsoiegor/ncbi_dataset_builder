@@ -20,7 +20,7 @@ and acts as an index to the focused subpackage references.
 | [`metadata/`](metadata/README.md) | Entrez/SRA/BioSample retrieval and normalized records | Clients, bundles, descriptions, and HTTP support |
 | [`processing/`](processing/README.md) | Assay-processor contract | `Processor` and `load_processor` |
 | [`processing/atac/`](processing/atac/README.md) | Built-in ATAC-seq implementation | Every config and retention field |
-| [`workspace/`](workspace/README.md) | Durable directories and compact dataset publication | Workspace and publisher classes |
+| [`workspace/`](workspace/README.md) | Visible runtime directories and public manifest | Workspace classes |
 | [`support/`](support/README.md) | Commands, progress, unit logging, and safe file helpers | Advanced support API |
 | [`cli/`](cli/README.md) | Argument parsing and command mapping | Command-to-Python reference |
 | `__init__.py` | Curated top-level import surface | [Public imports](#public-imports) |
@@ -36,11 +36,10 @@ and acts as an index to the focused subpackage references.
    `FastqSet`.
 5. `GenomeManager` returns `GenomeRef`.
 6. A [processor](processing/README.md) receives `FastqSet`, `GenomeRef`, and
-   a CPU count, then returns `ProcessingResult`.
+   `ProcessingContext`, then owns its complete unit output directory.
 7. The builder validates and checksums outputs, writes unit state, and returns
    `UnitOutcome` values inside `BuildReport`.
-8. [`DatasetPublisher`](workspace/README.md) can build a compact model-ready
-   dataset from successful experiment units.
+8. The public manifest indexes declared artifacts for downstream reshaping.
 
 ## Public imports
 
@@ -55,7 +54,7 @@ All names below are exported from `ncbi_dataset_builder`.
 | Metadata | `EntrezClient`, `SraClient`, `BioSampleClient`, `MetadataBundle`, `DescriptionPolicy`, `training_fields_by_experiment` |
 | Processing | `Processor`, `AtacIntermediateFiles`, `AtacSeqConfig`, `AtacSeqProcessor`, `process_atac` |
 | Shared models | `FastqLayout`, `ProcessingUnit`, `StagedFastq`, `FastqSet`, `GenomeRef`, `ProcessingResult` |
-| Workspace | `WorkspaceConfig`, `WorkspaceStore`, `PublishMode`, `DatasetExport`, `DatasetPublisher` |
+| Workspace | `WorkspaceConfig`, `WorkspaceStore` |
 | Progress | `ProgressTask`, `ProgressReporter` |
 
 `GenomeCandidate`, `FastqProvider`, `load_processor`, HTTP support types,
@@ -71,11 +70,11 @@ Stable workspace and NCBI configuration:
 ```python
 BuilderConfig(
     workspace,
+    output_dir=None,
     email=None,
     ncbi_api_key=None,
     genome_policy=GenomeSelectionPolicy(),
     group_by="experiment",
-    description_profile="training",
     prefetch_max_size="u",
     show_progress=True,
     progress_bars=True,
@@ -84,12 +83,12 @@ BuilderConfig(
 
 | Argument | Meaning |
 | --- | --- |
-| `workspace: Path` | Root for caches, inputs, work, outputs, state, executions, and logs. It is normalized to `Path`. |
+| `workspace: Path` | Root containing the public manifest plus visible `runtime/` and default `output/` directories. |
+| `output_dir: Path | None` | Processor-owned output root; defaults to `workspace/output/`. |
 | `email: str | None` | NCBI contact email. Direct Entrez methods require a non-empty value; loading an existing CSV does not. |
 | `ncbi_api_key: str | None` | Optional NCBI API key passed to Entrez for the higher request rate. |
 | `genome_policy: GenomeSelectionPolicy` | Deterministic assembly filtering and ranking used by `GenomeManager`. |
 | `group_by` | Default processing-unit level: `"run"`, `"experiment"`, `"sra_sample"`, or `"biosample"`. |
-| `description_profile` | `"training"` for compact descriptions or `"full"` for the full normalized projection. |
 | `prefetch_max_size: str` | Value sent to SRA Toolkit `prefetch --max-size`, such as `"100G"` or unlimited `"u"`. |
 | `show_progress: bool` | Enable direct progress display. Logging records remain separate. |
 | `progress_bars: bool` | Use optional tqdm bars when installed; otherwise use throttled text. |
@@ -97,10 +96,9 @@ BuilderConfig(
 CPU, memory, concurrency, and storage do not belong here. They are specific to
 the selected [execution system](execution/README.md).
 
-Constructing `DatasetBuilder` creates the workspace directories and persists
-or validates stable workspace semantics. Changing `group_by`,
-`description_profile`, or `genome_policy` after unit state exists is
-rejected.
+Constructing `DatasetBuilder` creates only the state path needed immediately;
+other runtime directories are lazy. Changing `group_by`, `output_dir`, or
+`genome_policy` after unit state exists is rejected.
 
 ## `DatasetBuilder`
 
@@ -118,7 +116,7 @@ DatasetBuilder(
 | --- | --- |
 | `config: BuilderConfig` | Stable workspace and NCBI configuration. |
 | `fastq_provider: FastqProvider | None` | Custom provider; defaults to `SraToolkitProvider`. A staged provider enables download/materialization overlap. |
-| `genome_manager: GenomeManager | None` | Custom manager; defaults to one rooted at `workspace/work/genome_cache/`. |
+| `genome_manager: GenomeManager | None` | Custom manager; defaults to one rooted at `workspace/runtime/genomes/`. |
 | `progress: ProgressReporter | None` | Custom progress sink; defaults are built from `BuilderConfig`. |
 
 Construction also exposes `workspace`, `state`, `entrez`, `sra`,
@@ -130,7 +128,7 @@ methods below rather than coordinating those services directly.
 #### `fetch_runs(query, *, refresh=False) -> RunCatalog`
 
 Fetch a complete SRA RunInfo catalog and cache it below
-`workspace/catalogs/`.
+`workspace/runtime/catalogs/`.
 
 | Argument | Meaning |
 | --- | --- |
@@ -157,25 +155,21 @@ catalog.
 ```python
 bundle = builder.fetch_metadata(
     ["SRX123456", "SRR234567"],
-    destination=Path("/data/ncbi-workspace/metadata"),
+    destination=Path("/data/ncbi-workspace/runtime/metadata"),
     include_raw=False,
     refresh=False,
-    description_profile="training",
-    description_policy=None,
 )
 ```
 
 | Argument | Meaning |
 | --- | --- |
 | `accessions: list[str]` | SRA study, experiment, sample, or run accessions to resolve. |
-| `destination: Path | None` | Save directory; defaults to `workspace/metadata/`. |
+| `destination: Path | None` | Save directory; defaults to `workspace/runtime/metadata/`. |
 | `include_raw: bool` | Retain parsed complete SRA/BioSample XML trees in addition to normalized records. |
 | `refresh: bool` | Bypass reusable NCBI response caches. |
-| `description_profile: str | None` | `"training"`, `"full"`, or `None` to use `BuilderConfig`. |
-| `description_policy: DescriptionPolicy | None` | Optional attribute-selection and exact alias policy for compact descriptions. |
 
-The method saves normalized metadata and sample-description files, then returns
-the in-memory bundle.
+The method saves normalized metadata only, then returns the in-memory bundle.
+Description projection is an explicit operation on `MetadataBundle`.
 
 #### `enrich_metadata(catalog, *, ...) -> MetadataBundle`
 
@@ -245,19 +239,18 @@ submit_slurm(
 | `genome_pins` | Exact assembly mapping by taxonomy ID. |
 | `query` | Optional source-query provenance. |
 | `retry_failed` | Forwarded to the coordinator/workers. |
-| `script_path: Path | None` | Coordinator script destination; defaults below `workspace/slurm/`. |
+| `script_path: Path | None` | Coordinator script destination; defaults below `workspace/runtime/slurm/`. |
 | `submit: bool` | Call `sbatch` when true. False writes a dry-run script and returns no job ID. |
 
 The returned tuple contains the coordinator script and scheduler job ID.
 See [Choosing an execution system](../../docs/ExecutionSystems.md) for path
 visibility and resource differences.
 
-### Status and publication
+### Status
 
 | Method | Arguments and result |
 | --- | --- |
 | `status(execution_id=None)` | Return execution metadata, status counts, every experiment, genome inventory, metadata-cache count, and raw unit state. |
-| `publish_dataset(destination=None, *, execution_id=None, mode="auto", overwrite=False)` | Publish verified experiment BigWigs, descriptions, and genomes; return `DatasetExport`. See the [workspace API](workspace/README.md). |
 
 ## `UnitOutcome`
 
@@ -364,7 +357,7 @@ StagedFastq(
 | `unit_id` | Processing-unit identity. |
 | `source` | Provider label such as `"sra"` or `"geo"`. |
 | `size_gb` | Measured staged size in decimal GB. |
-| `cleanup_roots` | Exact provider-owned roots eligible for queue cleanup. The builder additionally requires them below `workspace/fastq/`. |
+| `cleanup_roots` | Exact provider-owned roots eligible for queue cleanup. The builder additionally requires them below `workspace/runtime/fastq/`. |
 | `ready_fastq` | Optional already materialized `FastqSet`, used by GEO and cache hits. |
 | `metadata` | Provider-specific staging provenance. |
 
@@ -405,8 +398,8 @@ Processors should call `validate()` before expensive work.
 
 ## `ProcessingContext`
 
-`ProcessingContext(unit_id, threads, work_dir, output_dir, log_path, execution_id)`
-contains pipeline-owned identity, resources, and paths for one processor call.
+`ProcessingContext(unit_id, threads, output_dir, log_path, execution_id)`
+contains identity, resources, and one processor-owned path for a call.
 This keeps execution state out of `FastqSet` and `GenomeRef`.
 
 ## `GenomeRef`

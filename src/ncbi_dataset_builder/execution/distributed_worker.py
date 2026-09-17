@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..api import BuilderConfig, DatasetBuilder
+from ..api import DatasetBuilder
 from ..workspace import WorkspaceStore
 from .config import (
     SlurmDistributedExecution,
@@ -29,6 +29,7 @@ class _RunningSample:
     slurm_job_id: str
     cpus: int
     submitted_epoch: float
+    claim_id: str
     missing_since: float | None = None
 
 
@@ -79,13 +80,11 @@ def main(argv: list[str] | None = None) -> int:
     if not isinstance(execution, SlurmDistributedExecution):
         raise TypeError("Execution record is not configured for distributed Slurm")
     queue = queue_policy_from_dict(record.queue_config)
-    builder = DatasetBuilder(
-        BuilderConfig(
-            workspace=arguments.workspace,
-            email=arguments.email,
-            ncbi_api_key=os.environ.get("NCBI_API_KEY"),
-            group_by=record.group_by,
-        )
+    builder = DatasetBuilder.from_execution_record(
+        workspace=arguments.workspace,
+        record=record,
+        email=arguments.email,
+        ncbi_api_key=os.environ.get("NCBI_API_KEY"),
     )
     executor = SlurmExecutor(progress=builder.progress)
     record_path = workspace.executions / f"{record.execution_id}.json"
@@ -103,7 +102,8 @@ def main(argv: list[str] | None = None) -> int:
             and state.get("fingerprint") == item.fingerprint
             and state.get("status") == "failed"
         )
-        if not reusable and (arguments.retry_failed or not failed):
+        active = bool(state and state.get("status") in {"running", "submitted"})
+        if not reusable and not active and (arguments.retry_failed or not failed):
             pending.append(index)
 
     running: dict[int, _RunningSample] = {}
@@ -124,10 +124,16 @@ def main(argv: list[str] | None = None) -> int:
                 if active.missing_since is None:
                     active.missing_since = now
                 elif now - active.missing_since > 30:
-                    builder.state.fail(
-                        item.item_id,
-                        f"Slurm job {active.slurm_job_id} ended without terminal sample state",
-                    )
+                    current_claim = saved.get("claim_id")
+                    if (
+                        saved.get("execution_id") == record.execution_id
+                        and isinstance(current_claim, str)
+                    ):
+                        builder.state.fail(
+                            item.item_id,
+                            f"Slurm job {active.slurm_job_id} ended without terminal sample state",
+                            claim_id=current_claim,
+                        )
                     running.pop(index)
 
         made_progress = False
@@ -169,8 +175,7 @@ def main(argv: list[str] | None = None) -> int:
                 workspace=arguments.workspace,
                 email=arguments.email,
                 output_path=(
-                    arguments.workspace
-                    / "slurm"
+                    workspace.path("slurm")
                     / record.execution_id
                     / f"{item.item_id}.sbatch"
                 ),
@@ -181,7 +186,7 @@ def main(argv: list[str] | None = None) -> int:
             slurm_job_id: str | None = None
             try:
                 slurm_job_id = executor.submit(script, hold=True)
-                builder.state.record_submission(
+                claim_id = builder.state.record_submission(
                     item.item_id,
                     slurm_job_id=slurm_job_id,
                     cpus=cpus,
@@ -197,7 +202,13 @@ def main(argv: list[str] | None = None) -> int:
                     executor.cancel(slurm_job_id)
                 raise
             assert slurm_job_id is not None
-            running[index] = _RunningSample(index, slurm_job_id, cpus, time.time())
+            running[index] = _RunningSample(
+                index,
+                slurm_job_id,
+                cpus,
+                time.time(),
+                claim_id,
+            )
             active_cpus += cpus
             active_gb += max(0.0, item.unit.total_size_gb) * queue.processing_storage_multiplier
             made_progress = True

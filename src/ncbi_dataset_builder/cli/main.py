@@ -22,6 +22,11 @@ def _add_builder_arguments(parser: argparse.ArgumentParser) -> None:
     """Add stable workspace and NCBI arguments to *parser*."""
 
     parser.add_argument("--workspace", type=Path, required=True)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Processor-owned output root (default: WORKSPACE/output)",
+    )
     parser.add_argument("--email", default=os.environ.get("NCBI_EMAIL"))
     parser.add_argument("--ncbi-api-key", default=os.environ.get("NCBI_API_KEY"))
     parser.add_argument(
@@ -126,12 +131,6 @@ def _parser() -> argparse.ArgumentParser:
     status.add_argument("--execution-id")
     status.add_argument("--json", action="store_true", help="Print the structured status as JSON")
 
-    publish = commands.add_parser("publish", help="Publish verified experiment outputs")
-    _add_builder_arguments(publish)
-    publish.add_argument("--destination", type=Path)
-    publish.add_argument("--execution-id")
-    publish.add_argument("--mode", choices=("auto", "hardlink", "copy"), default="auto")
-    publish.add_argument("--overwrite", action="store_true")
     return parser
 
 
@@ -141,6 +140,7 @@ def _builder(arguments: argparse.Namespace) -> DatasetBuilder:
     return DatasetBuilder(
         BuilderConfig(
             workspace=arguments.workspace,
+            output_dir=arguments.output_dir,
             email=arguments.email,
             ncbi_api_key=arguments.ncbi_api_key,
             group_by=arguments.group_by,
@@ -202,15 +202,18 @@ def _print_status(report: dict) -> None:
     execution = report["execution"]
     counts = report["counts"]
     total = int(execution["total_experiments"])
+    grouped_by_experiment = execution["group_by"] == "experiment"
+    entity_label = "Experiments" if grouped_by_experiment else "Units"
     finished = int(counts.get("succeeded", 0)) + int(counts.get("failed", 0))
     percent = 100.0 if total == 0 else 100.0 * finished / total
     print("NCBI dataset workspace status")
     print(f"Execution : {report['execution_id']}")
     print(f"Created   : {execution['created_at']}")
     print(f"Mode      : {execution['type']} / grouped by {execution['group_by']}")
+    print(f"Scope     : {report.get('scope', 'execution')}")
     print(f"Progress  : {finished}/{total} finished ({percent:.1f}%)")
     print(
-        "Experiments: "
+        f"{entity_label}: "
         + ", ".join(
             f"{name}={counts.get(name, 0)}"
             for name in ("succeeded", "running", "submitted", "pending", "failed")
@@ -239,11 +242,20 @@ def _print_status(report: dict) -> None:
                 str(experiment["attempts"]),
             ]
         )
-    print("\nAll experiments")
+    print(f"\nAll {entity_label.lower()}")
     print(
         _status_table(
             rows,
-            ["EXPERIMENT", "STATUS", "PHASE", "SPECIES", "RUNS", "GENOME", "OUTPUTS", "TRIES"],
+            [
+                "EXPERIMENT" if grouped_by_experiment else "UNIT",
+                "STATUS",
+                "PHASE",
+                "SPECIES",
+                "RUNS",
+                "GENOME",
+                "OUTPUTS",
+                "TRIES",
+            ],
         )
     )
 
@@ -332,11 +344,4 @@ def main(argv: list[str] | None = None) -> int:
         else:
             _print_status(report)
         return 0
-    export = builder.publish_dataset(
-        arguments.destination,
-        execution_id=arguments.execution_id,
-        mode=arguments.mode,
-        overwrite=arguments.overwrite,
-    )
-    print(export.manifest)
-    return 0
+    raise ValueError(f"Unsupported command: {arguments.command}")

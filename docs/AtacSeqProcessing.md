@@ -1,8 +1,8 @@
 # Built-in ATAC-seq processing
 
 `AtacSeqProcessor` turns a validated single, paired, or mixed `FastqSet` and a
-validated genome into BigWig coverage plus configurable retained reports and
-alignment files.
+validated genome into forward/reverse BigWigs plus configurable retained reports,
+alignment files, and a coverage-annotated experiment description.
 
 Use the default callable when the built-in scientific choices are suitable:
 
@@ -34,7 +34,8 @@ an importable configured processor object.
 | Align single | Same pipeline | Clean single reads when retained | `single.sorted.bam` |
 | Final BAM | copy or `samtools merge` | Component BAM(s) | `<unit>.bam` |
 | Index | `samtools index -c` | Final BAM | `<unit>.bam.csi` |
-| Coverage | `bamCoverage` | Final BAM | One or more `.bw` |
+| Materialize description | Builder metadata projection | Normalized metadata | `<unit>.json` in the unit output directory |
+| Coverage | ExpressionPredict `bam2bw.py` → `bamCoverage` | Final BAM, CSI, description, chromosome sizes | `<unit>.forward.bw`, `<unit>.reverse.bw`, updated description |
 | Validate/retain | Python | All produced files/reports | `ProcessingResult`, metrics, selected retained files |
 
 ## Input layouts
@@ -52,6 +53,9 @@ concatenated. Mixed compression is read and recompressed.
 ## Default configuration
 
 ```python
+import sys
+from pathlib import Path
+
 from ncbi_dataset_builder.processing.atac import (
     AtacIntermediateFiles,
     AtacSeqConfig,
@@ -64,11 +68,10 @@ processor = AtacSeqProcessor(
         bowtie2_build="bowtie2-build",
         samtools="samtools",
         fastp="fastp",
-        bam_coverage="bamCoverage",
+        bam2bw_script=Path("/shared/ExpressionPredict/src/bam2bw.py"),
+        python_executable=sys.executable,
         maximum_insert_size=2_000,
-        bin_size=1,
-        normalize_using=None,
-        coverage_strands=(),
+        min_coverage=1_000_000,
         fastp_deduplicate=True,
         fastp_max_threads=16,
         strict_mixed_layout=True,
@@ -76,7 +79,6 @@ processor = AtacSeqProcessor(
         mixed_max_short_read_length=30,
         mixed_min_length_ratio=0.5,
         mixed_min_retained_fraction=0.1,
-        coverage_ignore_duplicates=True,
         intermediates=AtacIntermediateFiles(),
     )
 )
@@ -90,30 +92,28 @@ processor = AtacSeqProcessor(
 | `bowtie2_build` | `"bowtie2-build"` | Index creation | Matching Bowtie2 installation | Must be available even if an index cache may exist |
 | `samtools` | `"samtools"` | BAM conversion, sorting, merge, CSI | Compatible command on `PATH` | Must support `index -c` |
 | `fastp` | `"fastp"` | Read cleaning and QC reports | Command name/path | Must write valid JSON/HTML and non-empty cleaned reads |
-| `bam_coverage` | `"bamCoverage"` | BigWig creation | deepTools command name/path | Must support configured options |
+| `bam2bw_script` | Required argument, or `$BAM2BW_SCRIPT` when omitted | Strand splitting, BigWig generation, coverage annotation | Set an absolute path in code or the environment for Slurm | There is no filesystem default; the script and sibling `utils.py`/`bam_utils.py` must be readable |
+| `python_executable` | Current interpreter | Runs `bam2bw.py` | Use the environment containing the script dependencies | Must resolve as an executable |
 
-`preflight()` requires all five commands. It records reported versions for
-fastp, Bowtie2, samtools, and bamCoverage.
+`preflight()` requires fastp, Bowtie2, samtools, Python, and `bamCoverage`, then
+runs `bam2bw.py --help` to validate imports. It records tool versions and the
+script SHA-256.
 
 ## Processing parameters
 
 | Parameter | Default | Exact effect | How to choose | Validation/restriction |
 | --- | --- | --- | --- | --- |
 | `maximum_insert_size: int` | `2000` | Adds Bowtie2 `-X` for paired alignment | Choose for expected ATAC fragment distribution; keep default unless protocol requires otherwise | Positive |
-| `bin_size: int` | `1` | `bamCoverage --binSize` | `1` for base-resolution; larger bins reduce output/detail | Positive |
-| `normalize_using: str \| None` | `None` | Adds `bamCoverage --normalizeUsing VALUE` | Choose an accepted deepTools method when normalized tracks are required | Package does not validate method; command will |
-| `coverage_strands: tuple[str, ...]` | `()` | Empty creates one unstranded track; values create one track per listed strand | ATAC is normally unstranded, so keep empty | Only `forward` and/or `reverse` |
+| `min_coverage: int` | `1_000_000` | Passed to `bam2bw.py --min-coverage` for each strand | Lower only for deliberately small/test libraries | Non-negative |
 | `fastp_deduplicate: bool` | `True` | Adds `--dedup --dup_calc_accuracy 5` | Default removes duplicates at cleaning; align with study policy | Separate from coverage duplicate filtering |
 | `fastp_max_threads: int` | `16` | Caps `fastp --thread` at `min(assigned threads, cap)` | Keep 16 unless your fastp deployment justifies another cap | Positive |
-| `coverage_ignore_duplicates: bool` | `True` | Adds `bamCoverage --ignoreDuplicates` | Keep for duplicate-excluded coverage; disable deliberately if duplicates should count | Independent of fastp deduplication |
 | `intermediates` | Default retention object | Controls processor-created file deletion/declaration | Choose from retention table | CSI retention requires final BAM retention |
 
-### Coverage/publication restriction
+### Coverage roles
 
-`coverage_strands=("forward", "reverse")` creates two named coverage outputs.
-Compact `publish_dataset()` requires the single `coverage` role and rejects
-strand-specific coverage roles. Keep `coverage_strands=()` for one unstranded
-publication track, or manage multi-track outputs outside that publisher.
+ATAC is declared unstranded in the one-row file mapping. `bam2bw.py` always
+splits reads into forward and reverse signal, and the manifest records them as
+`coverage_forward` and `coverage_reverse`.
 
 ## Commands and fixed options
 
@@ -126,7 +126,10 @@ publication track, or manage multi-track outputs outside that publisher.
 | samtools sort | `sort -@ <assigned>` |
 | samtools merge | `merge -f -@ <assigned>` when both branches exist |
 | samtools index | `index -c -@ <assigned>` |
-| bamCoverage | BigWig format, `--binSize`, `--numberOfProcessors`, `--skipNAs`; optional strand, duplicate ignore, normalization; 24-hour timeout |
+| `bam2bw.py` | One ATAC mapping row; both CPU flags use assigned threads; minimum coverage is configured; statistics are always recomputed; 24-hour timeout |
+
+The external script invokes `bamCoverage` with bin size 1, `--filterRNAstrand`
+for each direction, `--skipNAs`, and `--ignoreDuplicates`.
 
 Bowtie2 and samtools sort run concurrently in one pipe and both receive the
 full assigned thread value. On systems where both fully occupy those threads,
@@ -204,13 +207,13 @@ retention = AtacIntermediateFiles(
 
 | Parameter | Default | File category | Typical path | Declared output? |
 | --- | --- | --- | --- | --- |
-| `keep_staged_fastq` | `False` | Processor-created merged/recompressed input | `work/units/<id>/processing/atac/input.*.fastq[.gz]` | No |
+| `keep_staged_fastq` | `False` | Processor-created merged/recompressed input | `output/<id>/work/atac/input.*.fastq[.gz]` | No |
 | `keep_cleaned_fastq` | `False` | fastp cleaned reads | `*.clean.fastq.gz` | No |
 | `keep_fastp_json` | `True` | Machine-readable fastp reports | `*.fastp.json` | Yes when kept |
 | `keep_fastp_html` | `True` | Human fastp reports | `*.fastp.html` | Yes when kept |
 | `keep_component_bams` | `False` | Paired/single sorted BAMs | `paired.sorted.bam`, `single.sorted.bam` | No |
-| `keep_final_bam` | `True` | Final copied/merged BAM | `outputs/<id>/<id>.bam` | Yes when kept |
-| `keep_final_bam_index` | `True` | Final CSI | `outputs/<id>/<id>.bam.csi` | Yes when kept |
+| `keep_final_bam` | `True` | Final copied/merged BAM | `output/<id>/<id>.bam` | Yes when kept |
+| `keep_final_bam_index` | `True` | Final CSI | `output/<id>/<id>.bam.csi` | Yes when kept |
 | `keep_uncompressed_genome` | `True` | FASTA used for index build | Genome cache index directory | No |
 | `keep_bowtie2_index` | `True` | Six index files | Genome cache `indexes/<accession>/` | No |
 
@@ -230,14 +233,17 @@ BigWigs are always retained and declared.
 | --- | --- |
 | Final BAM | `<safe-unit-id>.bam` |
 | CSI | `<safe-unit-id>.bam.csi` |
-| Unstranded BigWig | `<safe-unit-id>.coverage.bw` |
-| Strand BigWig | `<safe-unit-id>.forward.bw` or `.reverse.bw` |
+| Forward BigWig | `<safe-unit-id>.forward.bw` |
+| Reverse BigWig | `<safe-unit-id>.reverse.bw` |
+| Experiment description | `<safe-unit-id>.json` |
+| Script mapping | `work/atac/file_mappings.csv` |
 | Paired reports | `paired.fastp.json`, `paired.fastp.html` |
 | Single reports | `single.fastp.json`, `single.fastp.html` |
 
 With default retention, `ProcessingResult.outputs` maps stable roles such as
-`alignment_bam`, `alignment_index`, and `coverage` to the corresponding files,
-along with named fastp JSON/HTML report roles.
+`alignment_bam`, `alignment_index`, `coverage_forward`, `coverage_reverse`,
+`description`, and `file_mapping` to the corresponding files, along with named
+fastp JSON/HTML report roles.
 
 ## Metrics
 
@@ -257,12 +263,12 @@ Tool versions are stored separately in `ProcessingResult.tool_versions`.
 | fastp branch | Reused only when cleaned file and both JSON/HTML reports all exist and are non-empty |
 | Bowtie2 index | Reused only when all six standard or all six large index files are non-empty |
 | Final BAM | Reused when non-empty |
-| BigWig | Reused per non-empty expected path |
+| BigWig | `bam2bw.py` may reuse a valid file; the processor still verifies both files and coverage metadata |
 | CSI | Recreated by the indexing command |
 
 Index construction uses an exclusive lock per assembly. Partial files and
 atomic replacements protect staged FASTQ, genome FASTA, BAM, and index
-publication where implemented.
+finalization where implemented.
 
 At the higher builder layer, a valid succeeded unit is reused from state before
 the processor is called.
@@ -272,11 +278,12 @@ the processor is called.
 | Layer | Controls | Boundary |
 | --- | --- | --- |
 | `AtacIntermediateFiles` | Files created by ATAC processor | Unit work/output and genome index files named by processor |
-| `QueuePolicy.cleanup` | Provider-owned staged/downloaded input | Declared roots strictly below `workspace/fastq/` |
+| `QueuePolicy.cleanup` | Provider-owned staged/downloaded input | Declared roots strictly below `workspace/runtime/fastq/` |
 
 With default settings, provider SRA/FASTQ input is removed after verified
 success, processor-created staged/cleaned FASTQ and component BAMs are removed,
-while final BAM/CSI, BigWigs, reports, genome FASTA, and Bowtie2 index remain.
+while final BAM/CSI, both BigWigs, the description, mapping CSV, reports, genome
+FASTA, and Bowtie2 index remain.
 
 ## Non-default Slurm configuration
 
@@ -284,16 +291,17 @@ Create an importable module:
 
 ```python
 # my_project/processors.py
+from pathlib import Path
+
 from ncbi_dataset_builder.processing.atac import (
     AtacIntermediateFiles,
     AtacSeqConfig,
     AtacSeqProcessor,
 )
 
-atac_10bp = AtacSeqProcessor(
+atac_with_retained_intermediates = AtacSeqProcessor(
     AtacSeqConfig(
-        bin_size=10,
-        normalize_using="CPM",
+        bam2bw_script=Path("/shared/ExpressionPredict/src/bam2bw.py"),
         intermediates=AtacIntermediateFiles(
             keep_cleaned_fastq=True,
             keep_component_bams=True,
@@ -305,7 +313,7 @@ atac_10bp = AtacSeqProcessor(
 Submit:
 
 ```python
-processor_reference="my_project.processors:atac_10bp"
+processor_reference="my_project.processors:atac_with_retained_intermediates"
 ```
 
 The module, package checkout, and external tools must be available to every
@@ -329,9 +337,9 @@ Run this in the actual execution environment before a large job.
 | Insert size | Keep 2000 unless assay protocol says otherwise |
 | Bin size | 1 for raw detail; test larger bins if files are too large |
 | Normalization | `None` until downstream requirements are explicit |
-| Strands | Empty for ordinary ATAC and compact publication |
+| Strands | Fixed forward/reverse outputs from an unstranded ATAC mapping |
 | fastp deduplication | Keep enabled if consistent with analysis policy |
-| Duplicate coverage | Keep ignored if consistent with deduplicated signal |
+| Duplicate coverage | `bam2bw.py` fixes `--ignoreDuplicates`; change the external script if policy differs |
 | Mixed defense | Keep enabled |
 | Retention | Defaults; keep cleaned/component files temporarily during validation |
 | Threads | Measure; remember fastp cap and alignment-pipe overlap |
@@ -343,7 +351,9 @@ Run this in the actual execution environment before a large job.
 | Preflight reports missing command | Tool absent from execution `PATH` | Install/activate environment on compute node |
 | Paired input validation fails | R1/R2 count mismatch | Repair provider output before processing |
 | Single branch unexpectedly excluded | Any strict rule or invalid report triggered | Inspect `mixed_layout_defense` reasons and fastp JSON |
-| Compact publication rejects output | More or fewer than one BigWig | Use unstranded single track or custom publication |
+| Downstream script expects one track | Processor now always emits two strand tracks | Read `coverage_forward` and `coverage_reverse` from the manifest and reshape downstream |
+| Description is missing | `enrich_metadata()` was not run or the unit is not one Experiment | Enrich metadata before build and keep experiment grouping |
+| Script exits 0 but unit fails | `bam2bw.py` swallowed a per-record exception | Read the unit log; the processor intentionally verifies both tracks and coverage keys |
 | Index rebuilds repeatedly | Retention disabled or incomplete cache | Keep index files and verify shared filesystem |
 | CPU usage exceeds expectation | Bowtie2 and samtools sort both use assigned threads concurrently | Lower per-job CPUs/concurrency after measurement |
 | Success loses raw input | Queue cleanup, not ATAC retention | Change `QueuePolicy.cleanup` |

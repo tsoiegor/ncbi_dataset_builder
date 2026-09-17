@@ -86,7 +86,7 @@ def _from_manifest(path: Path, *, progress: ProgressReporter | None = None) -> F
 
 
 class AtomicDownloader:
-    """Download HTTP data with resume, validation, retries, and atomic publication."""
+    """Download HTTP data with resume, validation, retries, and atomic finalization."""
 
     def __init__(
         self,
@@ -761,7 +761,7 @@ class SraToolkitProvider:
         unit_root: Path,
         manifest: Path,
     ) -> FastqSet:
-        """Materialize *staged* SRA FASTQ and publish *manifest*.
+        """Materialize *staged* SRA FASTQ and write *manifest*.
 
         *unit* identifies runs, *destination* is the FASTQ root, *threads* sets
         tool concurrency, and *safe_id*/*unit_root* are validated cache paths.
@@ -887,11 +887,15 @@ class GeoFastqProvider:
         """Download complete GEO FASTQ for *unit* at *destination* using *threads*."""
 
         ready = self.fetch(unit, destination, threads=threads)
+        safe_id = sanitize_identifier(unit.unit_id)
+        configured_urls = self.urls.get(unit.unit_id, [])
+        fingerprint = hashlib.sha256("\n".join(configured_urls).encode()).hexdigest()[:16]
+        root = destination / safe_id / fingerprint
         return StagedFastq(
             unit_id=unit.unit_id,
             source="geo",
-            size_gb=paths_size_gb([ready.work_dir]),
-            cleanup_roots=(ready.work_dir,),
+            size_gb=paths_size_gb([root]),
+            cleanup_roots=(root,),
             ready_fastq=ready,
             metadata={"cache_hit_or_downloaded": True},
         )
@@ -920,7 +924,7 @@ class GeoFastqProvider:
         root: Path,
         manifest: Path,
     ) -> FastqSet:
-        """Download and classify uncached GEO files, then publish *manifest*.
+        """Download and classify uncached GEO files, then write *manifest*.
 
         *unit* chooses configured URLs, *destination* defines result placement,
         and *safe_id* and *root* identify the validated cache directory.
