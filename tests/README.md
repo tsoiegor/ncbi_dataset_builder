@@ -12,6 +12,7 @@ real Slurm jobs or download complete public datasets.
 | `test_atac.py` | ATAC commands, outputs, retention, caching, and strict mixed-layout behavior |
 | `test_catalog.py` | Run catalog construction, transformations, deduplication, grouping, and conflicts |
 | `test_descriptions.py` | Compact description policy and experiment/sample projection |
+| `test_distributed_scheduler.py` | Coordinator-side staging and ready-only distributed CPU allocation |
 | `test_execution_config.py` | Validation and serialization for all resource/storage/queue configs |
 | `test_fastq.py` | SRA/GEO staging, conversion, manifests, checksums, retries, and layouts |
 | `test_genomes.py` | Candidate parsing, policy ranking, custom references, caches, and locks |

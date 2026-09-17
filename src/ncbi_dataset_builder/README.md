@@ -287,12 +287,15 @@ BuildReport(outcomes, execution_id)
 ## Internal scheduler carrier
 
 `_PreparedUnit(item, log_path, genome=None, staged=None, outcome=None,
-reset_outputs=False)` is a private frozen dataclass used only while the local
-streaming scheduler moves a queue item from download to processing. Its fields
+reset_outputs=False, claim_id=None)` is a private frozen dataclass used while
+local, single-node, or distributed coordination moves a queue item from
+download to processing. Its fields
 hold the source `QueueItem`, unit log path, optional resolved `GenomeRef`,
 optional `StagedFastq`, optional terminal `UnitOutcome`, and whether stale
-outputs must be reset. It is documented to make the implementation map
-complete, but it is not public compatibility API.
+outputs must be reset, plus the current state claim. Distributed mode persists
+its restartable fields before submitting a processor worker. It is documented
+to make the implementation map complete, but it is not public compatibility
+API.
 
 # Shared data models
 
@@ -361,7 +364,8 @@ StagedFastq(
 | `ready_fastq` | Optional already materialized `FastqSet`, used by GEO and cache hits. |
 | `metadata` | Provider-specific staging provenance. |
 
-`to_dict()` serializes paths and an optional ready FASTQ set.
+`to_dict()` and `from_dict(value)` round-trip paths and an optional ready FASTQ
+set so downloaded-ready input can survive a coordinator restart.
 
 ## `FastqSet`
 

@@ -45,13 +45,31 @@ def main(argv: list[str] | None = None) -> int:
         ncbi_api_key=os.environ.get("NCBI_API_KEY"),
     )
     item = record.items[arguments.item_index]
-    prepared = builder._claim_and_stage(
-        item,
-        execution_id=record.execution_id,
-        retry_failed=arguments.retry_failed,
-        queue=queue,
-        reclaim_running=True,
-    )
+    saved = builder.state.get(item.item_id) or {}
+    if (
+        saved.get("fingerprint") == item.fingerprint
+        and saved.get("execution_id") == record.execution_id
+        and saved.get("phase") == "ready"
+        and isinstance(saved.get("prepared"), dict)
+    ):
+        claim_id = saved.get("claim_id")
+        if not isinstance(claim_id, str):
+            raise ValueError(f"Ready sample has no claim token: {item.item_id}")
+        if saved.get("status") == "submitted":
+            builder.state.activate_ready_submission(item.item_id, claim_id=claim_id)
+            saved = builder.state.get(item.item_id) or {}
+        elif saved.get("status") != "running":
+            raise ValueError(f"Ready sample has invalid state: {item.item_id}")
+        prepared = builder._prepared_from_state(item, saved)
+    else:
+        # Compatibility with executions submitted before coordinator-side staging.
+        prepared = builder._claim_and_stage(
+            item,
+            execution_id=record.execution_id,
+            retry_failed=arguments.retry_failed,
+            queue=queue,
+            reclaim_running=True,
+        )
     outcome = (
         prepared.outcome
         if prepared.outcome is not None

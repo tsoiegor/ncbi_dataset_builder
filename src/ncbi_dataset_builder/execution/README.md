@@ -231,15 +231,20 @@ The coordinator:
 
 1. reconstructs the saved execution record;
 2. excludes reusable successes and non-retried failures;
-3. observes active job IDs through `squeue`;
-4. selects a worker CPU request within quota and per-job limits;
-5. submits the sample script on hold;
-6. persists job ID and resources in unit state;
-7. releases the held job; and
-8. waits for durable sample state to become succeeded or failed.
+3. resolves genomes and stages up to `download_workers` inputs inside the
+   coordinator allocation;
+4. persists restartable prepared input and moves completed stages to a ready
+   queue;
+5. observes active job IDs through `squeue`;
+6. selects a worker CPU request from active plus ready units only;
+7. submits the sample script on hold;
+8. attaches the job ID/resources to the existing ready claim;
+9. releases the held job; and
+10. waits for durable sample state to become succeeded or failed.
 
 The submitted CPU request is fixed for that worker. The coordinator counts
-`total_cpu_quota - coordinator_cpus` as worker capacity.
+`total_cpu_quota - coordinator_cpus` as worker capacity. Pending and staging
+units do not reserve processing CPUs.
 
 # Serialization functions
 
@@ -314,6 +319,9 @@ UnitStateStore(root)
 | `start(unit_id, *, fingerprint, execution_id, item, log_path, retry_failed=False, reclaim_running=False, stale_after_seconds=604800, force=False)` | Atomically claim a unit; return a unique claim token when work should run, otherwise `False`. |
 | `record_submission(unit_id, *, slurm_job_id, cpus, memory_gb, fingerprint, execution_id, item, log_path)` | Persist a held distributed job before release and return its unique claim token. |
 | `set_phase(unit_id, phase, *, claim_id)` | Update the phase only while the caller still owns the claim. |
+| `set_ready(unit_id, prepared, *, claim_id)` | Persist restartable genome/input staging under the current claim. |
+| `record_ready_submission(unit_id, *, slurm_job_id, cpus, memory_gb, claim_id)` | Attach a held worker job to an already-ready claim. |
+| `activate_ready_submission(unit_id, *, claim_id)` | Transition a submitted ready unit when its worker starts. |
 | `set_runtime_resources(unit_id, *, cpus, memory_gb, claim_id)` | Record actual launch resources only for the current claim. |
 | `succeed(unit_id, result, *, claim_id)` | Persist terminal success only for the current claim. |
 | `fail(unit_id, error, *, claim_id)` | Persist terminal failure with a bounded traceback tail only for the current claim. |

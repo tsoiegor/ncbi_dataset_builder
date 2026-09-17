@@ -8,10 +8,11 @@ import shutil
 import subprocess
 import sys
 import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..api import DatasetBuilder
+from ..api import DatasetBuilder, _PreparedUnit
 from ..workspace import WorkspaceStore
 from .config import (
     SlurmDistributedExecution,
@@ -89,137 +90,231 @@ def main(argv: list[str] | None = None) -> int:
     executor = SlurmExecutor(progress=builder.progress)
     record_path = workspace.executions / f"{record.execution_id}.json"
     pending: list[int] = []
+    ready: dict[int, _PreparedUnit] = {}
+    running: dict[int, _RunningSample] = {}
     for index, item in enumerate(record.items):
-        state = builder.state.get(item.item_id)
+        state = builder.state.get(item.item_id) or {}
+        same_work = state.get("fingerprint") == item.fingerprint
         reusable = bool(
-            state
-            and state.get("fingerprint") == item.fingerprint
+            same_work
             and state.get("status") == "succeeded"
             and builder._outputs_valid(state)
         )
         failed = bool(
-            state
-            and state.get("fingerprint") == item.fingerprint
-            and state.get("status") == "failed"
+            same_work and state.get("status") == "failed"
         )
-        active = bool(state and state.get("status") in {"running", "submitted"})
-        if not reusable and not active and (arguments.retry_failed or not failed):
+        if reusable or (failed and not arguments.retry_failed):
+            continue
+        active = state.get("status") in {"running", "submitted"}
+        slurm_job_id = state.get("slurm_job_id")
+        claim_id = state.get("claim_id")
+        coordinator_ready = bool(
+            same_work
+            and state.get("status") == "running"
+            and state.get("phase") == "ready"
+            and isinstance(state.get("prepared"), dict)
+            and not state.get("worker_activated_at")
+        )
+        if coordinator_ready:
+            ready[index] = builder._prepared_from_state(item, state)
+        elif same_work and active and isinstance(slurm_job_id, str) and slurm_job_id:
+            if not isinstance(claim_id, str):
+                raise ValueError(f"Active sample has no claim token: {item.item_id}")
+            running[index] = _RunningSample(
+                index=index,
+                slurm_job_id=slurm_job_id,
+                cpus=int(state.get("allocated_cpus") or execution.min_cpus_per_job),
+                submitted_epoch=float(
+                    state.get("submitted_epoch") or state.get("started_epoch") or time.time()
+                ),
+                claim_id=claim_id,
+            )
+        else:
             pending.append(index)
 
-    running: dict[int, _RunningSample] = {}
     worker_cpu_budget = execution.total_cpu_quota - execution.coordinator_cpus
-    while pending or running:
-        states = _slurm_states({value.slurm_job_id for value in running.values()})
-        if states is not None:
-            now = time.time()
-            for index, active in list(running.items()):
-                if active.slurm_job_id in states:
-                    active.missing_since = None
-                    continue
-                item = record.items[index]
-                saved = builder.state.get(item.item_id) or {}
-                if saved.get("status") in {"succeeded", "failed"}:
-                    running.pop(index)
-                    continue
-                if active.missing_since is None:
-                    active.missing_since = now
-                elif now - active.missing_since > 30:
-                    current_claim = saved.get("claim_id")
-                    if (
-                        saved.get("execution_id") == record.execution_id
-                        and isinstance(current_claim, str)
-                    ):
-                        builder.state.fail(
-                            item.item_id,
-                            f"Slurm job {active.slurm_job_id} ended without terminal sample state",
-                            claim_id=current_claim,
-                        )
-                    running.pop(index)
+    stage_threads = max(1, execution.coordinator_cpus // queue.download_workers)
+    staging: dict[Future[_PreparedUnit], int] = {}
+    stage_pool = ThreadPoolExecutor(
+        max_workers=queue.download_workers,
+        thread_name_prefix="distributed-download",
+    )
+    try:
+        while pending or staging or ready or running:
+            made_progress = False
+            for future in [candidate for candidate in staging if candidate.done()]:
+                index = staging.pop(future)
+                prepared = future.result()
+                if prepared.outcome is None:
+                    ready[index] = prepared
+                made_progress = True
 
-        made_progress = False
-        active_cpus = sum(value.cpus for value in running.values())
-        active_gb = sum(
-            max(0.0, record.items[index].unit.total_size_gb)
-            * queue.processing_storage_multiplier
-            for index in running
-        )
-        while pending and len(running) < execution.max_running_jobs:
-            available_cpus = worker_cpu_budget - active_cpus
-            if available_cpus < execution.min_cpus_per_job:
-                break
-            selected_position: int | None = None
-            for position, index in enumerate(pending):
-                raw_gb = max(0.0, record.items[index].unit.total_size_gb)
-                projected_gb = active_gb + raw_gb * queue.processing_storage_multiplier
-                if (
-                    queue.max_inflight_gb is not None
-                    and projected_gb > queue.max_inflight_gb
-                    and running
-                ):
-                    continue
-                if raw_gb > execution.storage.available_gb(arguments.workspace):
-                    continue
-                selected_position = position
-                break
-            if selected_position is None:
-                break
-            index = pending.pop(selected_position)
-            item = record.items[index]
-            cohort = min(execution.max_running_jobs, len(running) + len(pending) + 1)
-            fair_share = max(execution.min_cpus_per_job, worker_cpu_budget // max(1, cohort))
-            cpus = min(execution.max_cpus_per_job, available_cpus, fair_share)
-            script = executor.create_sample_script(
-                record_path=record_path,
-                item_index=index,
-                processor_reference=arguments.processor,
-                workspace=arguments.workspace,
-                email=arguments.email,
-                output_path=(
-                    workspace.path("slurm")
-                    / record.execution_id
-                    / f"{item.item_id}.sbatch"
-                ),
-                execution=execution,
-                cpus=cpus,
-                retry_failed=arguments.retry_failed,
-            )
-            slurm_job_id: str | None = None
-            try:
-                slurm_job_id = executor.submit(script, hold=True)
-                claim_id = builder.state.record_submission(
-                    item.item_id,
+            states = _slurm_states({value.slurm_job_id for value in running.values()})
+            if states is not None:
+                now = time.time()
+                for index, active in list(running.items()):
+                    if active.slurm_job_id in states:
+                        active.missing_since = None
+                        continue
+                    item = record.items[index]
+                    saved = builder.state.get(item.item_id) or {}
+                    if saved.get("status") in {"succeeded", "failed"}:
+                        running.pop(index)
+                        made_progress = True
+                        continue
+                    if active.missing_since is None:
+                        active.missing_since = now
+                    elif now - active.missing_since > 30:
+                        current_claim = saved.get("claim_id")
+                        if (
+                            saved.get("execution_id") == record.execution_id
+                            and isinstance(current_claim, str)
+                        ):
+                            builder.state.fail(
+                                item.item_id,
+                                f"Slurm job {active.slurm_job_id} ended without "
+                                "terminal sample state",
+                                claim_id=current_claim,
+                            )
+                        running.pop(index)
+                        made_progress = True
+
+            active_cpus = sum(value.cpus for value in running.values())
+            while (
+                states is not None
+                and ready
+                and len(running) < execution.max_running_jobs
+            ):
+                available_cpus = worker_cpu_budget - active_cpus
+                if available_cpus < execution.min_cpus_per_job:
+                    break
+                index = min(ready)
+                prepared = ready[index]
+                item = prepared.item
+                ready_items = [ready[key].item for key in sorted(ready) if key != index]
+                cohort = builder._scheduled_count(
+                    item,
+                    active=[record.items[key] for key in running],
+                    ready=ready_items,
+                    total_cpus=worker_cpu_budget,
+                    total_memory_gb=None,
+                    max_running_jobs=execution.max_running_jobs,
+                )
+                fair_share = max(
+                    execution.min_cpus_per_job,
+                    worker_cpu_budget // cohort,
+                )
+                cpus = min(execution.max_cpus_per_job, available_cpus, fair_share)
+                script = executor.create_sample_script(
+                    record_path=record_path,
+                    item_index=index,
+                    processor_reference=arguments.processor,
+                    workspace=arguments.workspace,
+                    email=arguments.email,
+                    output_path=(
+                        workspace.path("slurm")
+                        / record.execution_id
+                        / f"{item.item_id}.sbatch"
+                    ),
+                    execution=execution,
+                    cpus=cpus,
+                    retry_failed=arguments.retry_failed,
+                )
+                slurm_job_id: str | None = None
+                try:
+                    slurm_job_id = executor.submit(script, hold=True)
+                    if prepared.claim_id is None:
+                        raise ValueError(f"Ready sample has no claim token: {item.item_id}")
+                    builder.state.record_ready_submission(
+                        item.item_id,
+                        slurm_job_id=slurm_job_id,
+                        cpus=cpus,
+                        memory_gb=execution.memory_gb_per_job,
+                        claim_id=prepared.claim_id,
+                    )
+                    executor.release(slurm_job_id)
+                except Exception:
+                    if slurm_job_id is not None:
+                        executor.cancel(slurm_job_id)
+                    raise
+                assert slurm_job_id is not None
+                running[index] = _RunningSample(
+                    index=index,
                     slurm_job_id=slurm_job_id,
                     cpus=cpus,
-                    memory_gb=execution.memory_gb_per_job,
-                    fingerprint=item.fingerprint,
-                    execution_id=record.execution_id,
-                    item=item.to_dict(),
-                    log_path=builder._unit_log_path(item),
+                    submitted_epoch=time.time(),
+                    claim_id=prepared.claim_id,
                 )
-                executor.release(slurm_job_id)
-            except Exception:
-                if slurm_job_id is not None:
-                    executor.cancel(slurm_job_id)
-                raise
-            assert slurm_job_id is not None
-            running[index] = _RunningSample(
-                index,
-                slurm_job_id,
-                cpus,
-                time.time(),
-                claim_id,
-            )
-            active_cpus += cpus
-            active_gb += max(0.0, item.unit.total_size_gb) * queue.processing_storage_multiplier
-            made_progress = True
+                ready.pop(index)
+                active_cpus += cpus
+                made_progress = True
 
-        if not made_progress and not running and pending:
-            blocked = record.items[pending[0]]
-            raise RuntimeError(
-                f"Distributed queue cannot admit {blocked.item_id}; check CPU quota and storage"
+            inflight_indexes = [*staging.values(), *ready, *running]
+            estimated_inflight_gb = sum(
+                max(0.0, record.items[index].unit.total_size_gb)
+                for index in inflight_indexes
             )
-        if running:
-            time.sleep(min(60.0, queue.scheduler_poll_seconds))
+            processing_extra_gb = sum(
+                max(0.0, record.items[index].unit.total_size_gb)
+                * (queue.processing_storage_multiplier - 1)
+                for index in running
+            )
+            while pending and len(staging) < queue.download_workers:
+                candidate_position: int | None = None
+                for position, index in enumerate(pending):
+                    raw_gb = max(0.0, record.items[index].unit.total_size_gb)
+                    projected_gb = estimated_inflight_gb + processing_extra_gb + raw_gb
+                    if (
+                        queue.max_inflight_gb is not None
+                        and projected_gb > queue.max_inflight_gb
+                        and inflight_indexes
+                    ):
+                        continue
+                    if raw_gb > execution.storage.available_gb(arguments.workspace):
+                        continue
+                    candidate_position = position
+                    break
+                if candidate_position is None:
+                    break
+                index = pending.pop(candidate_position)
+                item = record.items[index]
+                future = stage_pool.submit(
+                    builder._claim_and_stage,
+                    item,
+                    execution_id=record.execution_id,
+                    retry_failed=arguments.retry_failed,
+                    queue=queue,
+                    reclaim_running=True,
+                    stage_threads=stage_threads,
+                )
+                staging[future] = index
+                inflight_indexes.append(index)
+                estimated_inflight_gb += max(0.0, item.unit.total_size_gb)
+                made_progress = True
+
+            if not made_progress:
+                if staging:
+                    wait(
+                        staging,
+                        timeout=queue.scheduler_poll_seconds,
+                        return_when=FIRST_COMPLETED,
+                    )
+                elif running:
+                    time.sleep(min(60.0, queue.scheduler_poll_seconds))
+                elif ready:
+                    blocked = record.items[min(ready)]
+                    raise RuntimeError(
+                        f"Distributed queue cannot admit ready sample {blocked.item_id}; "
+                        "check CPU quota and worker limits"
+                    )
+                elif pending:
+                    blocked = record.items[pending[0]]
+                    raise RuntimeError(
+                        f"Distributed queue cannot stage {blocked.item_id}; "
+                        "check storage capacity"
+                    )
+    finally:
+        stage_pool.shutdown(wait=False, cancel_futures=True)
 
     workspace.sync_manifest(
         record,

@@ -900,14 +900,15 @@ class DatasetBuilder:
         species = sanitize_identifier(item.unit.scientific_name or "unknown_species")
         return self.workspace.path("logs") / species / f"{item.item_id}.log"
 
-    def _stage_fastq(self, item: QueueItem) -> StagedFastq:
-        """Stage input for *item*, adapting providers that expose only ``fetch``."""
+    def _stage_fastq(self, item: QueueItem, *, threads: int | None = None) -> StagedFastq:
+        """Stage input for *item* with optional *threads*."""
 
         destination = self.workspace.path("fastq")
+        stage_threads = threads or item.resources.cpus
         stage = getattr(self.fastq_provider, "stage", None)
         if callable(stage):
-            return stage(item.unit, destination, threads=item.resources.cpus)
-        ready = self.fastq_provider.fetch(item.unit, destination, threads=item.resources.cpus)
+            return stage(item.unit, destination, threads=stage_threads)
+        ready = self.fastq_provider.fetch(item.unit, destination, threads=stage_threads)
         unit_root = destination / sanitize_identifier(item.unit.unit_id)
         return StagedFastq(
             unit_id=item.unit.unit_id,
@@ -918,8 +919,8 @@ class DatasetBuilder:
             metadata={"provider_mode": "fetch_during_staging"},
         )
 
-    def _materialize_fastq(self, prepared: _PreparedUnit) -> FastqSet:
-        """Materialize processor input for *prepared*."""
+    def _materialize_fastq(self, prepared: _PreparedUnit, *, threads: int) -> FastqSet:
+        """Materialize processor input for *prepared* using *threads*."""
 
         if prepared.staged is None:
             raise ValueError(f"Sample {prepared.item.item_id} has no staged input")
@@ -929,7 +930,7 @@ class DatasetBuilder:
                 prepared.item.unit,
                 prepared.staged,
                 self.workspace.path("fastq"),
-                threads=prepared.item.resources.cpus,
+                threads=threads,
             )
         if prepared.staged.ready_fastq is None:
             raise TypeError("Input provider supplied neither materialize() nor ready FASTQ")
@@ -943,6 +944,7 @@ class DatasetBuilder:
         retry_failed: bool,
         queue: QueuePolicy,
         reclaim_running: bool,
+        stage_threads: int | None = None,
     ) -> _PreparedUnit:
         """Claim and download one queue *item*."""
 
@@ -1009,16 +1011,21 @@ class DatasetBuilder:
                     scientific_name=item.unit.scientific_name,
                     pin=item.genome_pin,
                 )
-                staged = self._stage_fastq(item)
-                self.state.set_phase(item.item_id, "ready", claim_id=str(claim_id))
-            return _PreparedUnit(
-                item=item,
-                log_path=log_path,
-                genome=genome,
-                staged=staged,
-                reset_outputs=reset_outputs,
-                claim_id=str(claim_id),
-            )
+                staged = self._stage_fastq(item, threads=stage_threads)
+                prepared = _PreparedUnit(
+                    item=item,
+                    log_path=log_path,
+                    genome=genome,
+                    staged=staged,
+                    reset_outputs=reset_outputs,
+                    claim_id=str(claim_id),
+                )
+                self.state.set_ready(
+                    item.item_id,
+                    self._prepared_to_dict(prepared),
+                    claim_id=str(claim_id),
+                )
+            return prepared
         except Exception:  # noqa: BLE001 - sample boundary persists operational failures
             error = traceback.format_exc()
             self.state.fail(item.item_id, error, claim_id=str(claim_id))
@@ -1034,6 +1041,42 @@ class DatasetBuilder:
                 log_path,
                 outcome=UnitOutcome(item.item_id, "failed", error=error),
             )
+
+    @staticmethod
+    def _prepared_to_dict(prepared: _PreparedUnit) -> dict[str, Any]:
+        """Serialize restartable fields from *prepared*."""
+
+        if prepared.genome is None or prepared.staged is None:
+            raise ValueError(f"Prepared sample {prepared.item.item_id} is incomplete")
+        return {
+            "genome": prepared.genome.to_dict(),
+            "staged": prepared.staged.to_dict(),
+            "reset_outputs": prepared.reset_outputs,
+        }
+
+    def _prepared_from_state(
+        self,
+        item: QueueItem,
+        state: Mapping[str, Any],
+    ) -> _PreparedUnit:
+        """Restore staged *item* from persisted ready *state*."""
+
+        serialized = state.get("prepared")
+        claim_id = state.get("claim_id")
+        if not isinstance(serialized, Mapping) or not isinstance(claim_id, str):
+            raise TypeError(f"Ready sample lacks persisted input: {item.item_id}")
+        genome = serialized.get("genome")
+        staged = serialized.get("staged")
+        if not isinstance(genome, dict) or not isinstance(staged, dict):
+            raise TypeError(f"Ready sample input is malformed: {item.item_id}")
+        return _PreparedUnit(
+            item=item,
+            log_path=Path(str(state.get("log_path") or self._unit_log_path(item))),
+            genome=GenomeRef.from_dict(genome),
+            staged=StagedFastq.from_dict(staged),
+            reset_outputs=bool(serialized.get("reset_outputs", False)),
+            claim_id=claim_id,
+        )
 
     def _process_prepared(
         self,
@@ -1073,7 +1116,7 @@ class DatasetBuilder:
                 ),
                 self.progress.minimum_level(logging.WARNING),
             ):
-                fastq = self._materialize_fastq(prepared)
+                fastq = self._materialize_fastq(prepared, threads=cpus)
                 output_root = self.workspace.output / item.item_id
                 if prepared.reset_outputs:
                     if output_root.is_dir():

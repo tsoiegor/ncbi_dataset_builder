@@ -165,6 +165,20 @@ class StagedFastq:
             "metadata": self.metadata,
         }
 
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> StagedFastq:
+        """Restore staged FASTQ information from serialized *value*."""
+
+        ready = value.get("ready_fastq")
+        return cls(
+            unit_id=str(value["unit_id"]),
+            source=str(value["source"]),
+            size_gb=float(value["size_gb"]),
+            cleanup_roots=tuple(Path(path) for path in value.get("cleanup_roots", ())),
+            ready_fastq=FastqSet.from_dict(ready) if isinstance(ready, dict) else None,
+            metadata=dict(value.get("metadata", {})),
+        )
+
 
 @dataclass(frozen=True)
 class GenomeRef:

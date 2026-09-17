@@ -105,7 +105,13 @@ class UnitStateStore:
                 if previous and previous.get("fingerprint") == fingerprint
                 else 1
             )
-            submitted = previous or {}
+            submitted = (
+                previous
+                if previous
+                and previous.get("status") == "submitted"
+                and reclaim_running
+                else {}
+            )
             claim_id = uuid.uuid4().hex
             atomic_write_json(
                 self._path(unit_id),
@@ -208,6 +214,80 @@ class UnitStateStore:
             atomic_write_json(
                 self._path(unit_id),
                 {**previous, "phase": phase, "phase_updated_at": utc_timestamp()},
+            )
+
+    def set_ready(
+        self,
+        unit_id: str,
+        prepared: dict[str, Any],
+        *,
+        claim_id: str,
+    ) -> None:
+        """Persist restartable *prepared* input for *unit_id* owned by *claim_id*."""
+
+        with exclusive_file_lock(self._lock(unit_id), timeout_seconds=60):
+            previous = self._require_claim(unit_id, self.get(unit_id), claim_id)
+            if previous.get("status") != "running":
+                raise ValueError(f"Cannot prepare an unclaimed sample: {unit_id}")
+            atomic_write_json(
+                self._path(unit_id),
+                {
+                    **previous,
+                    "phase": "ready",
+                    "phase_updated_at": utc_timestamp(),
+                    "prepared": prepared,
+                },
+            )
+
+    def record_ready_submission(
+        self,
+        unit_id: str,
+        *,
+        slurm_job_id: str,
+        cpus: int,
+        memory_gb: float,
+        claim_id: str,
+    ) -> None:
+        """Attach *slurm_job_id*, *cpus*, and *memory_gb* to *claim_id* for *unit_id*."""
+
+        if not slurm_job_id or cpus < 1 or memory_gb <= 0:
+            raise ValueError("Submission needs a job ID and positive resources")
+        with exclusive_file_lock(self._lock(unit_id), timeout_seconds=60):
+            previous = self._require_claim(unit_id, self.get(unit_id), claim_id)
+            if previous.get("status") != "running" or previous.get("phase") != "ready":
+                raise ValueError(f"Cannot submit a sample that is not ready: {unit_id}")
+            if not isinstance(previous.get("prepared"), dict):
+                raise TypeError(f"Ready sample lacks persisted input: {unit_id}")
+            atomic_write_json(
+                self._path(unit_id),
+                {
+                    **previous,
+                    "status": "submitted",
+                    "submitted_at": utc_timestamp(),
+                    "submitted_epoch": time.time(),
+                    "slurm_job_id": slurm_job_id,
+                    "allocated_cpus": cpus,
+                    "allocated_memory_gb": memory_gb,
+                    "worker_activated_at": None,
+                },
+            )
+
+    def activate_ready_submission(self, unit_id: str, *, claim_id: str) -> None:
+        """Mark submitted, staged *unit_id* as running under *claim_id*."""
+
+        with exclusive_file_lock(self._lock(unit_id), timeout_seconds=60):
+            previous = self._require_claim(unit_id, self.get(unit_id), claim_id)
+            if previous.get("status") != "submitted" or previous.get("phase") != "ready":
+                raise ValueError(f"Cannot activate a sample that is not submitted: {unit_id}")
+            atomic_write_json(
+                self._path(unit_id),
+                {
+                    **previous,
+                    "status": "running",
+                    "started_at": utc_timestamp(),
+                    "started_epoch": time.time(),
+                    "worker_activated_at": utc_timestamp(),
+                },
             )
 
     def set_runtime_resources(
