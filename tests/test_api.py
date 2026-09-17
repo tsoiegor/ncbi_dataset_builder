@@ -1,13 +1,17 @@
 import json
+import logging
+from io import StringIO
 
 import pytest
 
+import ncbi_dataset_builder.api as api_module
 from ncbi_dataset_builder import (
     BuilderConfig,
     DatasetBuilder,
     FilesystemStorage,
     GenomeSelectionPolicy,
     LocalExecution,
+    ProgressReporter,
     QueuePolicy,
     QuotaStorage,
     RunCatalog,
@@ -321,6 +325,74 @@ def test_changed_description_content_invalidates_successful_unit(tmp_path):
         (tmp_path / "output" / "SRX1" / "SRX1.json").read_text(encoding="utf-8")
     )
     assert description["Strategy"] == "DNase-Hypersensitivity"
+
+
+def test_description_checksums_use_one_aggregate_progress_task(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    MetadataBundle(
+        packages=[
+            {
+                "accession": experiment,
+                "experiment_accession": experiment,
+                "sra_sample_accession": sample,
+                "run_accessions": [run],
+            }
+            for experiment, sample, run in (
+                ("SRX1", "SRS1", "SRR1"),
+                ("SRX2", "SRS2", "SRR2"),
+            )
+        ],
+        experiments=[
+            {"accession": "SRX1", "library": {"strategy": "ATAC-seq"}},
+            {"accession": "SRX2", "library": {"strategy": "ATAC-seq"}},
+        ],
+        sra_samples=[
+            {"accession": "SRS1", "biosample": "SAMN1", "organism": "Homo sapiens"},
+            {"accession": "SRS2", "biosample": "SAMN2", "organism": "Homo sapiens"},
+        ],
+        biosamples=[{"accession": "SAMN1"}, {"accession": "SAMN2"}],
+    ).save(tmp_path / "runtime" / "metadata")
+    stream = StringIO()
+    instance = DatasetBuilder(
+        BuilderConfig(tmp_path, progress_bars=False),
+        fastq_provider=FakeFastqProvider(),
+        genome_manager=FakeGenomeManager(tmp_path / "genome-cache"),
+        progress=ProgressReporter(use_bars=False, stream=stream),
+    )
+    original_sha256_file = api_module.sha256_file
+    metadata_checksums = 0
+
+    def tracked_sha256_file(path, *args, **kwargs):
+        nonlocal metadata_checksums
+        if path.name == "metadata.json":
+            metadata_checksums += 1
+        return original_sha256_file(path, *args, **kwargs)
+
+    monkeypatch.setattr(api_module, "sha256_file", tracked_sha256_file)
+
+    with caplog.at_level(logging.INFO, logger="ncbi_dataset_builder"):
+        instance._create_execution(
+            catalog("SRX1", "SRX2"),
+            description_processor,
+            execution=LocalExecution(storage=FilesystemStorage(reserve_free_gb=0)),
+            queue=QueuePolicy(),
+            group_by=None,
+            genome_pins=None,
+            query=None,
+            processor_id="description-processor-v1",
+        )
+
+    output = stream.getvalue()
+    assert metadata_checksums == 1
+    assert output.count("Checksum experiment descriptions: started") == 1
+    assert "Checksum experiment descriptions: complete (2/2 descriptions" in output
+    assert "Checksum metadata.json" not in output
+    assert not any(
+        "Checksum metadata.json" in record.getMessage() for record in caplog.records
+    )
 
 
 def test_manifest_and_default_status_retain_prior_executions(tmp_path):

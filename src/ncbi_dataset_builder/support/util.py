@@ -45,10 +45,16 @@ def sha256_file(
     chunk_size: int = 8 * 1024 * 1024,
     *,
     progress: ProgressReporter | None = None,
+    show_progress: bool = True,
 ) -> str:
-    """Return the SHA-256 of *path* using *chunk_size* and optional *progress*."""
+    """Hash *path* in *chunk_size* blocks, using *progress* when *show_progress*."""
 
     digest = hashlib.sha256()
+    if not show_progress:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(chunk_size), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
     reporter = get_progress(progress)
     with (
         path.open("rb") as handle,

@@ -195,10 +195,13 @@ sha256_file(
     chunk_size=8 * 1024 * 1024,
     *,
     progress=None,
+    show_progress=True,
 ) -> str
 ```
 
-`path` is streamed in chunks; optional progress reports decimal GB.
+`path` is streamed in chunks; optional progress reports decimal GB. Set
+`show_progress=False` for an internal verification that should not create a
+progress task or logging event.
 
 ## Atomic writes
 

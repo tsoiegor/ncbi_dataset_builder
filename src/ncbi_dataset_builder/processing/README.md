@@ -46,6 +46,9 @@ A processor can opt into a pre-materialized experiment description by exposing
 description directly into the unit output directory before the call. This hook
 requires normalized metadata and one Experiment per processing unit. The
 built-in ATAC processor uses it so `bam2bw.py` can append coverage statistics.
+Execution planning verifies `metadata.json` once, then reports one
+`Checksum experiment descriptions` counter while hashing the canonical
+description for each Experiment fingerprint.
 
 ## Processor rules
 

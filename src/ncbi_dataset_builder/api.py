@@ -353,24 +353,19 @@ class DatasetBuilder:
             raise TypeError("Execution fastq_provider_config must be a mapping")
         return cls(config, fastq_provider=cls._restore_fastq_provider(provider_value))
 
-    def _processor_description(
+    def _processor_descriptions(
         self,
         processor: Processor,
-        unit: ProcessingUnit,
-    ) -> tuple[str, dict[str, Any]] | None:
-        """Return the profile and description requested by *processor* for *unit*."""
+        *,
+        refresh: bool = False,
+    ) -> tuple[str, dict[str, dict[str, Any]]] | None:
+        """Load the description collection requested by *processor* once."""
 
         profile = getattr(processor, "description_profile", None)
         if profile is None:
             return None
         if not isinstance(profile, str) or not profile:
             raise TypeError("Processor description_profile must be a non-empty string")
-        experiments = unit.experiment_accessions
-        if len(experiments) != 1:
-            raise ValueError(
-                f"Processor {processor!r} requires exactly one experiment per unit; "
-                f"{unit.unit_id} contains {list(experiments)}"
-            )
         metadata_path = self.workspace.path("metadata") / "metadata.json"
         if not metadata_path.is_file():
             raise FileNotFoundError(
@@ -378,22 +373,54 @@ class DatasetBuilder:
                 f"but normalized metadata is missing at {metadata_path}. "
                 "Call builder.enrich_metadata(catalog) before build()."
             )
-        signature = (profile, sha256_file(metadata_path, progress=self.progress))
         with self._description_cache_lock:
+            if (
+                not refresh
+                and self._description_cache_signature is not None
+                and self._description_cache_signature[0] == profile
+            ):
+                return profile, self._description_cache
+            signature = (profile, sha256_file(metadata_path, show_progress=False))
             if self._description_cache_signature != signature:
-                bundle = MetadataBundle.load(metadata_path, progress=self.progress)
+                bundle = MetadataBundle.load(metadata_path)
                 self._description_cache = bundle.descriptions_by_experiment(
                     profile=profile,
-                    progress=self.progress,
                 )
                 self._description_cache_signature = signature
-            descriptions = self._description_cache
+            return profile, self._description_cache
+
+    @staticmethod
+    def _description_for_unit(
+        processor: Processor,
+        unit: ProcessingUnit,
+        descriptions: Mapping[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Return the one Experiment description associated with *unit*."""
+
+        experiments = unit.experiment_accessions
+        if len(experiments) != 1:
+            raise ValueError(
+                f"Processor {processor!r} requires exactly one experiment per unit; "
+                f"{unit.unit_id} contains {list(experiments)}"
+            )
         experiment = experiments[0]
         description = descriptions.get(experiment)
         if description is None:
-            raise KeyError(
-                f"No {profile!r} description is available for experiment {experiment}"
-            )
+            raise KeyError(f"No description is available for experiment {experiment}")
+        return description
+
+    def _processor_description(
+        self,
+        processor: Processor,
+        unit: ProcessingUnit,
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Return the profile and description requested by *processor* for *unit*."""
+
+        requested = self._processor_descriptions(processor)
+        if requested is None:
+            return None
+        profile, descriptions = requested
+        description = self._description_for_unit(processor, unit, descriptions)
         return profile, description
 
     def _materialize_processor_description(
@@ -412,24 +439,37 @@ class DatasetBuilder:
         atomic_write_json(destination, description)
         return destination
 
-    def _description_identity(
+    def _description_identities(
         self,
         processor: Processor,
-        unit: ProcessingUnit,
-    ) -> dict[str, str] | None:
-        """Return the profile and canonical content hash affecting *unit*."""
+        units: tuple[ProcessingUnit, ...],
+    ) -> dict[str, dict[str, str]]:
+        """Checksum requested descriptions with one aggregate progress task."""
 
-        requested = self._processor_description(processor, unit)
+        if not units:
+            return {}
+        requested = self._processor_descriptions(processor, refresh=True)
         if requested is None:
-            return None
-        profile, description = requested
-        payload = json.dumps(
-            description,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        return {"profile": profile, "sha256": hashlib.sha256(payload).hexdigest()}
+            return {}
+        profile, descriptions = requested
+        identities: dict[str, dict[str, str]] = {}
+        for unit in self.progress.track(
+            units,
+            "Checksum experiment descriptions",
+            unit="descriptions",
+        ):
+            description = self._description_for_unit(processor, unit, descriptions)
+            payload = json.dumps(
+                description,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            identities[unit.unit_id] = {
+                "profile": profile,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        return identities
 
     def fetch_runs(self, query: str, *, refresh: bool = False) -> RunCatalog:
         """Fetch an SRA RunInfo catalog for *query*.
@@ -747,15 +787,20 @@ class DatasetBuilder:
         )
         pins = genome_pins or {}
         resources = self._unit_resources(execution)
-        items: list[QueueItem] = []
+        units: list[ProcessingUnit] = []
         for original in clean.processing_units(by=selected_group):
-            unit = replace(
-                original,
-                run_accessions=tuple(sorted(original.run_accessions)),
-                experiment_accessions=tuple(sorted(original.experiment_accessions)),
-                sra_sample_accessions=tuple(sorted(original.sra_sample_accessions)),
-                biosample_accessions=tuple(sorted(original.biosample_accessions)),
+            units.append(
+                replace(
+                    original,
+                    run_accessions=tuple(sorted(original.run_accessions)),
+                    experiment_accessions=tuple(sorted(original.experiment_accessions)),
+                    sra_sample_accessions=tuple(sorted(original.sra_sample_accessions)),
+                    biosample_accessions=tuple(sorted(original.biosample_accessions)),
+                )
             )
+        description_identities = self._description_identities(resolved, tuple(units))
+        items: list[QueueItem] = []
+        for unit in units:
             pin = pins.get(unit.taxid) if unit.taxid is not None else None
             items.append(
                 QueueItem(
@@ -768,7 +813,7 @@ class DatasetBuilder:
                         group_by=selected_group,
                         genome_pin=pin,
                         processor_identity=processor_identity,
-                        description_identity=self._description_identity(resolved, unit),
+                        description_identity=description_identities.get(unit.unit_id),
                     ),
                 )
             )
